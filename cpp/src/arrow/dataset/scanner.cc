@@ -31,6 +31,8 @@
 #include "arrow/util/task_group.h"
 #include "arrow/util/thread_pool.h"
 
+#include "include/rados/librados.hpp"
+
 namespace arrow {
 namespace dataset {
 
@@ -67,7 +69,7 @@ Result<RecordBatchIterator> InMemoryScanTask::Execute() {
 
 Result<RecordBatchIterator> RadosScanTask::Execute() {
   // we have the object id and the offset to scan
-  ceph::buffer::list bl;
+  bufferlist &bl;
   uint32_t e = librados::IoCtx::read(object_id_, bl, off_and_len_->second, off_and_len_->first);
   // bl is the vector of record batches
   if (e != 0) {

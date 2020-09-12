@@ -209,7 +209,7 @@ Result<ScanTaskIterator> RadosFragment::Scan(std::shared_ptr<ScanOptions> option
   // RecordBatch -> ScanTask
   auto fn = [=](std::shared_ptr<std::pair<auto, auto>> range) -> std::shared_ptr<ScanTask> {
     return ::arrow::internal::make_unique<RadosScanTask>(
-        std::move(range), std::move(options), std::move(context));
+        std::move(object_id_), std::move(range), std::move(options), std::move(context));
   };
   return MakeMapIterator(fn, std::move(ranges_it));
 }

@@ -127,7 +127,7 @@ class ARROW_DS_EXPORT RadosFragment : public Fragment {
 
   protected:
     Result<std::shared_ptr<Schema>> ReadPhysicalSchemaImpl() override;
-    string object_id_ = "";
+    std::string object_id_ = "";
 };
 
 /// \brief A container of zero or more Fragments.
