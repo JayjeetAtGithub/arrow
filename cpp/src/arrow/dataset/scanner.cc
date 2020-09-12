@@ -80,6 +80,9 @@ Result<RecordBatchIterator> RadosScanTask::Execute() {
   }
 }
 
+// compute_on_arrow_data will take the input bufferlist (which is a vector of RecordBatches) and convert them to 
+// InMemoryFragment and then will run Scan() on it. The Scan Options and Scan Context will be pushed down by the client.
+
 FragmentIterator Scanner::GetFragments() {
   if (fragment_ != nullptr) {
     return MakeVectorIterator(FragmentVector{fragment_});
