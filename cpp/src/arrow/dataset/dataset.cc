@@ -203,9 +203,9 @@ FragmentIterator UnionDataset::GetFragmentsImpl(std::shared_ptr<Expression> pred
 
 Result<ScanTaskIterator> RadosFragment::Scan(std::shared_ptr<ScanOptions> options,
                                                 std::shared_ptr<ScanContext> context) {
-  auto batch_length = options->fragment_size;
+  auto fragment_size = options->fragment_size;
   auto batch_size = options->batch_size;
-  auto ranges_it = MakeVectorIterator(create_range_vector(batch_length, batch_size));
+  auto ranges_it = MakeVectorIterator(create_range_vector(fragment_size, batch_size));
   // RecordBatch -> ScanTask
   auto fn = [=](std::shared_ptr<std::pair<auto, auto>> range) -> std::shared_ptr<ScanTask> {
     return ::arrow::internal::make_unique<RadosScanTask>(
