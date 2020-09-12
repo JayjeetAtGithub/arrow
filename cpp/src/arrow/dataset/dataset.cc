@@ -29,6 +29,9 @@
 #include "arrow/util/logging.h"
 #include "arrow/util/make_unique.h"
 
+#include "include/rados/librados.hpp"
+
+
 namespace arrow {
 namespace dataset {
 
@@ -196,6 +199,42 @@ Result<std::shared_ptr<Dataset>> UnionDataset::ReplaceSchema(
 
 FragmentIterator UnionDataset::GetFragmentsImpl(std::shared_ptr<Expression> predicate) {
   return GetFragmentsFromDatasets(children_, predicate);
+}
+
+Result<ScanTaskIterator> RadosFragment::Scan(std::shared_ptr<ScanOptions> options,
+                                                std::shared_ptr<ScanContext> context) {
+  auto fragment_size = options->fragment_size;
+  auto batch_size = options->batch_size;
+  auto ranges_it = MakeVectorIterator(create_range_vector(fragment_size, batch_size));
+  // RecordBatch -> ScanTask
+  auto fn = [=](std::shared_ptr<std::pair<auto, auto>> range) -> std::shared_ptr<ScanTask> {
+    return ::arrow::internal::make_unique<RadosScanTask>(
+        std::move(object_id_), std::move(range), std::move(options), std::move(context));
+  };
+  return MakeMapIterator(fn, std::move(ranges_it));
+}
+
+RadosFragment::RadosFragment(std::shared_ptr<Schema> schema, std::string object_id, std::shared_ptr<Expression> = scalar(true))
+    : Dataset(std::move(schema)),
+      object_id_(std::move(object_id)) {}
+
+RadosDataset::RadosDataset(std::shared_ptr<Schema> schema, std::string rados_pool_name)
+    : Dataset(std::move(schema)),
+      rados_pool_name_(std::move(rados_pool_name)) {}
+
+FragmentIterator RadosDataset::GetFragmentsImpl(std::shared_ptr<Expression> predicate = scalar(true)) {
+  auto create_fragment =
+      [schema](std::string object_id) -> Result<std::shared_ptr<RadosFragment>> {
+        RadosFragment fragment{schema, object_id, predicate};
+        return std::make_shared<RadosFragment>(std::move(fragment));
+  };
+
+  return MakeMaybeMapIterator(std::move(create_fragment), <get_object_ids_>->Get());
+
+  // std::vector<std::string> fragments;
+  // for (uint32_t i = start_obj; i < start_obj + num_objs; i++ ) {
+  //   fragments.push_back(new RadosFragment(schema, , predicate));
+  // }
 }
 
 }  // namespace dataset

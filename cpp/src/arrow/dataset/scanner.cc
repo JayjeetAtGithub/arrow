@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <iostream>
 #include <mutex>
 
 #include "arrow/dataset/dataset.h"
@@ -29,6 +30,8 @@
 #include "arrow/util/iterator.h"
 #include "arrow/util/task_group.h"
 #include "arrow/util/thread_pool.h"
+
+#include "include/rados/librados.hpp"
 
 namespace arrow {
 namespace dataset {
@@ -63,6 +66,22 @@ std::vector<std::string> ScanOptions::MaterializedFields() const {
 Result<RecordBatchIterator> InMemoryScanTask::Execute() {
   return MakeVectorIterator(record_batches_);
 }
+
+Result<RecordBatchIterator> RadosScanTask::Execute() {
+  // we have the object id and the offset to scan
+  librados::bufferlist in, out;
+  uint32_t e = io_ctx.exec(object_id_, "arrow", "compute_on_arrow_data", in, out);
+  if (e != 0) {
+    std::cout << "Failed to read from object";
+    exit(EXIT_FAILURE);
+  } else {
+    using RecordBatchVector = std::vector<std::shared_ptr<RecordBatch>>;
+    return MakeVectorIterator(RecordBatchVector{out});
+  }
+}
+
+// compute_on_arrow_data will take the input bufferlist (which is a vector of RecordBatches) and convert them to 
+// InMemoryFragment and then will run Scan() on it. The Scan Options and Scan Context will be pushed down by the client.
 
 FragmentIterator Scanner::GetFragments() {
   if (fragment_ != nullptr) {
