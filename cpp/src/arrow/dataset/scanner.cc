@@ -69,15 +69,14 @@ Result<RecordBatchIterator> InMemoryScanTask::Execute() {
 
 Result<RecordBatchIterator> RadosScanTask::Execute() {
   // we have the object id and the offset to scan
-  bufferlist &bl;
-  uint32_t e = librados::IoCtx::read(object_id_, bl, off_and_len_->second, off_and_len_->first);
-  // bl is the vector of record batches
+  librados::bufferlist in, out;
+  uint32_t e = io_ctx.exec(object_id_, "arrow", "compute_on_arrow_data", in, out);
   if (e != 0) {
     std::cout << "Failed to read from object";
     exit(EXIT_FAILURE);
   } else {
     using RecordBatchVector = std::vector<std::shared_ptr<RecordBatch>>;
-    return MakeVectorIterator(RecordBatchVector{bl});
+    return MakeVectorIterator(RecordBatchVector{out});
   }
 }
 
