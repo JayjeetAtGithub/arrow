@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <iostream>
 #include <mutex>
 
 #include "arrow/dataset/dataset.h"
@@ -62,6 +63,20 @@ std::vector<std::string> ScanOptions::MaterializedFields() const {
 
 Result<RecordBatchIterator> InMemoryScanTask::Execute() {
   return MakeVectorIterator(record_batches_);
+}
+
+Result<RecordBatchIterator> RadosScanTask::Execute() {
+  // we have the object id and the offset to scan
+  ceph::buffer::list bl;
+  uint32_t e = librados::IoCtx::read(object_id_, bl, off_and_len_->second, off_and_len_->first);
+  // bl is the vector of record batches
+  if (e != 0) {
+    std::cout << "Failed to read from object";
+    exit(EXIT_FAILURE);
+  } else {
+    using RecordBatchVector = std::vector<std::shared_ptr<RecordBatch>>;
+    return MakeVectorIterator(RecordBatchVector{bl});
+  }
 }
 
 FragmentIterator Scanner::GetFragments() {

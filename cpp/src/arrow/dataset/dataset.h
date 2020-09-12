@@ -111,6 +111,25 @@ class ARROW_DS_EXPORT InMemoryFragment : public Fragment {
   RecordBatchVector record_batches_;
 };
 
+/// \brief A Fragment from Rados objects
+///
+class ARROW_DS_EXPORT RadosFragment : public Fragment {
+  public:
+    RadosFragment(std::shared_ptr<Schema> schema, std::string object_id,
+                   std::shared_ptr<Expression> = scalar(true));
+
+    Result<ScanTaskIterator> Scan(std::shared_ptr<ScanOptions> options,
+                                  std::shared_ptr<ScanContext> context) override;
+
+    bool splittable() const override { return false; }
+
+    std::string type_name() const override { return "rados"; }
+
+  protected:
+    Result<std::shared_ptr<Schema>> ReadPhysicalSchemaImpl() override;
+    string object_id_ = "";
+};
+
 /// \brief A container of zero or more Fragments.
 ///
 /// A Dataset acts as a union of Fragments, e.g. files deeply nested in a
@@ -215,6 +234,29 @@ class ARROW_DS_EXPORT UnionDataset : public Dataset {
   DatasetVector children_;
 
   friend class UnionDatasetFactory;
+};
+
+class ARROW_DS_EXPORT RadosDataset : public Dataset {
+ public:
+    RadosDataset(std::shared_ptr<Schema> schema, std::string rados_pool_name);
+
+    FragmentIterator GetFragments(std::shared_ptr<Expression> predicate = scalar(true));
+
+    const std::shared_ptr<Schema>& schema() const { return schema_; }
+
+    virtual std::string type_name() const = 0;
+
+    virtual Result<std::shared_ptr<Dataset>> ReplaceSchema(
+        std::shared_ptr<Schema> schema) const = 0;
+
+    virtual ~RadosDataset() = default;
+
+  protected:
+    std::shared_ptr<Schema> schema_;
+    std::string rados_pool_name_ = "";
+
+    virtual FragmentIterator GetFragmentsImpl(std::shared_ptr<Expression> predicate) = 0;
+
 };
 
 }  // namespace dataset

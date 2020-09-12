@@ -133,6 +133,21 @@ class ARROW_DS_EXPORT InMemoryScanTask : public ScanTask {
   std::vector<std::shared_ptr<RecordBatch>> record_batches_;
 };
 
+class ARROW_DS_EXPORT RadosScanTask : public ScanTask {
+  public: 
+    // A RadosScanTask needs an object name and offset to scan
+    RadosScanTask(std::string object_id, std::pair<auto, auto> off_and_len, std::shared_ptr<ScanOptions> options, std::shared_ptr<ScanContext> context)
+      : ScanTask(std::move(options), std::move(context)),
+        off_and_len_(std::move(off_and_len)),
+        object_id_(std::move(object_id)) {}
+
+    Result<RecordBatchIterator> Execute() override;
+  
+  protected:
+    std::string object_id_;
+    std::pair<auto, auto> off_and_len_;
+}
+
 ARROW_DS_EXPORT Result<ScanTaskIterator> ScanTaskIteratorFromRecordBatch(
     std::vector<std::shared_ptr<RecordBatch>> batches,
     std::shared_ptr<ScanOptions> options, std::shared_ptr<ScanContext>);
