@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <iostream>
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,8 @@
 #include "arrow/dataset/rados.h"
 #include "arrow/dataset/scanner.h"
 #include "arrow/util/iterator.h"
+#include "arrow/util/logging.h"
+#include "arrow/io/api.h"
 
 namespace arrow {
 namespace dataset {
@@ -264,6 +267,89 @@ class ARROW_DS_EXPORT RadosDatasetFactory : public DatasetFactory {
       : objects_(objects), cluster_(std::move(cluster)) {}
   RadosObjectVector objects_;
   std::shared_ptr<RadosCluster> cluster_;
+};
+
+class ARROW_EXPORT RandomAccessObject final : public io::RandomAccessFile {
+  public:
+    RandomAccessObject(std::string object_id, std::shared_ptr<RadosCluster> cluster)
+      : object_id_(object_id), cluster_(cluster) {};
+
+    Status Init() {
+      uint64_t size;
+      int e = cluster_->io_ctx_interface_->stat(object_id_, size);
+      if (e == 0) {
+        content_length_ = size;
+        return Status::OK();
+      } else {
+        return Status::ExecutionError("Can't read the object");
+      }
+    }
+
+    Status CheckClosed() const {
+      if (closed_) {
+        return Status::Invalid("Operation on closed stream");
+      }
+      return Status::OK();
+    }
+
+    Status CheckPosition(int64_t position, const char* action) const {
+      if (position < 0) {
+        return Status::Invalid("Cannot ", action, " from negative position");
+      }
+      if (position > content_length_) {
+        return Status::IOError("Cannot ", action, " past end of file");
+      }
+      return Status::OK();
+    }
+
+    Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) { return 0; }
+
+    Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes);
+
+    Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override {
+      ARROW_ASSIGN_OR_RAISE(auto buffer, ReadAt(pos_, nbytes));
+      pos_ += buffer->size();
+      return std::move(buffer);
+    }
+
+    Result<int64_t> Read(int64_t nbytes, void* out) override {
+      ARROW_ASSIGN_OR_RAISE(int64_t bytes_read, ReadAt(pos_, nbytes, out));
+      pos_ += bytes_read;
+      return bytes_read;
+    }
+
+    Result<int64_t> GetSize() override {
+      RETURN_NOT_OK(CheckClosed());
+      return content_length_;
+    }
+
+    Status Seek(int64_t position) override {
+      RETURN_NOT_OK(CheckClosed());
+      RETURN_NOT_OK(CheckPosition(position, "seek"));
+
+      pos_ = position;
+      return Status::OK();
+    }
+
+    Result<int64_t> Tell() const override {
+      RETURN_NOT_OK(CheckClosed());
+      return pos_;
+    }
+
+    Status Close() override {
+      cluster_->Disconnect();
+      closed_ = true;
+      return Status::OK();
+    }
+
+    bool closed() const override { return closed_; }
+
+  protected:
+    std::string object_id_;
+    std::shared_ptr<RadosCluster> cluster_;
+    bool closed_ = false;
+    int64_t pos_ = 0;
+    int64_t content_length_ = -1;
 };
 
 }  // namespace dataset

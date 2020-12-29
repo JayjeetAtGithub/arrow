@@ -36,6 +36,13 @@ int IoCtxWrapper::exec(const std::string& oid, const char* cls, const char* meth
   return this->ioCtx->exec(oid, cls, method, in, out);
 }
 
+int IoCtxWrapper::stat(const std::string& oid, uint64_t &psize) {
+  uint64_t size = 0;
+  int e = this->ioCtx->stat(oid, &size, nullptr);
+  psize = size;
+  return e;
+};
+
 int RadosWrapper::init2(const char* const name, const char* const clustername,
                         uint64_t flags) {
   return this->cluster->init2(name, clustername, flags);

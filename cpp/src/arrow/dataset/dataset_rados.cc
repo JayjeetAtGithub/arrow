@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <utility>
+#include <iostream>
 
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/filter.h"
@@ -219,6 +220,21 @@ Result<RecordBatchIterator> RadosScanTask::Execute() {
   RecordBatchVector batches;
   ARROW_RETURN_NOT_OK(table_reader->ReadAll(&batches));
   return MakeVectorIterator(batches);
+}
+
+Result<std::shared_ptr<Buffer>> RandomAccessObject::ReadAt(int64_t position, int64_t nbytes) {
+  RETURN_NOT_OK(CheckClosed());
+  RETURN_NOT_OK(CheckPosition(position, "read"));
+
+  // No need to allocate more than the remaining number of bytes
+  nbytes = std::min(nbytes, content_length_ - position);
+
+  if (nbytes > 0) {
+    librados::bufferlist bl;
+    cluster_->io_ctx_interface_->read(object_id_, bl, nbytes, position);
+    return std::make_shared<Buffer>((uint8_t*)bl.c_str(), bl.length());
+  }
+  return std::make_shared<Buffer>("");
 }
 
 }  // namespace dataset
