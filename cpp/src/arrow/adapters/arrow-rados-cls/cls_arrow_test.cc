@@ -398,7 +398,7 @@ TEST(TestClsSDK, EndToEndWithPartitioning) {
   auto factory_options = CreateTestRadosFactoryOptions();
   factory_options.format = 2;
 
-  factory_options.partition_base_dir = "nyc/";
+  factory_options.partition_base_dir = "/workspace/nyc/";
   factory_options.partitioning = std::make_shared<arrow::dataset::HivePartitioning>(
       arrow::schema({arrow::field("payment_type", arrow::int64()),
                      arrow::field("VendorID", arrow::int64())}));
@@ -410,16 +410,17 @@ TEST(TestClsSDK, EndToEndWithPartitioning) {
 
   auto builder = ds->NewScan().ValueOrDie();
 
-  auto projection = std::vector<std::string>{"DOLocationID", "PULocationID",
-                                             "passenger_count", "payment_type"};
-  auto filter = ("payment_type"_ == int64_t(1) && "passenger_count"_ > int64_t(4)).Copy();
-
+  auto projection = std::vector<std::string>{"DOLocationID", "PULocationID","trip_distance", "total_amount",
+                                             "passenger_count"};
+//  auto filter = ("payment_type"_ == int64_t(1) && "passenger_count"_ > int64_t(4)).Copy();
+  auto filter = ("trip_distance"_ > double(50.0f)).Copy();
   builder->Project(projection);
   builder->Filter(filter);
   auto scanner = builder->Finish().ValueOrDie();
 
   auto table = scanner->ToTable().ValueOrDie();
   std::cout << table->ToString() << "\n";
+  std::cout << table->num_rows() << "\n";
 
   ASSERT_EQ(table->num_columns(), 4);
   ASSERT_EQ(table->num_rows(), 5651);
