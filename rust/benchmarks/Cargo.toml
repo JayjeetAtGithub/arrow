@@ -18,7 +18,7 @@
 [package]
 name = "arrow-benchmarks"
 description = "Apache Arrow Benchmarks"
-version = "2.0.0-SNAPSHOT"
+version = "3.0.0-SNAPSHOT"
 edition = "2018"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 homepage = "https://github.com/apache/arrow"
@@ -27,6 +27,9 @@ license = "Apache-2.0"
 
 [dependencies]
 arrow = { path = "../arrow" }
+parquet = { path = "../parquet" }
 datafusion = { path = "../datafusion" }
-
 structopt = { version = "0.3", default-features = false }
+tokio = { version = "0.2", features = ["macros", "rt-core", "rt-threaded"] }
+futures = "0.3"
+env_logger = "^0.8"

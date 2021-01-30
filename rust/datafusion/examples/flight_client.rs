@@ -23,13 +23,15 @@ use arrow::util::pretty;
 
 use arrow_flight::flight_descriptor;
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::utils::flight_data_to_batch;
+use arrow_flight::utils::flight_data_to_arrow_batch;
 use arrow_flight::{FlightDescriptor, Ticket};
 
+/// This example shows how to wrap DataFusion with `FlightService` to support looking up schema information for
+/// Parquet files and executing SQL queries against them on a remote server.
+/// This example is run along-side the example `flight_server`.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let testdata =
-        std::env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::parquet_test_data();
 
     // Create Flight client
     let mut client = FlightServiceClient::connect("http://localhost:50051").await?;
@@ -62,7 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut results = vec![];
     while let Some(flight_data) = stream.message().await? {
         // the unwrap is infallible and thus safe
-        let record_batch = flight_data_to_batch(&flight_data, schema.clone())?.unwrap();
+        let record_batch =
+            flight_data_to_arrow_batch(&flight_data, schema.clone()).unwrap()?;
         results.push(record_batch);
     }
 

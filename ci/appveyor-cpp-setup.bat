@@ -62,10 +62,10 @@ if "%JOB%" NEQ "Build_Debug" (
     --file=ci\conda_env_python.yml ^
     %CONDA_PACKAGES%  ^
     "cmake=3.17" ^
-    "boost-cpp<1.70" ^
     "ninja" ^
     "nomkl" ^
     "pandas" ^
+    "fsspec" ^
     "python=%PYTHON%" ^
     || exit /B
 )

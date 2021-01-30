@@ -45,6 +45,7 @@ pub struct Row {
     fields: Vec<(String, Field)>,
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl Row {
     /// Get the number of fields in this row.
     pub fn len(&self) -> usize {
@@ -231,10 +232,15 @@ pub struct List {
     elements: Vec<Field>,
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl List {
     /// Get the number of fields in this row
     pub fn len(&self) -> usize {
         self.elements.len()
+    }
+
+    pub fn elements(&self) -> &[Field] {
+        self.elements.as_slice()
     }
 }
 
@@ -348,10 +354,15 @@ pub struct Map {
     entries: Vec<(Field, Field)>,
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl Map {
     /// Get the number of fields in this row
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn entries(&self) -> &[(Field, Field)] {
+        self.entries.as_slice()
     }
 }
 
@@ -526,12 +537,10 @@ impl Field {
 
     /// Determines if this Row represents a primitive value.
     pub fn is_primitive(&self) -> bool {
-        match *self {
-            Field::Group(_) => false,
-            Field::ListInternal(_) => false,
-            Field::MapInternal(_) => false,
-            _ => true,
-        }
+        !matches!(
+            *self,
+            Field::Group(_) | Field::ListInternal(_) | Field::MapInternal(_)
+        )
     }
 
     /// Converts Parquet BOOLEAN type with logical type into `bool` value.
@@ -642,14 +651,14 @@ impl fmt::Display for Field {
             Field::UInt(value) => write!(f, "{}", value),
             Field::ULong(value) => write!(f, "{}", value),
             Field::Float(value) => {
-                if value > 1e19 || value < 1e-15 {
+                if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
                 } else {
                     write!(f, "{:?}", value)
                 }
             }
             Field::Double(value) => {
-                if value > 1e19 || value < 1e-15 {
+                if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
                 } else {
                     write!(f, "{:?}", value)
@@ -756,11 +765,11 @@ fn convert_decimal_to_string(decimal: &Decimal) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant, clippy::many_single_char_names)]
 mod tests {
     use super::*;
 
-    use chrono;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::schema::types::{ColumnDescriptor, ColumnPath, PrimitiveTypeBuilder};
 
@@ -771,9 +780,8 @@ mod tests {
                 .with_logical_type($logical_type)
                 .build()
                 .unwrap();
-            Rc::new(ColumnDescriptor::new(
-                Rc::new(tpe),
-                None,
+            Arc::new(ColumnDescriptor::new(
+                Arc::new(tpe),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -787,9 +795,8 @@ mod tests {
                 .with_scale($scale)
                 .build()
                 .unwrap();
-            Rc::new(ColumnDescriptor::new(
-                Rc::new(tpe),
-                None,
+            Arc::new(ColumnDescriptor::new(
+                Arc::new(tpe),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -983,11 +990,11 @@ mod tests {
             assert_eq!(res, exp);
         }
 
-        check_date_conversion(2010, 01, 02);
-        check_date_conversion(2014, 05, 01);
-        check_date_conversion(2016, 02, 29);
-        check_date_conversion(2017, 09, 12);
-        check_date_conversion(2018, 03, 31);
+        check_date_conversion(2010, 1, 2);
+        check_date_conversion(2014, 5, 1);
+        check_date_conversion(2016, 2, 29);
+        check_date_conversion(2017, 9, 12);
+        check_date_conversion(2018, 3, 31);
     }
 
     #[test]
@@ -1000,10 +1007,10 @@ mod tests {
             assert_eq!(res, exp);
         }
 
-        check_datetime_conversion(2010, 01, 02, 13, 12, 54);
-        check_datetime_conversion(2011, 01, 03, 08, 23, 01);
-        check_datetime_conversion(2012, 04, 05, 11, 06, 32);
-        check_datetime_conversion(2013, 05, 12, 16, 38, 00);
+        check_datetime_conversion(2010, 1, 2, 13, 12, 54);
+        check_datetime_conversion(2011, 1, 3, 8, 23, 1);
+        check_datetime_conversion(2012, 4, 5, 11, 6, 32);
+        check_datetime_conversion(2013, 5, 12, 16, 38, 0);
         check_datetime_conversion(2014, 11, 28, 21, 15, 12);
     }
 
@@ -1311,8 +1318,8 @@ mod tests {
         assert_eq!(4, row.get_ushort(7).unwrap());
         assert_eq!(5, row.get_uint(8).unwrap());
         assert_eq!(6, row.get_ulong(9).unwrap());
-        assert_eq!(7.1, row.get_float(10).unwrap());
-        assert_eq!(8.1, row.get_double(11).unwrap());
+        assert!(7.1 - row.get_float(10).unwrap() < f32::EPSILON);
+        assert!(8.1 - row.get_double(11).unwrap() < f64::EPSILON);
         assert_eq!("abc", row.get_string(12).unwrap());
         assert_eq!(5, row.get_bytes(13).unwrap().len());
         assert_eq!(7, row.get_decimal(14).unwrap().precision());
@@ -1459,10 +1466,10 @@ mod tests {
             Field::Float(9.2),
             Field::Float(10.3),
         ]);
-        assert_eq!(10.3, list.get_float(2).unwrap());
+        assert!(10.3 - list.get_float(2).unwrap() < f32::EPSILON);
 
         let list = make_list(vec![Field::Double(3.1415)]);
-        assert_eq!(3.1415, list.get_double(0).unwrap());
+        assert!(3.1415 - list.get_double(0).unwrap() < f64::EPSILON);
 
         let list = make_list(vec![Field::Str("abc".to_string())]);
         assert_eq!(&"abc".to_string(), list.get_string(0).unwrap());
@@ -1596,9 +1603,71 @@ mod tests {
         for i in 0..5 {
             assert_eq!((i + 1) as i32, map.get_keys().get_int(i).unwrap());
             assert_eq!(
-                &((i as u8 + 'a' as u8) as char).to_string(),
+                &((i as u8 + b'a') as char).to_string(),
                 map.get_values().get_string(i).unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::approx_constant, clippy::many_single_char_names)]
+mod api_tests {
+    use super::{make_list, make_map, make_row};
+    use crate::record::Field;
+
+    #[test]
+    fn test_field_visibility() {
+        let row = make_row(vec![(
+            "a".to_string(),
+            Field::Group(make_row(vec![
+                ("x".to_string(), Field::Null),
+                ("Y".to_string(), Field::Int(2)),
+            ])),
+        )]);
+
+        match row.get_column_iter().next() {
+            Some(column) => {
+                assert_eq!("a", column.0);
+                match column.1 {
+                    Field::Group(r) => {
+                        assert_eq!(
+                            &make_row(vec![
+                                ("x".to_string(), Field::Null),
+                                ("Y".to_string(), Field::Int(2)),
+                            ]),
+                            r
+                        );
+                    }
+                    _ => panic!("Expected the first column to be Field::Group"),
+                }
+            }
+            None => panic!("Expected at least one column"),
+        }
+    }
+
+    #[test]
+    fn test_list_element_access() {
+        let expected = vec![
+            Field::Int(1),
+            Field::Group(make_row(vec![
+                ("x".to_string(), Field::Null),
+                ("Y".to_string(), Field::Int(2)),
+            ])),
+        ];
+
+        let list = make_list(expected.clone());
+        assert_eq!(expected.as_slice(), list.elements());
+    }
+
+    #[test]
+    fn test_map_entry_access() {
+        let expected = vec![
+            (Field::Str("one".to_owned()), Field::Int(1)),
+            (Field::Str("two".to_owned()), Field::Int(2)),
+        ];
+
+        let map = make_map(expected.clone());
+        assert_eq!(expected.as_slice(), map.entries());
     }
 }

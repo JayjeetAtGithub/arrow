@@ -21,10 +21,9 @@
 #include "arrow/python/common.h"
 #include "arrow/python/decimal.h"
 #include "arrow/python/helpers.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/decimal.h"
 #include "arrow/util/logging.h"
-
-#include <arrow/api.h>
 
 namespace arrow {
 namespace py {
@@ -109,13 +108,14 @@ PyObject* DecimalFromString(PyObject* decimal_constructor,
 
 namespace {
 
+template <typename ArrowDecimal>
 Status DecimalFromStdString(const std::string& decimal_string,
-                            const DecimalType& arrow_type, Decimal128* out) {
+                            const DecimalType& arrow_type, ArrowDecimal* out) {
   int32_t inferred_precision;
   int32_t inferred_scale;
 
-  RETURN_NOT_OK(
-      Decimal128::FromString(decimal_string, out, &inferred_precision, &inferred_scale));
+  RETURN_NOT_OK(ArrowDecimal::FromString(decimal_string, out, &inferred_precision,
+                                         &inferred_scale));
 
   const int32_t precision = arrow_type.precision();
   const int32_t scale = arrow_type.scale();
@@ -133,10 +133,10 @@ Status DecimalFromStdString(const std::string& decimal_string,
   return Status::OK();
 }
 
-}  // namespace
-
-Status DecimalFromPythonDecimal(PyObject* python_decimal, const DecimalType& arrow_type,
-                                Decimal128* out) {
+template <typename ArrowDecimal>
+Status InternalDecimalFromPythonDecimal(PyObject* python_decimal,
+                                        const DecimalType& arrow_type,
+                                        ArrowDecimal* out) {
   DCHECK_NE(python_decimal, NULLPTR);
   DCHECK_NE(out, NULLPTR);
 
@@ -145,8 +145,9 @@ Status DecimalFromPythonDecimal(PyObject* python_decimal, const DecimalType& arr
   return DecimalFromStdString(string, arrow_type, out);
 }
 
-Status DecimalFromPyObject(PyObject* obj, const DecimalType& arrow_type,
-                           Decimal128* out) {
+template <typename ArrowDecimal>
+Status InternalDecimalFromPyObject(PyObject* obj, const DecimalType& arrow_type,
+                                   ArrowDecimal* out) {
   DCHECK_NE(obj, NULLPTR);
   DCHECK_NE(out, NULLPTR);
 
@@ -156,11 +157,33 @@ Status DecimalFromPyObject(PyObject* obj, const DecimalType& arrow_type,
     RETURN_NOT_OK(PyObject_StdStringStr(obj, &string));
     return DecimalFromStdString(string, arrow_type, out);
   } else if (PyDecimal_Check(obj)) {
-    return DecimalFromPythonDecimal(obj, arrow_type, out);
+    return InternalDecimalFromPythonDecimal<ArrowDecimal>(obj, arrow_type, out);
   } else {
     return Status::TypeError("int or Decimal object expected, got ",
                              Py_TYPE(obj)->tp_name);
   }
+}
+
+}  // namespace
+
+Status DecimalFromPythonDecimal(PyObject* python_decimal, const DecimalType& arrow_type,
+                                Decimal128* out) {
+  return InternalDecimalFromPythonDecimal(python_decimal, arrow_type, out);
+}
+
+Status DecimalFromPyObject(PyObject* obj, const DecimalType& arrow_type,
+                           Decimal128* out) {
+  return InternalDecimalFromPyObject(obj, arrow_type, out);
+}
+
+Status DecimalFromPythonDecimal(PyObject* python_decimal, const DecimalType& arrow_type,
+                                Decimal256* out) {
+  return InternalDecimalFromPythonDecimal(python_decimal, arrow_type, out);
+}
+
+Status DecimalFromPyObject(PyObject* obj, const DecimalType& arrow_type,
+                           Decimal256* out) {
+  return InternalDecimalFromPyObject(obj, arrow_type, out);
 }
 
 bool PyDecimal_Check(PyObject* obj) {

@@ -22,13 +22,11 @@
 #include <memory>
 #include <numeric>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "arrow/array/builder_primitive.h"
 #include "arrow/buffer.h"
-#include "arrow/buffer_builder.h"
-#include "arrow/builder.h"
 #include "arrow/compute/api.h"
 #include "arrow/dataset/dataset.h"
 #include "arrow/io/memory.h"
@@ -79,6 +77,14 @@ struct Comparison {
     NULL_,
   };
 };
+
+Result<std::shared_ptr<Scalar>> EnsureNotDictionary(
+    const std::shared_ptr<Scalar>& scalar) {
+  if (scalar->type->id() == Type::DICTIONARY) {
+    return checked_cast<const DictionaryScalar&>(*scalar).GetEncodedValue();
+  }
+  return scalar;
+}
 
 Result<Comparison::type> Compare(const Scalar& lhs, const Scalar& rhs);
 
@@ -136,6 +142,7 @@ struct CompareVisitor {
   }
 
   Status Visit(const Decimal128Type&) { return CompareValues<Decimal128Type>(); }
+  Status Visit(const Decimal256Type&) { return CompareValues<Decimal256Type>(); }
 
   // Explicit because it falls under `physical_unsigned_integer`.
   // TODO(bkietz) whenever we vendor a float16, this can be implemented
@@ -148,11 +155,7 @@ struct CompareVisitor {
   }
 
   Status Visit(const DictionaryType&) {
-    ARROW_ASSIGN_OR_RAISE(auto lhs,
-                          checked_cast<const DictionaryScalar&>(lhs_).GetEncodedValue());
-    ARROW_ASSIGN_OR_RAISE(auto rhs,
-                          checked_cast<const DictionaryScalar&>(rhs_).GetEncodedValue());
-    return Compare(*lhs, *rhs).Value(&result_);
+    return Status::NotImplemented("comparison of scalars of type ", *lhs_.type);
   }
 
   // defer comparison to ScalarType<T>::value
@@ -357,9 +360,17 @@ std::shared_ptr<Expression> ComparisonExpression::AssumeGivenComparison(
     }
   }
 
-  const auto& this_rhs = checked_cast<const ScalarExpression&>(*right_operand_).value();
-  const auto& given_rhs =
-      checked_cast<const ScalarExpression&>(*given.right_operand_).value();
+  auto this_rhs =
+      EnsureNotDictionary(checked_cast<const ScalarExpression&>(*right_operand_).value())
+          .ValueOr(nullptr);
+  auto given_rhs =
+      EnsureNotDictionary(
+          checked_cast<const ScalarExpression&>(*given.right_operand_).value())
+          .ValueOr(nullptr);
+
+  if (!this_rhs || !given_rhs) {
+    return Copy();
+  }
 
   auto cmp = Compare(*this_rhs, *given_rhs).ValueOrDie();
 
@@ -805,6 +816,7 @@ std::shared_ptr<Expression> and_(std::shared_ptr<Expression> lhs,
 std::shared_ptr<Expression> and_(const ExpressionVector& subexpressions) {
   auto acc = scalar(true);
   for (const auto& next : subexpressions) {
+    if (next->Equals(false)) return next;
     acc = acc->Equals(true) ? next : and_(std::move(acc), next);
   }
   return acc;
@@ -818,6 +830,7 @@ std::shared_ptr<Expression> or_(std::shared_ptr<Expression> lhs,
 std::shared_ptr<Expression> or_(const ExpressionVector& subexpressions) {
   auto acc = scalar(false);
   for (const auto& next : subexpressions) {
+    if (next->Equals(true)) return next;
     acc = acc->Equals(false) ? next : or_(std::move(acc), next);
   }
   return acc;
@@ -1179,8 +1192,8 @@ struct TreeEvaluator::Impl {
                                 Result<Datum> kernel(const Datum& left,
                                                      const Datum& right,
                                                      ExecContext* ctx)) const {
-    ARROW_ASSIGN_OR_RAISE(auto lhs, Evaluate(*expr.left_operand()));
-    ARROW_ASSIGN_OR_RAISE(auto rhs, Evaluate(*expr.right_operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum lhs, Evaluate(*expr.left_operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum rhs, Evaluate(*expr.right_operand()));
 
     if (lhs.is_scalar()) {
       ARROW_ASSIGN_OR_RAISE(
@@ -1200,7 +1213,7 @@ struct TreeEvaluator::Impl {
   }
 
   Result<Datum> operator()(const NotExpression& expr) const {
-    ARROW_ASSIGN_OR_RAISE(auto to_invert, Evaluate(*expr.operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum to_invert, Evaluate(*expr.operand()));
     if (IsNullDatum(to_invert)) {
       return NullDatum();
     }
@@ -1214,7 +1227,7 @@ struct TreeEvaluator::Impl {
   }
 
   Result<Datum> operator()(const InExpression& expr) const {
-    ARROW_ASSIGN_OR_RAISE(auto operand_values, Evaluate(*expr.operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum operand_values, Evaluate(*expr.operand()));
     if (IsNullDatum(operand_values)) {
       return Datum(expr.set()->null_count() != 0);
     }
@@ -1224,7 +1237,7 @@ struct TreeEvaluator::Impl {
   }
 
   Result<Datum> operator()(const IsValidExpression& expr) const {
-    ARROW_ASSIGN_OR_RAISE(auto operand_values, Evaluate(*expr.operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum operand_values, Evaluate(*expr.operand()));
     if (IsNullDatum(operand_values)) {
       return Datum(false);
     }
@@ -1255,14 +1268,42 @@ struct TreeEvaluator::Impl {
   }
 
   Result<Datum> operator()(const ComparisonExpression& expr) const {
-    ARROW_ASSIGN_OR_RAISE(auto lhs, Evaluate(*expr.left_operand()));
-    ARROW_ASSIGN_OR_RAISE(auto rhs, Evaluate(*expr.right_operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum lhs, Evaluate(*expr.left_operand()));
+    ARROW_ASSIGN_OR_RAISE(Datum rhs, Evaluate(*expr.right_operand()));
 
     if (IsNullDatum(lhs) || IsNullDatum(rhs)) {
       return Datum(std::make_shared<BooleanScalar>());
     }
 
-    DCHECK(lhs.is_array());
+    if (lhs.type()->id() == Type::DICTIONARY && rhs.type()->id() == Type::DICTIONARY) {
+      if (lhs.is_array() && rhs.is_array()) {
+        // decode dictionary arrays
+        for (Datum* arg : {&lhs, &rhs}) {
+          auto dict = checked_pointer_cast<DictionaryArray>(arg->make_array());
+          ARROW_ASSIGN_OR_RAISE(*arg, compute::Take(dict->dictionary(), dict->indices(),
+                                                    compute::TakeOptions::Defaults()));
+        }
+      } else if (lhs.is_array() || rhs.is_array()) {
+        auto dict = checked_pointer_cast<DictionaryArray>(
+            (lhs.is_array() ? lhs : rhs).make_array());
+
+        ARROW_ASSIGN_OR_RAISE(auto scalar, checked_cast<const DictionaryScalar&>(
+                                               *(lhs.is_scalar() ? lhs : rhs).scalar())
+                                               .GetEncodedValue());
+        if (lhs.is_array()) {
+          lhs = dict->dictionary();
+          rhs = std::move(scalar);
+        } else {
+          lhs = std::move(scalar);
+          rhs = dict->dictionary();
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            Datum out_dict,
+            compute::Compare(lhs, rhs, compute::CompareOptions(expr.op()), &ctx_));
+
+        return compute::Take(out_dict, dict->indices(), compute::TakeOptions::Defaults());
+      }
+    }
 
     return compute::Compare(lhs, rhs, compute::CompareOptions(expr.op()), &ctx_);
   }
@@ -1309,7 +1350,11 @@ Result<std::shared_ptr<RecordBatch>> TreeEvaluator::Filter(
   return batch->Slice(0, 0);
 }
 
-std::shared_ptr<Expression> scalar(bool value) { return scalar(MakeScalar(value)); }
+const std::shared_ptr<Expression>& scalar(bool value) {
+  static auto true_ = scalar(MakeScalar(true));
+  static auto false_ = scalar(MakeScalar(false));
+  return value ? true_ : false_;
+}
 
 // Serialization is accomplished by converting expressions to single element StructArrays
 // then writing that to an IPC file. The last field is always an int32 column containing
@@ -1431,7 +1476,7 @@ struct DeserializeImpl {
     switch (expression_type) {
       case ExpressionType::FIELD: {
         ARROW_ASSIGN_OR_RAISE(auto name, GetView<StringType>(struct_array, 0));
-        return field_ref(name.to_string());
+        return field_ref(std::string(name));
       }
 
       case ExpressionType::SCALAR: {
@@ -1617,15 +1662,17 @@ class StructDictionary {
   }
 
  private:
-  Status AddOne(const std::shared_ptr<Array>& column,
-                std::shared_ptr<Int32Array>* fused_indices) {
-    ARROW_ASSIGN_OR_RAISE(Datum encoded, compute::DictionaryEncode(column));
-    ArrayData* encoded_array = encoded.mutable_array();
+  Status AddOne(Datum column, std::shared_ptr<Int32Array>* fused_indices) {
+    ArrayData* encoded;
+    if (column.type()->id() != Type::DICTIONARY) {
+      ARROW_ASSIGN_OR_RAISE(column, compute::DictionaryEncode(column));
+    }
+    encoded = column.mutable_array();
 
-    auto indices = std::make_shared<Int32Array>(encoded_array->length,
-                                                std::move(encoded_array->buffers[1]));
+    auto indices =
+        std::make_shared<Int32Array>(encoded->length, std::move(encoded->buffers[1]));
 
-    dictionaries_.push_back(MakeArray(std::move(encoded_array->dictionary)));
+    dictionaries_.push_back(MakeArray(std::move(encoded->dictionary)));
     auto dictionary_size = static_cast<int32_t>(dictionaries_.back()->length());
 
     if (*fused_indices == nullptr) {
@@ -1671,7 +1718,7 @@ Result<std::shared_ptr<StructArray>> MakeGroupings(const StructArray& by) {
 
   ARROW_ASSIGN_OR_RAISE(auto fused, StructDictionary::Encode(by.fields()));
 
-  ARROW_ASSIGN_OR_RAISE(auto sort_indices, compute::SortToIndices(*fused.indices));
+  ARROW_ASSIGN_OR_RAISE(auto sort_indices, compute::SortIndices(*fused.indices));
   ARROW_ASSIGN_OR_RAISE(Datum sorted, compute::Take(fused.indices, *sort_indices));
   fused.indices = checked_pointer_cast<Int32Array>(sorted.make_array());
 

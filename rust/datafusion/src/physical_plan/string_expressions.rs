@@ -17,8 +17,11 @@
 
 //! String expressions
 
-use crate::error::{ExecutionError, Result};
-use arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
+use crate::error::{DataFusionError, Result};
+use arrow::array::{
+    Array, ArrayRef, GenericStringArray, StringArray, StringBuilder,
+    StringOffsetSizeTrait,
+};
 
 macro_rules! downcast_vec {
     ($ARGS:expr, $ARRAY_TYPE:ident) => {{
@@ -26,7 +29,7 @@ macro_rules! downcast_vec {
             .iter()
             .map(|e| match e.as_any().downcast_ref::<$ARRAY_TYPE>() {
                 Some(array) => Ok(array),
-                _ => Err(ExecutionError::General("failed to downcast".to_string())),
+                _ => Err(DataFusionError::Internal("failed to downcast".to_string())),
             })
     }};
 }
@@ -36,8 +39,8 @@ pub fn concatenate(args: &[ArrayRef]) -> Result<StringArray> {
     // downcast all arguments to strings
     let args = downcast_vec!(args, StringArray).collect::<Result<Vec<&StringArray>>>()?;
     // do not accept 0 arguments.
-    if args.len() == 0 {
-        return Err(ExecutionError::InternalError(
+    if args.is_empty() {
+        return Err(DataFusionError::Internal(
             "Concatenate was called with 0 arguments. It requires at least one."
                 .to_string(),
         ));
@@ -66,3 +69,23 @@ pub fn concatenate(args: &[ArrayRef]) -> Result<StringArray> {
     }
     Ok(builder.finish())
 }
+
+macro_rules! string_unary_function {
+    ($NAME:ident, $FUNC:ident) => {
+        /// string function that accepts Utf8 or LargeUtf8 and returns Utf8 or LargeUtf8
+        pub fn $NAME<T: StringOffsetSizeTrait>(
+            args: &[ArrayRef],
+        ) -> Result<GenericStringArray<T>> {
+            let array = args[0]
+                .as_any()
+                .downcast_ref::<GenericStringArray<T>>()
+                .unwrap();
+            // first map is the iterator, second is for the `Option<_>`
+            Ok(array.iter().map(|x| x.map(|x| x.$FUNC())).collect())
+        }
+    };
+}
+
+string_unary_function!(lower, to_ascii_lowercase);
+string_unary_function!(upper, to_ascii_uppercase);
+string_unary_function!(trim, trim);

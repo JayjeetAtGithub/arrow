@@ -19,14 +19,16 @@
 
 use crate::arrow::array_reader::{build_array_reader, ArrayReader, StructArrayReader};
 use crate::arrow::schema::parquet_to_arrow_schema;
-use crate::arrow::schema::parquet_to_arrow_schema_by_columns;
+use crate::arrow::schema::{
+    parquet_to_arrow_schema_by_columns, parquet_to_arrow_schema_by_root_columns,
+};
 use crate::errors::{ParquetError, Result};
+use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::FileReader;
-use arrow::array::StructArray;
 use arrow::datatypes::{DataType as ArrowType, Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
-use std::rc::Rc;
+use arrow::{array::StructArray, error::ArrowError};
 use std::sync::Arc;
 
 /// Arrow reader api.
@@ -40,7 +42,12 @@ pub trait ArrowReader {
 
     /// Read parquet schema and convert it into arrow schema.
     /// This schema only includes columns identified by `column_indices`.
-    fn get_schema_by_columns<T>(&mut self, column_indices: T) -> Result<Schema>
+    /// To select leaf columns (i.e. `a.b.c` instead of `a`), set `leaf_columns = true`
+    fn get_schema_by_columns<T>(
+        &mut self,
+        column_indices: T,
+        leaf_columns: bool,
+    ) -> Result<Schema>
     where
         T: IntoIterator<Item = usize>;
 
@@ -70,7 +77,7 @@ pub trait ArrowReader {
 }
 
 pub struct ParquetFileArrowReader {
-    file_reader: Rc<dyn FileReader>,
+    file_reader: Arc<dyn FileReader>,
 }
 
 impl ArrowReader for ParquetFileArrowReader {
@@ -84,16 +91,28 @@ impl ArrowReader for ParquetFileArrowReader {
         )
     }
 
-    fn get_schema_by_columns<T>(&mut self, column_indices: T) -> Result<Schema>
+    fn get_schema_by_columns<T>(
+        &mut self,
+        column_indices: T,
+        leaf_columns: bool,
+    ) -> Result<Schema>
     where
         T: IntoIterator<Item = usize>,
     {
         let file_metadata = self.file_reader.metadata().file_metadata();
-        parquet_to_arrow_schema_by_columns(
-            file_metadata.schema_descr(),
-            column_indices,
-            file_metadata.key_value_metadata(),
-        )
+        if leaf_columns {
+            parquet_to_arrow_schema_by_columns(
+                file_metadata.schema_descr(),
+                column_indices,
+                file_metadata.key_value_metadata(),
+            )
+        } else {
+            parquet_to_arrow_schema_by_root_columns(
+                file_metadata.schema_descr(),
+                column_indices,
+                file_metadata.key_value_metadata(),
+            )
+        }
     }
 
     fn get_record_reader(
@@ -123,6 +142,7 @@ impl ArrowReader for ParquetFileArrowReader {
                 .metadata()
                 .file_metadata()
                 .schema_descr_ptr(),
+            self.get_schema()?,
             column_indices,
             self.file_reader.clone(),
         )?;
@@ -132,8 +152,13 @@ impl ArrowReader for ParquetFileArrowReader {
 }
 
 impl ParquetFileArrowReader {
-    pub fn new(file_reader: Rc<dyn FileReader>) -> Self {
+    pub fn new(file_reader: Arc<dyn FileReader>) -> Self {
         Self { file_reader }
+    }
+
+    // Expose the reader metadata
+    pub fn get_metadata(&mut self) -> ParquetMetaData {
+        self.file_reader.metadata().clone()
     }
 }
 
@@ -143,37 +168,42 @@ pub struct ParquetRecordBatchReader {
     schema: SchemaRef,
 }
 
+impl Iterator for ParquetRecordBatchReader {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.array_reader.next_batch(self.batch_size) {
+            Err(error) => Some(Err(error.into())),
+            Ok(array) => {
+                let struct_array =
+                    array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                        ArrowError::ParquetError(
+                            "Struct array reader should return struct array".to_string(),
+                        )
+                    });
+                match struct_array {
+                    Err(err) => Some(Err(err)),
+                    Ok(e) => {
+                        match RecordBatch::try_new(self.schema.clone(), e.columns_ref()) {
+                            Err(err) => Some(Err(err)),
+                            Ok(record_batch) => {
+                                if record_batch.num_rows() > 0 {
+                                    Some(Ok(record_batch))
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl RecordBatchReader for ParquetRecordBatchReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
-    }
-
-    fn next_batch(&mut self) -> ArrowResult<Option<RecordBatch>> {
-        self.array_reader
-            .next_batch(self.batch_size)
-            .map_err(|err| err.into())
-            .and_then(|array| {
-                array
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| {
-                        general_err!("Struct array reader should return struct array")
-                            .into()
-                    })
-                    .and_then(|struct_array| {
-                        RecordBatch::try_new(
-                            self.schema.clone(),
-                            struct_array.columns_ref(),
-                        )
-                    })
-            })
-            .map(|record_batch| {
-                if record_batch.num_rows() > 0 {
-                    Some(record_batch)
-                } else {
-                    None
-                }
-            })
     }
 }
 
@@ -189,7 +219,7 @@ impl ParquetRecordBatchReader {
             .ok_or_else(|| general_err!("The input must be struct array reader!"))?;
 
         let schema = match array_reader.get_data_type() {
-            &ArrowType::Struct(ref fields) => Schema::new(fields.clone()),
+            ArrowType::Struct(ref fields) => Schema::new(fields.clone()),
             _ => unreachable!("Struct array reader's data type is not struct!"),
         };
 
@@ -205,11 +235,13 @@ impl ParquetRecordBatchReader {
 mod tests {
     use crate::arrow::arrow_reader::{ArrowReader, ParquetFileArrowReader};
     use crate::arrow::converter::{
-        Converter, FixedSizeArrayConverter, FromConverter, Utf8ArrayConverter,
+        Converter, FixedSizeArrayConverter, FromConverter, IntervalDayTimeArrayConverter,
+        Utf8ArrayConverter,
     };
     use crate::column::writer::get_typed_column_writer_mut;
     use crate::data_type::{
-        BoolType, ByteArray, ByteArrayType, DataType, FixedLenByteArrayType, Int32Type,
+        BoolType, ByteArray, ByteArrayType, DataType, FixedLenByteArray,
+        FixedLenByteArrayType, Int32Type,
     };
     use crate::errors::Result;
     use crate::file::properties::WriterProperties;
@@ -218,19 +250,16 @@ mod tests {
     use crate::schema::parser::parse_message_type;
     use crate::schema::types::TypePtr;
     use crate::util::test_common::{get_temp_filename, RandGen};
-    use arrow::array::{
-        Array, BooleanArray, FixedSizeBinaryArray, StringArray, StructArray,
-    };
+    use arrow::array::*;
     use arrow::record_batch::RecordBatchReader;
     use rand::RngCore;
     use serde_json::json;
     use serde_json::Value::{Array as JArray, Null as JNull, Object as JObject};
     use std::cmp::min;
     use std::convert::TryFrom;
-    use std::env;
     use std::fs::File;
     use std::path::{Path, PathBuf};
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn test_arrow_reader_all_columns() {
@@ -296,60 +325,21 @@ mod tests {
         ";
 
         let converter = FromConverter::new();
-        single_column_reader_test::<
+        run_single_column_reader_tests::<
             BoolType,
             BooleanArray,
             FromConverter<Vec<Option<bool>>, BooleanArray>,
             BoolType,
-        >(2, 100, 2, message_type, 15, 50, converter);
-    }
-
-    #[test]
-    fn test_bool_single_column_reader_test_batch_size_divides_into_row_group_size() {
-        let message_type = "
-        message test_schema {
-          REQUIRED BOOLEAN leaf;
-        }
-        ";
-
-        // Use a batch size (5) so batches to fall on
-        // row group boundaries (25 rows in 3 row groups --> row
-        // groups of 10, 10, and 5) to test edge refilling edge cases.
-        let converter = FromConverter::new();
-        single_column_reader_test::<
-            BoolType,
-            BooleanArray,
-            FromConverter<Vec<Option<bool>>, BooleanArray>,
-            BoolType,
-        >(3, 25, 2, message_type, 5, 50, converter);
-    }
-
-    #[test]
-    fn test_bool_single_column_reader_test_batch_size_divides_into_row_group_size2() {
-        let message_type = "
-        message test_schema {
-          REQUIRED BOOLEAN leaf;
-        }
-        ";
-
-        // Ensure that every batch size (25) falls exactly a row group
-        // boundary (25 in this case) to test edge case.
-        let converter = FromConverter::new();
-        single_column_reader_test::<
-            BoolType,
-            BooleanArray,
-            FromConverter<Vec<Option<bool>>, BooleanArray>,
-            BoolType,
-        >(4, 100, 2, message_type, 25, 50, converter);
+        >(2, message_type, &converter);
     }
 
     struct RandFixedLenGen {}
 
     impl RandGen<FixedLenByteArrayType> for RandFixedLenGen {
-        fn gen(len: i32) -> ByteArray {
+        fn gen(len: i32) -> FixedLenByteArray {
             let mut v = vec![0u8; len as usize];
             rand::thread_rng().fill_bytes(&mut v);
-            v.into()
+            ByteArray::from(v).into()
         }
     }
 
@@ -362,12 +352,29 @@ mod tests {
         ";
 
         let converter = FixedSizeArrayConverter::new(20);
-        single_column_reader_test::<
+        run_single_column_reader_tests::<
             FixedLenByteArrayType,
             FixedSizeBinaryArray,
             FixedSizeArrayConverter,
             RandFixedLenGen,
-        >(2, 100, 20, message_type, 15, 50, converter);
+        >(20, message_type, &converter);
+    }
+
+    #[test]
+    fn test_interval_day_time_column_reader() {
+        let message_type = "
+        message test_schema {
+          REQUIRED FIXED_LEN_BYTE_ARRAY (12) leaf (INTERVAL);
+        }
+        ";
+
+        let converter = IntervalDayTimeArrayConverter {};
+        run_single_column_reader_tests::<
+            FixedLenByteArrayType,
+            IntervalDayTimeArray,
+            IntervalDayTimeArrayConverter,
+            RandFixedLenGen,
+        >(12, message_type, &converter);
     }
 
     struct RandUtf8Gen {}
@@ -387,47 +394,146 @@ mod tests {
         ";
 
         let converter = Utf8ArrayConverter {};
-        single_column_reader_test::<
+        run_single_column_reader_tests::<
             ByteArrayType,
             StringArray,
             Utf8ArrayConverter,
             RandUtf8Gen,
-        >(2, 100, 2, message_type, 15, 50, converter);
+        >(2, message_type, &converter);
     }
 
-    fn single_column_reader_test<T, A, C, G>(
+    #[test]
+    fn test_read_decimal_file() {
+        use arrow::array::DecimalArray;
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{}/fixed_length_decimal.parquet", testdata);
+        let parquet_reader =
+            SerializedFileReader::try_from(File::open(&path).unwrap()).unwrap();
+        let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(parquet_reader));
+
+        let mut record_reader = arrow_reader.get_record_reader(32).unwrap();
+
+        let batch = record_reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 24);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DecimalArray>()
+            .unwrap();
+
+        let expected = 1..25;
+
+        for (i, v) in expected.enumerate() {
+            assert_eq!(col.value(i), v * 100_i128);
+        }
+    }
+
+    /// Parameters for single_column_reader_test
+    #[derive(Debug)]
+    struct TestOptions {
+        /// Number of row group to write to parquet (row group size =
+        /// num_row_groups / num_rows)
         num_row_groups: usize,
+        /// Total number of rows
         num_rows: usize,
+        /// Size of batches to read back
+        record_batch_size: usize,
+        /// Total number of batches to attempt to read.
+        /// `record_batch_size` * `num_iterations` should be greater
+        /// than `num_rows` to ensure the data can be read back completely
+        num_iterations: usize,
+    }
+
+    /// Create a parquet file and then read it using
+    /// `ParquetFileArrowReader` using a standard set of parameters
+    /// `opts`.
+    ///
+    /// `rand_max` represents the maximum size of value to pass to to
+    /// value generator
+    fn run_single_column_reader_tests<T, A, C, G>(
         rand_max: i32,
         message_type: &str,
-        record_batch_size: usize,
-        num_iterations: usize,
-        converter: C,
+        converter: &C,
     ) where
         T: DataType,
         G: RandGen<T>,
         A: PartialEq + Array + 'static,
         C: Converter<Vec<Option<T::T>>, A> + 'static,
     {
-        let values: Vec<Vec<T::T>> = (0..num_row_groups)
-            .map(|_| G::gen_vec(rand_max, num_rows))
+        let all_options = vec![
+            // choose record_batch_batch (15) so batches cross row
+            // group boundaries (50 rows in 2 row groups) cases.
+            TestOptions {
+                num_row_groups: 2,
+                num_rows: 100,
+                record_batch_size: 15,
+                num_iterations: 50,
+            },
+            // choose record_batch_batch (5) so batches sometime fall
+            // on row group boundaries and (25 rows in 3 row groups
+            // --> row groups of 10, 10, and 5). Tests buffer
+            // refilling edge cases.
+            TestOptions {
+                num_row_groups: 3,
+                num_rows: 25,
+                record_batch_size: 5,
+                num_iterations: 50,
+            },
+            // Choose record_batch_size (25) so all batches fall
+            // exactly on row group boundary (25). Tests buffer
+            // refilling edge cases.
+            TestOptions {
+                num_row_groups: 4,
+                num_rows: 100,
+                record_batch_size: 25,
+                num_iterations: 50,
+            },
+        ];
+
+        all_options.into_iter().for_each(|opts| {
+            // Print out options to facilitate debugging failures on CI
+            println!("Running with Test Options: {:?}", opts);
+            single_column_reader_test::<T, A, C, G>(
+                opts,
+                rand_max,
+                message_type,
+                converter,
+            )
+        });
+    }
+
+    /// Create a parquet file and then read it using
+    /// `ParquetFileArrowReader` using the parameters described in
+    /// `opts`.
+    fn single_column_reader_test<T, A, C, G>(
+        opts: TestOptions,
+        rand_max: i32,
+        message_type: &str,
+        converter: &C,
+    ) where
+        T: DataType,
+        G: RandGen<T>,
+        A: PartialEq + Array + 'static,
+        C: Converter<Vec<Option<T::T>>, A> + 'static,
+    {
+        let values: Vec<Vec<T::T>> = (0..opts.num_row_groups)
+            .map(|_| G::gen_vec(rand_max, opts.num_rows))
             .collect();
 
         let path = get_temp_filename();
 
-        let schema = parse_message_type(message_type)
-            .map(|t| Rc::new(t))
-            .unwrap();
+        let schema = parse_message_type(message_type).map(Arc::new).unwrap();
 
         generate_single_column_file_with_data::<T>(&values, path.as_path(), schema)
             .unwrap();
 
         let parquet_reader =
             SerializedFileReader::try_from(File::open(&path).unwrap()).unwrap();
-        let mut arrow_reader = ParquetFileArrowReader::new(Rc::new(parquet_reader));
+        let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(parquet_reader));
 
-        let mut record_reader =
-            arrow_reader.get_record_reader(record_batch_size).unwrap();
+        let mut record_reader = arrow_reader
+            .get_record_reader(opts.record_batch_size)
+            .unwrap();
 
         let expected_data: Vec<Option<T::T>> = values
             .iter()
@@ -435,12 +541,12 @@ mod tests {
             .map(|b| Some(b.clone()))
             .collect();
 
-        for i in 0..num_iterations {
-            let start = i * record_batch_size;
+        for i in 0..opts.num_iterations {
+            let start = i * opts.record_batch_size;
 
-            let batch = record_reader.next_batch().unwrap();
+            let batch = record_reader.next();
             if start < expected_data.len() {
-                let end = min(start + record_batch_size, expected_data.len());
+                let end = min(start + opts.record_batch_size, expected_data.len());
                 assert!(batch.is_some());
 
                 let mut data = vec![];
@@ -449,6 +555,7 @@ mod tests {
                 assert_eq!(
                     &converter.convert(data).unwrap(),
                     batch
+                        .unwrap()
                         .unwrap()
                         .column(0)
                         .as_any()
@@ -462,14 +569,14 @@ mod tests {
     }
 
     fn generate_single_column_file_with_data<T: DataType>(
-        values: &Vec<Vec<T::T>>,
+        values: &[Vec<T::T>],
         path: &Path,
         schema: TypePtr,
     ) -> Result<()> {
         let file = File::create(path)?;
-        let writer_props = Rc::new(WriterProperties::builder().build());
+        let writer_props = Arc::new(WriterProperties::builder().build());
 
-        let mut writer = SerializedFileWriter::new(file, schema, writer_props.clone())?;
+        let mut writer = SerializedFileWriter::new(file, schema, writer_props)?;
 
         for v in values {
             let mut row_group_writer = writer.next_row_group()?;
@@ -487,18 +594,18 @@ mod tests {
         writer.close()
     }
 
-    fn get_test_reader(file_name: &str) -> Rc<dyn FileReader> {
+    fn get_test_reader(file_name: &str) -> Arc<dyn FileReader> {
         let file = get_test_file(file_name);
 
         let reader =
             SerializedFileReader::new(file).expect("Failed to create serialized reader");
 
-        Rc::new(reader)
+        Arc::new(reader)
     }
 
     fn get_test_file(file_name: &str) -> File {
         let mut path = PathBuf::new();
-        path.push(env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined!"));
+        path.push(arrow::util::test_util::arrow_test_data());
         path.push(file_name);
 
         File::open(path.as_path()).expect("File not found!")
@@ -520,11 +627,10 @@ mod tests {
     ) {
         for i in 0..20 {
             let array: Option<StructArray> = record_batch_reader
-                .next_batch()
-                .expect("Failed to read record batch!")
-                .map(|r| r.into());
+                .next()
+                .map(|r| r.expect("Failed to read record batch!").into());
 
-            let (start, end) = (i * 60 as usize, (i + 1) * 60 as usize);
+            let (start, end) = (i * 60_usize, (i + 1) * 60_usize);
 
             if start < max_len {
                 assert!(array.is_some());

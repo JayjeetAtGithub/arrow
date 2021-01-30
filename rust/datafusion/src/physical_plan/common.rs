@@ -19,27 +19,37 @@
 
 use std::fs;
 use std::fs::metadata;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::error::{ExecutionError, Result};
+use super::{RecordBatchStream, SendableRecordBatchStream};
+use crate::error::{DataFusionError, Result};
 
-use crate::logical_plan::ScalarValue;
-use arrow::array::{self, ArrayRef};
+use array::{
+    BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, LargeStringArray, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
+};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::Result as ArrowResult;
-use arrow::record_batch::{RecordBatch, RecordBatchReader};
+use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{self, ArrayRef},
+    datatypes::Schema,
+};
+use futures::{Stream, TryStreamExt};
 
-/// Iterator over a vector of record batches
-pub struct RecordBatchIterator {
+/// Stream of record batches
+pub struct SizedRecordBatchStream {
     schema: SchemaRef,
     batches: Vec<Arc<RecordBatch>>,
     index: usize,
 }
 
-impl RecordBatchIterator {
+impl SizedRecordBatchStream {
     /// Create a new RecordBatchIterator
     pub fn new(schema: SchemaRef, batches: Vec<Arc<RecordBatch>>) -> Self {
-        RecordBatchIterator {
+        SizedRecordBatchStream {
             schema,
             index: 0,
             batches,
@@ -47,39 +57,34 @@ impl RecordBatchIterator {
     }
 }
 
-impl RecordBatchReader for RecordBatchIterator {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
+impl Stream for SizedRecordBatchStream {
+    type Item = ArrowResult<RecordBatch>;
 
-    fn next_batch(&mut self) -> ArrowResult<Option<RecordBatch>> {
-        if self.index < self.batches.len() {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(if self.index < self.batches.len() {
             self.index += 1;
-            Ok(Some(self.batches[self.index - 1].as_ref().clone()))
+            Some(Ok(self.batches[self.index - 1].as_ref().clone()))
         } else {
-            Ok(None)
-        }
+            None
+        })
     }
 }
 
-/// Create a vector of record batches from an iterator
-pub fn collect(
-    it: Arc<Mutex<dyn RecordBatchReader + Send + Sync>>,
-) -> Result<Vec<RecordBatch>> {
-    let mut reader = it.lock().unwrap();
-    let mut results: Vec<RecordBatch> = vec![];
-    loop {
-        match reader.next_batch() {
-            Ok(Some(batch)) => {
-                results.push(batch);
-            }
-            Ok(None) => {
-                // end of result set
-                return Ok(results);
-            }
-            Err(e) => return Err(ExecutionError::from(e)),
-        }
+impl RecordBatchStream for SizedRecordBatchStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
+}
+
+/// Create a vector of record batches from a stream
+pub async fn collect(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
+    stream
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(DataFusionError::from)
 }
 
 /// Recursively build a list of files in a directory with a given extension
@@ -96,112 +101,68 @@ pub fn build_file_list(dir: &str, filenames: &mut Vec<String>, ext: &str) -> Res
             if let Some(path_name) = path.to_str() {
                 if path.is_dir() {
                     build_file_list(path_name, filenames, ext)?;
-                } else {
-                    if path_name.ends_with(ext) {
-                        filenames.push(path_name.to_string());
-                    }
+                } else if path_name.ends_with(ext) {
+                    filenames.push(path_name.to_string());
                 }
             } else {
-                return Err(ExecutionError::General("Invalid path".to_string()));
+                return Err(DataFusionError::Plan("Invalid path".to_string()));
             }
         }
     }
     Ok(())
 }
 
-/// Get a value from an array as a ScalarValue
-pub fn get_scalar_value(array: &ArrayRef, row: usize) -> Result<Option<ScalarValue>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    let value: Option<ScalarValue> = match array.data_type() {
-        DataType::UInt8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::UInt8Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::UInt8(array.value(row)))
-        }
-        DataType::UInt16 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::UInt16Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::UInt16(array.value(row)))
-        }
-        DataType::UInt32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::UInt32Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::UInt32(array.value(row)))
-        }
-        DataType::UInt64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::UInt64Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::UInt64(array.value(row)))
-        }
-        DataType::Int8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Int8Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::Int8(array.value(row)))
-        }
-        DataType::Int16 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Int16Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::Int16(array.value(row)))
-        }
-        DataType::Int32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Int32Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::Int32(array.value(row)))
-        }
-        DataType::Int64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Int64Array>()
-                .expect("Failed to cast array");
-            Some(ScalarValue::Int64(array.value(row)))
-        }
-        DataType::Float32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Float32Array>()
-                .unwrap();
-            Some(ScalarValue::Float32(array.value(row)))
-        }
-        DataType::Float64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::Float64Array>()
-                .unwrap();
-            Some(ScalarValue::Float64(array.value(row)))
-        }
-        DataType::Utf8 => {
-            let array = array.as_any().downcast_ref::<array::StringArray>().unwrap();
-            Some(ScalarValue::Utf8(array.value(row).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<array::LargeStringArray>()
-                .unwrap();
-            Some(ScalarValue::Utf8(array.value(row).to_string()))
-        }
-        other => {
-            return Err(ExecutionError::ExecutionError(format!(
-                "Unsupported data type {:?} for result of aggregate expression",
-                other
-            )));
-        }
-    };
-    Ok(value)
+/// creates an empty record batch.
+pub fn create_batch_empty(schema: &Schema) -> ArrowResult<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Float32 => {
+                Ok(Arc::new(Float32Array::from(vec![] as Vec<f32>)) as ArrayRef)
+            }
+            DataType::Float64 => {
+                Ok(Arc::new(Float64Array::from(vec![] as Vec<f64>)) as ArrayRef)
+            }
+            DataType::Int64 => {
+                Ok(Arc::new(Int64Array::from(vec![] as Vec<i64>)) as ArrayRef)
+            }
+            DataType::Int32 => {
+                Ok(Arc::new(Int32Array::from(vec![] as Vec<i32>)) as ArrayRef)
+            }
+            DataType::Int16 => {
+                Ok(Arc::new(Int16Array::from(vec![] as Vec<i16>)) as ArrayRef)
+            }
+            DataType::Int8 => {
+                Ok(Arc::new(Int8Array::from(vec![] as Vec<i8>)) as ArrayRef)
+            }
+            DataType::UInt64 => {
+                Ok(Arc::new(UInt64Array::from(vec![] as Vec<u64>)) as ArrayRef)
+            }
+            DataType::UInt32 => {
+                Ok(Arc::new(UInt32Array::from(vec![] as Vec<u32>)) as ArrayRef)
+            }
+            DataType::UInt16 => {
+                Ok(Arc::new(UInt16Array::from(vec![] as Vec<u16>)) as ArrayRef)
+            }
+            DataType::UInt8 => {
+                Ok(Arc::new(UInt8Array::from(vec![] as Vec<u8>)) as ArrayRef)
+            }
+            DataType::Utf8 => {
+                Ok(Arc::new(StringArray::from(vec![] as Vec<&str>)) as ArrayRef)
+            }
+            DataType::LargeUtf8 => {
+                Ok(Arc::new(LargeStringArray::from(vec![] as Vec<&str>)) as ArrayRef)
+            }
+            DataType::Boolean => {
+                Ok(Arc::new(BooleanArray::from(vec![] as Vec<bool>)) as ArrayRef)
+            }
+            _ => Err(DataFusionError::NotImplemented(format!(
+                "Cannot convert datatype {:?} to array",
+                f.data_type()
+            ))),
+        })
+        .collect::<Result<_>>()
+        .map_err(DataFusionError::into_arrow_external_error)?;
+    RecordBatch::try_new(Arc::new(schema.to_owned()), columns)
 }

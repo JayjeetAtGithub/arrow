@@ -33,7 +33,7 @@ use crate::error::{ArrowError, Result};
 /// datatypes.
 ///
 /// Record batches are a convenient unit of work for various
-/// serialization and computation functions, possibly incremental.  
+/// serialization and computation functions, possibly incremental.
 /// See also [CSV reader](crate::csv::Reader) and
 /// [JSON reader](crate::json::Reader).
 #[derive(Clone, Debug)]
@@ -75,6 +75,25 @@ impl RecordBatch {
     /// # }
     /// ```
     pub fn try_new(schema: SchemaRef, columns: Vec<ArrayRef>) -> Result<Self> {
+        let options = RecordBatchOptions::default();
+        Self::validate_new_batch(&schema, columns.as_slice(), &options)?;
+        Ok(RecordBatch { schema, columns })
+    }
+
+    pub fn try_new_with_options(
+        schema: SchemaRef,
+        columns: Vec<ArrayRef>,
+        options: &RecordBatchOptions,
+    ) -> Result<Self> {
+        Self::validate_new_batch(&schema, columns.as_slice(), options)?;
+        Ok(RecordBatch { schema, columns })
+    }
+
+    fn validate_new_batch(
+        schema: &SchemaRef,
+        columns: &[ArrayRef],
+        options: &RecordBatchOptions,
+    ) -> Result<()> {
         // check that there are some columns
         if columns.is_empty() {
             return Err(ArrowError::InvalidArgumentError(
@@ -93,21 +112,45 @@ impl RecordBatch {
         // check that all columns have the same row count, and match the schema
         let len = columns[0].data().len();
 
-        for (i, column) in columns.iter().enumerate() {
-            if column.len() != len {
-                return Err(ArrowError::InvalidArgumentError(
-                    "all columns in a record batch must have the same length".to_string(),
-                ));
+        // This is a bit repetitive, but it is better to check the condition outside the loop
+        if options.match_field_names {
+            for (i, column) in columns.iter().enumerate() {
+                if column.len() != len {
+                    return Err(ArrowError::InvalidArgumentError(
+                        "all columns in a record batch must have the same length"
+                            .to_string(),
+                    ));
+                }
+                if column.data_type() != schema.field(i).data_type() {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "column types must match schema types, expected {:?} but found {:?} at column index {}",
+                        schema.field(i).data_type(),
+                        column.data_type(),
+                        i)));
+                }
             }
-            if column.data_type() != schema.field(i).data_type() {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "column types must match schema types, expected {:?} but found {:?} at column index {}",
-                    schema.field(i).data_type(),
-                    column.data_type(),
-                    i)));
+        } else {
+            for (i, column) in columns.iter().enumerate() {
+                if column.len() != len {
+                    return Err(ArrowError::InvalidArgumentError(
+                        "all columns in a record batch must have the same length"
+                            .to_string(),
+                    ));
+                }
+                if !column
+                    .data_type()
+                    .equals_datatype(schema.field(i).data_type())
+                {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "column types must match schema types, expected {:?} but found {:?} at column index {}",
+                        schema.field(i).data_type(),
+                        column.data_type(),
+                        i)));
+                }
             }
         }
-        Ok(RecordBatch { schema, columns })
+
+        Ok(())
     }
 
     /// Returns the [`Schema`](crate::datatypes::Schema) of the record batch.
@@ -186,6 +229,19 @@ impl RecordBatch {
     }
 }
 
+#[derive(Debug)]
+pub struct RecordBatchOptions {
+    pub match_field_names: bool,
+}
+
+impl Default for RecordBatchOptions {
+    fn default() -> Self {
+        Self {
+            match_field_names: true,
+        }
+    }
+}
+
 impl From<&StructArray> for RecordBatch {
     /// Create a record batch from struct array.
     ///
@@ -217,7 +273,7 @@ impl Into<StructArray> for RecordBatch {
 }
 
 /// Trait for types that can read `RecordBatch`'s.
-pub trait RecordBatchReader {
+pub trait RecordBatchReader: Iterator<Item = Result<RecordBatch>> {
     /// Returns the schema of this `RecordBatchReader`.
     ///
     /// Implementation of this trait should guarantee that all `RecordBatch`'s returned by this
@@ -225,7 +281,13 @@ pub trait RecordBatchReader {
     fn schema(&self) -> SchemaRef;
 
     /// Reads the next `RecordBatch`.
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
+    #[deprecated(
+        since = "2.0.0",
+        note = "This method is deprecated in favour of `next` from the trait Iterator."
+    )]
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.next().transpose()
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +317,7 @@ mod tests {
             .add_buffer(Buffer::from(offset_data.to_byte_slice()))
             .add_buffer(Buffer::from(v.to_byte_slice()))
             .build();
-        let b = BinaryArray::from(array_data);
+        let b = StringArray::from(array_data);
 
         let record_batch =
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])
