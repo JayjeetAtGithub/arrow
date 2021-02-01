@@ -17,6 +17,7 @@
 
 #include "arrow/table.h"
 
+#include <iostream>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -528,6 +529,7 @@ bool Table::Equals(const Table& other, bool check_metadata) const {
 
   for (int i = 0; i < this->num_columns(); i++) {
     if (!this->column(i)->Equals(other.column(i))) {
+      std::cerr << "something here....\n";
       return false;
     }
   }

@@ -92,18 +92,24 @@ std::shared_ptr<arrow::Table> CreatePartitionedTable() {
   return arrow::Table::Make(schema, {sales_array, price_array});
 }
 
+std::vector<std::shared_ptr<arrow::Table>> CreateTestTables(int num) {
+  std::vector<std::shared_ptr<arrow::Table>> tables;
+  for (int i = 0; i < num; i++) {
+    tables.push_back(CreatePartitionedTable());
+  }
+  return tables;
+}
+
 TEST(TestClsSDK, EndToEndWithoutPartitionPruning) {
   auto fs = CreateTestRadosFileSystem();
   auto factory_options = CreateTestRadosFactoryOptions();
   factory_options.partition_base_dir = "/gm";
 
   auto writer = std::make_shared<arrow::dataset::CephFSParquetWriter>(fs);
-  writer->WriteTable(CreatePartitionedTable(), "/gm/a.parquet");
-  writer->WriteTable(CreatePartitionedTable(), "/gm/b.parquet");
-  writer->WriteTable(CreatePartitionedTable(), "/gm/c.parquet");
-  writer->WriteTable(CreatePartitionedTable(), "/gm/d.parquet");
-  writer->WriteTable(CreatePartitionedTable(), "/gm/e.parquet");
-  writer->WriteTable(CreatePartitionedTable(), "/gm/f.parquet");
+  auto tables = CreateTestTables(6);
+
+  for (int i = 0; i < 6; i++)
+    writer->WriteTable(tables[i], "/gm/" + std::to_string(i) + ".parquet");
 
   arrow::dataset::FinishOptions finish_options;
   auto factory =
@@ -117,10 +123,30 @@ TEST(TestClsSDK, EndToEndWithoutPartitionPruning) {
   builder->Project(projection);
   builder->Filter(filter);
   auto scanner = builder->Finish().ValueOrDie();
+  auto result_table = scanner->ToTable().ValueOrDie();
 
-  auto table = scanner->ToTable().ValueOrDie();
-  std::cout << table->ToString() << "\n";
-  std::cout << table->num_rows() << "\n";
+  // now lets make a memory fragments containing the batches from these tables
+  auto concatinated_table = arrow::ConcatenateTables(tables).ValueOrDie();
+  arrow::RecordBatchVector batches;
+  auto table_batch_reader = std::make_shared<arrow::TableBatchReader>(*concatinated_table);
+  table_batch_reader->ReadAll(&batches);
+
+  auto in_memory_fragment = std::make_shared<arrow::dataset::InMemoryFragment>(batches);
+  auto builder_ = std::make_shared<arrow::dataset::ScannerBuilder>(
+    batches[0]->schema(),
+    in_memory_fragment,
+    std::make_shared<arrow::dataset::ScanContext>()
+  );
+  builder_->Project(projection);
+  builder_->Filter(filter);
+  auto scanner_ = builder_->Finish().ValueOrDie();
+  auto result_table_ = scanner_->ToTable().ValueOrDie();
+  std::cout << result_table_->num_columns() << "\n"; 
+  std::cout << result_table_->num_rows() << "\n"; 
+  std::cout << result_table->num_columns() << "\n"; 
+  std::cout << result_table->num_rows() << "\n"; 
+
+  ASSERT_EQ(result_table_->Equals(*result_table), 1);
 }
 
 TEST(TestClsSDK, EndToEndWithPartitionPruning) {
@@ -154,7 +180,7 @@ TEST(TestClsSDK, EndToEndWithPartitionPruning) {
   auto builder = ds->NewScan().ValueOrDie();
   auto projection = std::vector<std::string>{"year", "price", "country"};
   auto filter =
-      ("sales"_ > int32_t(400) && "price"_ > double(30000.0f)).Copy();
+      ("sales"_ > int32_t(400) && "price"_ > double(30000.0f) && "year"_ < int32_t(2020)).Copy();
 
   builder->Project(projection);
   builder->Filter(filter);
@@ -174,7 +200,6 @@ TEST(TestClsSDK, TestObjectInputFileInterface) {
   ASSERT_EQ(s.ok(), true);
 
   auto source = std::make_shared<arrow::dataset::ObjectInputFile>(fs, path);
-  s = source->Init();
   ASSERT_EQ(s.ok(), true);
 
   std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -185,7 +210,9 @@ TEST(TestClsSDK, TestObjectInputFileInterface) {
   std::shared_ptr<arrow::Schema> schema;
   s = reader->GetSchema(&schema);
   ASSERT_EQ(s.ok(), true);
-  std::cout << schema->ToString() << "\n";
+
+  auto schema_ = arrow::schema({arrow::field("sales", arrow::int32()), arrow::field("price", arrow::float64())});
+  ASSERT_EQ(schema->Equals(schema_), 1);
 
   // get parquet file metadata
   std::shared_ptr<parquet::FileMetaData> metadata = reader->parquet_reader()->metadata();
