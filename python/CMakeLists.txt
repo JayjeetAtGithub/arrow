@@ -35,11 +35,9 @@ endif()
 
 include(CMakeParseArguments)
 
-# Compatibility with CMake 3.1
-if(POLICY CMP0054)
-  # http://www.cmake.org/cmake/help/v3.1/policy/CMP0054.html
-  cmake_policy(SET CMP0054 NEW)
-endif()
+# Only interpret if() arguments as variables or keywords when unquoted.
+# https://www.cmake.org/cmake/help/latest/policy/CMP0054.html
+cmake_policy(SET CMP0054 NEW)
 
 # Use the first Python installation on PATH, not the newest one
 set(Python3_FIND_STRATEGY "LOCATION")
@@ -179,6 +177,7 @@ else()
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${BUILD_SUBDIR_NAME}")
 endif()
 
+message(STATUS "Generator: ${CMAKE_GENERATOR}")
 message(STATUS "Build output directory: ${BUILD_OUTPUT_ROOT_DIRECTORY}")
 
 # where to put generated archives (.a files)
@@ -400,6 +399,12 @@ if(PYARROW_BUILD_HDFS)
   set(CYTHON_EXTENSIONS ${CYTHON_EXTENSIONS} _hdfs)
 endif()
 
+if(PYARROW_BUILD_RADOS)
+  set(RADOS_LINK_LIBS arrow_dataset_shared)
+  set(CYTHON_EXTENSIONS ${CYTHON_EXTENSIONS} _rados)
+  set(ARROW_RADOS ON)
+endif()
+
 if(PYARROW_BUILD_CUDA)
   # Arrow CUDA
   find_package(ArrowCUDA REQUIRED)
@@ -616,4 +621,8 @@ endif()
 
 if(PYARROW_BUILD_PLASMA)
   target_link_libraries(_plasma PRIVATE ${PLASMA_LINK_LIBS})
+endif()
+
+if(PYARROW_BUILD_RADOS)
+  target_link_libraries(_rados PRIVATE ${RADOS_LINK_LIBS})
 endif()

@@ -19,7 +19,6 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.ReferenceManager;
 import org.apache.arrow.memory.util.CommonUtil;
-import org.apache.arrow.util.DataSizeRoundingUtil;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.BaseValueVector;
 import org.apache.arrow.vector.BitVectorHelper;
@@ -37,6 +36,7 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.util.CallBack;
+import org.apache.arrow.vector.util.DataSizeRoundingUtil;
 import org.apache.arrow.vector.util.TransferPair;
 
 import java.util.Arrays;
@@ -63,7 +63,6 @@ import org.apache.arrow.vector.util.CallBack;
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode;
 import org.apache.arrow.vector.BaseValueVector;
 import org.apache.arrow.vector.util.OversizedAllocationException;
-import org.apache.arrow.util.DataSizeRoundingUtil;
 import org.apache.arrow.util.Preconditions;
 
 import static org.apache.arrow.vector.types.UnionMode.Dense;
@@ -211,7 +210,7 @@ public class DenseUnionVector implements FieldVector {
     typeBuffer.writerIndex(valueCount * TYPE_WIDTH);
 
     offsetBuffer.readerIndex(0);
-    offsetBuffer.writerIndex(valueCount * OFFSET_WIDTH);
+    offsetBuffer.writerIndex((long) valueCount * OFFSET_WIDTH);
   }
 
   @Override
@@ -306,13 +305,13 @@ public class DenseUnionVector implements FieldVector {
       <#assign fields = minor.fields!type.fields />
       <#assign uncappedName = name?uncap_first/>
       <#assign lowerCaseName = name?lower_case/>
-      <#if !minor.typeParams?? || minor.class == "Decimal">
+      <#if !minor.typeParams?? || minor.class?starts_with("Decimal")>
 
-  public ${name}Vector get${name}Vector(byte typeId<#if minor.class == "Decimal">, ArrowType arrowType</#if>) {
+  public ${name}Vector get${name}Vector(byte typeId<#if minor.class?starts_with("Decimal")>, ArrowType arrowType</#if>) {
     ValueVector vector = typeId < 0 ? null : childVectors[typeId];
     if (vector == null) {
       int vectorCount = internalStruct.size();
-      vector = addOrGet(typeId, MinorType.${name?upper_case}<#if minor.class == "Decimal">, arrowType</#if>, ${name}Vector.class);
+      vector = addOrGet(typeId, MinorType.${name?upper_case}<#if minor.class?starts_with("Decimal")>, arrowType</#if>, ${name}Vector.class);
       childVectors[typeId] = vector;
       if (internalStruct.size() > vectorCount) {
         vector.allocateNew();
@@ -403,7 +402,7 @@ public class DenseUnionVector implements FieldVector {
   }
 
   public int getOffset(int index) {
-    return offsetBuffer.getInt(index * OFFSET_WIDTH);
+    return offsetBuffer.getInt((long) index * OFFSET_WIDTH);
   }
 
   private void reallocTypeBuffer() {
@@ -547,9 +546,9 @@ public class DenseUnionVector implements FieldVector {
   public void copyFrom(int inIndex, int outIndex, ValueVector from) {
     Preconditions.checkArgument(this.getMinorType() == from.getMinorType());
     DenseUnionVector fromCast = (DenseUnionVector) from;
-    int inOffset = fromCast.offsetBuffer.getInt(inIndex * OFFSET_WIDTH);
+    int inOffset = fromCast.offsetBuffer.getInt((long) inIndex * OFFSET_WIDTH);
     fromCast.getReader().setPosition(inOffset);
-    int outOffset = offsetBuffer.getInt(outIndex * OFFSET_WIDTH);
+    int outOffset = offsetBuffer.getInt((long) outIndex * OFFSET_WIDTH);
     getWriter().setPosition(outOffset);
     ComplexCopier.copy(fromCast.reader, writer);
   }
@@ -631,7 +630,7 @@ public class DenseUnionVector implements FieldVector {
       to.typeBuffer = refManager.transferOwnership(slicedBuffer, to.allocator).getTransferredBuffer();
 
       // transfer offset byffer
-      while (to.offsetBuffer.capacity() < length * OFFSET_WIDTH) {
+      while (to.offsetBuffer.capacity() < (long) length * OFFSET_WIDTH) {
         to.reallocOffsetBuffer();
       }
 
@@ -644,10 +643,10 @@ public class DenseUnionVector implements FieldVector {
 
       for (int i = startIndex; i < startIndex + length; i++) {
         byte typeId = typeBuffer.getByte(i);
-        to.offsetBuffer.setInt((i - startIndex) * OFFSET_WIDTH, typeCounts[typeId]);
+        to.offsetBuffer.setInt((long) (i - startIndex) * OFFSET_WIDTH, typeCounts[typeId]);
         typeCounts[typeId] += 1;
         if (typeStarts[typeId] == -1) {
-          typeStarts[typeId] = offsetBuffer.getInt(i * OFFSET_WIDTH);
+          typeStarts[typeId] = offsetBuffer.getInt((long) i * OFFSET_WIDTH);
         }
       }
 
@@ -698,8 +697,8 @@ public class DenseUnionVector implements FieldVector {
     if (count == 0) {
       return 0;
     }
-    return count * TYPE_WIDTH + count * OFFSET_WIDTH + DataSizeRoundingUtil.divideBy8Ceil(count)
-        + internalStruct.getBufferSizeFor(count);
+    return (int) (count * TYPE_WIDTH + (long) count * OFFSET_WIDTH
+        + DataSizeRoundingUtil.divideBy8Ceil(count) + internalStruct.getBufferSizeFor(count));
   }
 
   @Override
@@ -737,7 +736,7 @@ public class DenseUnionVector implements FieldVector {
   public Object getObject(int index) {
     ValueVector vector = getVector(index);
     if (vector != null) {
-      int offset = offsetBuffer.getInt(index * OFFSET_WIDTH);
+      int offset = offsetBuffer.getInt((long) index * OFFSET_WIDTH);
       return vector.isNull(offset) ? null : vector.getObject(offset);
     }
     return null;
@@ -800,7 +799,7 @@ public class DenseUnionVector implements FieldVector {
     if (writer == null) {
       writer = new DenseUnionWriter(DenseUnionVector.this);
     }
-    int offset = offsetBuffer.getInt(index * OFFSET_WIDTH);
+    int offset = offsetBuffer.getInt((long) index * OFFSET_WIDTH);
     MinorType type = reader.getMinorType();
     writer.setPosition(offset);
     byte typeId = holder.typeId;
@@ -810,7 +809,7 @@ public class DenseUnionVector implements FieldVector {
           <#assign name = minor.class?cap_first />
           <#assign fields = minor.fields!type.fields />
           <#assign uncappedName = name?uncap_first/>
-          <#if !minor.typeParams?? || minor.class == "Decimal">
+          <#if !minor.typeParams?? || minor.class?starts_with("Decimal")>
       case ${name?upper_case}:
       Nullable${name}Holder ${uncappedName}Holder = new Nullable${name}Holder();
       reader.read(${uncappedName}Holder);
@@ -834,17 +833,17 @@ public class DenseUnionVector implements FieldVector {
         <#assign name = minor.class?cap_first />
         <#assign fields = minor.fields!type.fields />
         <#assign uncappedName = name?uncap_first/>
-        <#if !minor.typeParams?? || minor.class == "Decimal">
+        <#if !minor.typeParams?? || minor.class?starts_with("Decimal")>
   public void setSafe(int index, Nullable${name}Holder holder) {
     while (index >= getOffsetBufferValueCapacity()) {
       reallocOffsetBuffer();
     }
     byte typeId = getTypeId(index);
-    ${name}Vector vector = get${name}Vector(typeId<#if minor.class == "Decimal">, new ArrowType.Decimal(holder.precision, holder.scale)</#if>);
+    ${name}Vector vector = get${name}Vector(typeId<#if minor.class?starts_with("Decimal")>, new ArrowType.Decimal(holder.precision, holder.scale, holder.WIDTH * 8)</#if>);
     int offset = vector.getValueCount();
     vector.setValueCount(offset + 1);
     vector.setSafe(offset, holder);
-    offsetBuffer.setInt(index * OFFSET_WIDTH, offset);
+    offsetBuffer.setInt((long) index * OFFSET_WIDTH, offset);
   }
         </#if>
       </#list>
@@ -870,7 +869,7 @@ public class DenseUnionVector implements FieldVector {
     if (isNull(index)) {
       return 0;
     }
-    int offset = offsetBuffer.getInt(index * OFFSET_WIDTH);
+    int offset = offsetBuffer.getInt((long) index * OFFSET_WIDTH);
     return getVector(index).hashCode(offset, hasher);
   }
 

@@ -96,14 +96,6 @@ struct PARQUET_EXPORT SchemaField {
 
   parquet::internal::LevelInfo level_info;
 
-  bool IsStruct() const { return field->type()->id() == ::arrow::Type::STRUCT; }
-  bool IsRepeated() const {
-    // FixedSizeList will require special handling.
-    return field->type()->id() == ::arrow::Type::LIST ||
-           field->type()->id() == ::arrow::Type::LARGE_LIST ||
-           field->type()->id() == ::arrow::Type::MAP;
-  }
-
   bool is_leaf() const { return column_index != -1; }
 };
 

@@ -19,13 +19,10 @@
 
 use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
-use crate::execution::context::ExecutionContext;
-use crate::logical_plan::{Expr, LogicalPlan, LogicalPlanBuilder};
-use crate::physical_plan::ExecutionPlan;
-use arrow::array;
+use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
+use arrow::array::{self, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use std::env;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
@@ -45,24 +42,13 @@ pub fn create_table_dual() -> Box<dyn TableProvider + Send + Sync> {
         ],
     )
     .unwrap();
-    let provider = MemTable::new(dual_schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    let provider = MemTable::try_new(dual_schema, vec![vec![batch]]).unwrap();
     Box::new(provider)
-}
-
-/// Get the value of the ARROW_TEST_DATA environment variable
-pub fn arrow_testdata_path() -> String {
-    env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined")
-}
-
-/// Execute a physical plan and collect the results
-pub fn execute(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
-    let ctx = ExecutionContext::new();
-    ctx.collect(plan)
 }
 
 /// Generated partitioned copy of a CSV file
 pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<String> {
-    let testdata = arrow_testdata_path();
+    let testdata = arrow::util::test_util::arrow_test_data();
     let path = format!("{}/csv/{}", testdata, filename);
 
     let tmp_dir = TempDir::new()?;
@@ -78,24 +64,21 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
 
     let f = File::open(&path)?;
     let f = BufReader::new(f);
-    let mut i = 0;
-    for line in f.lines() {
+    for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
 
         if i == 0 {
             // write header to all partitions
             for w in writers.iter_mut() {
-                w.write(line.as_bytes()).unwrap();
-                w.write(b"\n").unwrap();
+                w.write_all(line.as_bytes()).unwrap();
+                w.write_all(b"\n").unwrap();
             }
         } else {
             // write data line to single partition
             let partition = i % partitions;
-            writers[partition].write(line.as_bytes()).unwrap();
-            writers[partition].write(b"\n").unwrap();
+            writers[partition].write_all(line.as_bytes()).unwrap();
+            writers[partition].write_all(b"\n").unwrap();
         }
-
-        i += 1;
     }
     for w in writers.iter_mut() {
         w.flush().unwrap();
@@ -133,7 +116,20 @@ pub fn format_batch(batch: &RecordBatch) -> Vec<String> {
                 s.push(',');
             }
             let array = batch.column(column_index);
+
+            if array.is_null(row_index) {
+                s.push_str("NULL");
+                continue;
+            }
+
             match array.data_type() {
+                DataType::Utf8 => s.push_str(
+                    array
+                        .as_any()
+                        .downcast_ref::<array::StringArray>()
+                        .unwrap()
+                        .value(row_index),
+                ),
                 DataType::Int8 => s.push_str(&format!(
                     "{:?}",
                     array
@@ -229,7 +225,7 @@ pub fn test_table_scan() -> Result<LogicalPlan> {
         Field::new("b", DataType::UInt32, false),
         Field::new("c", DataType::UInt32, false),
     ]);
-    LogicalPlanBuilder::scan("default", "test", &schema, None)?.build()
+    LogicalPlanBuilder::scan_empty("test", &schema, None)?.build()
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -242,18 +238,80 @@ pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
     assert_eq!(actual, expected);
 }
 
-pub fn max(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        name: "MAX".to_owned(),
-        args: vec![expr],
-    }
+/// returns a table with 3 columns of i32 in memory
+pub fn build_table_i32(
+    a: (&str, &Vec<i32>),
+    b: (&str, &Vec<i32>),
+    c: (&str, &Vec<i32>),
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new(a.0, DataType::Int32, false),
+        Field::new(b.0, DataType::Int32, false),
+        Field::new(c.0, DataType::Int32, false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(a.1.clone())),
+            Arc::new(Int32Array::from(b.1.clone())),
+            Arc::new(Int32Array::from(c.1.clone())),
+        ],
+    )
+    .unwrap()
 }
 
-pub fn min(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        name: "MIN".to_owned(),
-        args: vec![expr],
-    }
+/// Returns the column names on the schema
+pub fn columns(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
+pub mod user_defined;
 pub mod variable;
+
+mod tests {
+    use super::*;
+
+    use arrow::array::{BooleanArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn test_format_batch() -> Result<()> {
+        let array_int32 = Int32Array::from(vec![1000, 2000]);
+        let array_string = StringArray::from(vec!["bow \u{1F3F9}", "arrow \u{2191}"]);
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+
+        let record_batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(array_int32), Arc::new(array_string)],
+        )?;
+
+        let result = format_batch(&record_batch);
+
+        assert_eq!(result, vec!["1000,bow \u{1F3F9}", "2000,arrow \u{2191}"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_batch_unknown() -> Result<()> {
+        // Use any Array type not yet handled by format_batch().
+        let array_bool = BooleanArray::from(vec![false, true]);
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
+
+        let record_batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array_bool)])?;
+
+        let result = format_batch(&record_batch);
+
+        assert_eq!(result, vec!["?", "?"]);
+
+        Ok(())
+    }
+}

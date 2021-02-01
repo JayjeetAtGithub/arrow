@@ -15,46 +15,39 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.5)
 message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
 
 # Compiler id for Apple Clang is now AppleClang.
+# https://www.cmake.org/cmake/help/latest/policy/CMP0025.html
 cmake_policy(SET CMP0025 NEW)
 
-# IN_LIST if() operator
-if(POLICY CMP0057)
-  cmake_policy(SET CMP0057 NEW)
-endif()
-
-# Compatibility with CMake 3.1
 # Only interpret if() arguments as variables or keywords when unquoted.
-if(POLICY CMP0054)
-  # https://www.cmake.org/cmake/help/v3.1/policy/CMP0054.html
-  cmake_policy(SET CMP0054 NEW)
-endif()
+# https://www.cmake.org/cmake/help/latest/policy/CMP0054.html
+cmake_policy(SET CMP0054 NEW)
 
+# Support new if() IN_LIST operator.
+# https://www.cmake.org/cmake/help/latest/policy/CMP0057.html
+cmake_policy(SET CMP0057 NEW)
+
+# Adapted from Apache Kudu: https://github.com/apache/kudu/commit/bd549e13743a51013585
+# Honor visibility properties for all target types.
+# https://www.cmake.org/cmake/help/latest/policy/CMP0063.html
+cmake_policy(SET CMP0063 NEW)
+
+# RPATH settings on macOS do not affect install_name.
+# https://cmake.org/cmake/help/latest/policy/CMP0068.html
 if(POLICY CMP0068)
-  # https://cmake.org/cmake/help/v3.9/policy/CMP0068.html
   cmake_policy(SET CMP0068 NEW)
 endif()
 
-# Don't ignore <PackageName>_ROOT variables in find_package
+# find_package() uses <PackageName>_ROOT variables.
+# https://cmake.org/cmake/help/latest/policy/CMP0074.html
 if(POLICY CMP0074)
-  # https://cmake.org/cmake/help/v3.12/policy/CMP0074.html
   cmake_policy(SET CMP0074 NEW)
 endif()
 
-# Adapted from Apache Kudu: https://github.com/apache/kudu/commit/bd549e13743a51013585
-# Honor visibility properties for all target types. See
-# "cmake --help-policy CMP0063" for details.
-#
-# This policy was only added to cmake in version 3.3, so until the cmake in
-# thirdparty is updated, we must check if the policy exists before setting it.
-if(POLICY CMP0063)
-  cmake_policy(SET CMP0063 NEW)
-endif()
-
-set(ARROW_VERSION "2.0.0-SNAPSHOT")
+set(ARROW_VERSION "3.0.0-SNAPSHOT")
 
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" ARROW_BASE_VERSION "${ARROW_VERSION}")
 
@@ -109,7 +102,12 @@ set(BUILD_SUPPORT_DIR "${CMAKE_SOURCE_DIR}/build-support")
 set(ARROW_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
 set(ARROW_DOC_DIR "share/doc/${PROJECT_NAME}")
 
-set(ARROW_LLVM_VERSIONS "10" "9" "8" "7")
+set(ARROW_LLVM_VERSIONS
+    "11"
+    "10"
+    "9"
+    "8"
+    "7")
 list(GET ARROW_LLVM_VERSIONS 0 ARROW_LLVM_VERSION_PRIMARY)
 string(REGEX
        REPLACE "^([0-9]+)(\\..+)?" "\\1" ARROW_LLVM_VERSION_PRIMARY_MAJOR
@@ -157,6 +155,7 @@ endif()
 
 find_package(ClangTools)
 find_package(InferTools)
+
 if("$ENV{CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "1" OR CLANG_TIDY_FOUND OR INFER_FOUND)
   # Generate a Clang compile_commands.json "compilation database" file for use
   # with various development tools, such as Vim's YouCompleteMe plugin.
@@ -322,6 +321,11 @@ if(ARROW_BUILD_BENCHMARKS
    OR ARROW_BUILD_INTEGRATION
    OR ARROW_FUZZING)
   set(ARROW_JSON ON)
+  set(ARROW_TESTING ON)
+endif()
+
+if(ARROW_GANDIVA)
+  set(ARROW_WITH_RE2 ON)
 endif()
 
 if(ARROW_CUDA
@@ -330,6 +334,14 @@ if(ARROW_CUDA
    OR ARROW_BUILD_TESTS
    OR ARROW_BUILD_BENCHMARKS)
   set(ARROW_IPC ON)
+endif()
+
+if(ARROW_CLS)
+  set(ARROW_RADOS ON)
+endif()
+
+if(ARROW_RADOS)
+  set(ARROW_DATASET ON)
 endif()
 
 if(ARROW_DATASET)
@@ -533,22 +545,14 @@ include_directories(src/generated)
 #
 # Visibility
 #
-# For generate_export_header() and add_compiler_export_flags().
-include(GenerateExportHeader)
-
 if(PARQUET_BUILD_SHARED)
-  if(POLICY CMP0063)
-    set_target_properties(arrow_shared
-                          PROPERTIES C_VISIBILITY_PRESET
-                                     hidden
-                                     CXX_VISIBILITY_PRESET
-                                     hidden
-                                     VISIBILITY_INLINES_HIDDEN
-                                     1)
-  else()
-    # Sets -fvisibility=hidden for gcc
-    add_compiler_export_flags()
-  endif()
+  set_target_properties(arrow_shared
+                        PROPERTIES C_VISIBILITY_PRESET
+                                   hidden
+                                   CXX_VISIBILITY_PRESET
+                                   hidden
+                                   VISIBILITY_INLINES_HIDDEN
+                                   1)
 endif()
 
 #
@@ -729,6 +733,7 @@ endif()
 
 if(ARROW_S3)
   list(APPEND ARROW_LINK_LIBS ${AWSSDK_LINK_LIBRARIES})
+  list(APPEND ARROW_STATIC_LINK_LIBS ${AWSSDK_LINK_LIBRARIES})
 endif()
 
 if(ARROW_WITH_UTF8PROC)
@@ -736,6 +741,14 @@ if(ARROW_WITH_UTF8PROC)
   list(APPEND ARROW_STATIC_LINK_LIBS utf8proc::utf8proc)
   if(utf8proc_SOURCE STREQUAL "SYSTEM")
     list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS utf8proc::utf8proc)
+  endif()
+endif()
+
+if(ARROW_WITH_RE2)
+  list(APPEND ARROW_LINK_LIBS re2::re2)
+  list(APPEND ARROW_STATIC_LINK_LIBS re2::re2)
+  if(RE2_SOURCE STREQUAL "SYSTEM")
+    list(APPEND ARROW_STATIC_INSTALL_INTERFACE_LIBS re2::re2)
   endif()
 endif()
 

@@ -130,22 +130,98 @@ test_that("[, [[, $ for Table", {
   expect_null(tab[["asdf"]])
   # List-like column slicing
   expect_data_frame(tab[2:4], tbl[2:4])
-  expect_data_frame(tab[c(1, 0)], tbl[c(1, 0)])
+  expect_data_frame(tab[c(2, 1)], tbl[c(2, 1)])
+  expect_data_frame(tab[-3], tbl[-3])
 
   expect_error(tab[[c(4, 3)]])
   expect_error(tab[[NA]], "'i' must be character or numeric, not logical")
   expect_error(tab[[NULL]], "'i' must be character or numeric, not NULL")
   expect_error(tab[[c("asdf", "jkl;")]], 'length(name) not equal to 1', fixed = TRUE)
-  expect_error(tab[-3], "Selections can't have negative value") # From tidyselect
-  expect_error(tab[-3:3], "Selections can't have negative value") # From tidyselect
-  expect_error(tab[1000]) # This is caught in vctrs, assert more specifically when it stabilizes
-  expect_error(tab[1:1000]) # same as ^
+  expect_error(tab[-3:3], "Invalid column index")
+  expect_error(tab[1000],  "Invalid column index")
+  expect_error(tab[1:1000], "Invalid column index")
 
   skip("Table with 0 cols doesn't know how many rows it should have")
   expect_data_frame(tab[0], tbl[0])
 })
 
+test_that("[[<- assignment", {
+  tbl <- tibble::tibble(
+    int = 1:10,
+    dbl = as.numeric(1:10),
+    lgl = sample(c(TRUE, FALSE, NA), 10, replace = TRUE),
+    chr = letters[1:10],
+    fct = factor(letters[1:10])
+  )
+  tab <- Table$create(tbl)
+
+  # can remove a column
+  tab[["chr"]] <- NULL
+  expect_data_frame(tab, tbl[-4])
+
+  # can remove a column by index
+  tab[[4]] <- NULL
+  expect_data_frame(tab, tbl[1:3])
+
+  # can add a named column
+  tab[["new"]] <- letters[10:1]
+  expect_data_frame(tab, dplyr::bind_cols(tbl[1:3], new = letters[10:1]))
+
+  # can replace a column by index
+  tab[[2]] <- as.numeric(10:1)
+  expect_vector(tab[[2]], as.numeric(10:1))
+
+  # can add a column by index
+  tab[[5]] <- as.numeric(10:1)
+  expect_vector(tab[[5]], as.numeric(10:1))
+  expect_vector(tab[["5"]], as.numeric(10:1))
+
+  # can replace a column
+  tab[["int"]] <- 10:1
+  expect_vector(tab[["int"]], 10:1)
+
+  # can use $
+  tab$new <- NULL
+  expect_null(as.vector(tab$new))
+  expect_identical(dim(tab), c(10L, 4L))
+
+  tab$int <- 1:10
+  expect_vector(tab$int, 1:10)
+
+  # recycling
+  tab[["atom"]] <- 1L
+  expect_vector(tab[["atom"]], rep(1L, 10))
+
+  expect_error(
+    tab[["atom"]] <- 1:6,
+    "Can't recycle input of size 6 to size 10."
+  )
+
+  # assign Arrow array and chunked_array
+  array <- Array$create(c(10:1))
+  tab$array <- array
+  expect_vector(tab$array, 10:1)
+
+  tab$chunked <- chunked_array(1:10)
+  expect_vector(tab$chunked, 1:10)
+
+  # nonsense indexes
+  expect_error(tab[[NA]] <- letters[10:1], "'i' must be character or numeric, not logical")
+  expect_error(tab[[NA_integer_]] <- letters[10:1], "'i' cannot be NA")
+  expect_error(tab[[NA_real_]] <- letters[10:1], "'i' cannot be NA")
+  expect_error(tab[[NA_character_]] <- letters[10:1], "'i' cannot be NA")
+  expect_error(tab[[NULL]] <- letters[10:1], "'i' must be character or numeric, not NULL")
+})
+
 test_that("Table$Slice", {
+  tbl <- tibble::tibble(
+    int = 1:10,
+    dbl = as.numeric(1:10),
+    lgl = sample(c(TRUE, FALSE, NA), 10, replace = TRUE),
+    chr = letters[1:10],
+    fct = factor(letters[1:10])
+  )
+  tab <- Table$create(tbl)
   tab2 <- tab$Slice(5)
   expect_data_frame(tab2, tbl[6:10,])
 
@@ -277,6 +353,12 @@ test_that("table() auto splices (ARROW-5718)", {
   expect_equivalent(as.data.frame(tab3), df)
 })
 
+test_that("Validation when creating table with schema (ARROW-10953)", {
+  tab <- Table$create(data.frame(), schema = schema(a = int32()))
+  skip("This segfaults")
+  expect_identical(dim(as.data.frame(tab)), c(0L, 1L))
+})
+
 test_that("==.Table", {
   tab1 <- Table$create(x = 1:2, y = c("a", "b"))
   tab2 <- Table$create(x = 1:2, y = c("a", "b"))
@@ -348,4 +430,25 @@ test_that("Table unifies dictionary on conversion back to R (ARROW-8374)", {
   tab <- Table$create(b1, b2, b3, b4)
 
   expect_identical(as.data.frame(tab), res)
+})
+
+test_that("Table$SelectColumns()", {
+  tab <- Table$create(x = 1:10, y = 1:10)
+
+  expect_equal(tab$SelectColumns(0L), Table$create(x = 1:10))
+
+  expect_error(tab$SelectColumns(2:4))
+  expect_error(tab$SelectColumns(""))
+})
+
+test_that("Table name assignment", {
+  tab <- Table$create(x = 1:10, y = 1:10)
+  expect_identical(names(tab), c("x", "y"))
+  names(tab) <- c("a", "b")
+  expect_identical(names(tab), c("a", "b"))
+  expect_error(names(tab) <- "f")
+  expect_error(names(tab) <- letters)
+  expect_error(names(tab) <- character(0))
+  expect_error(names(tab) <- NULL)
+  expect_error(names(tab) <- c(TRUE, FALSE))
 })

@@ -49,13 +49,14 @@ fn create_context() -> Result<ExecutionContext> {
     let mut ctx = ExecutionContext::new();
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
-    let provider = MemTable::new(schema, vec![vec![batch]])?;
+    let provider = MemTable::try_new(schema, vec![vec![batch]])?;
     ctx.register_table("t", Box::new(provider));
     Ok(ctx)
 }
 
 /// In this example we will declare a single-type, single return type UDF that exponentiates f64, a^b
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut ctx = create_context()?;
 
     // First, declare the actual implementation of the calculation
@@ -111,25 +112,33 @@ fn main() -> Result<()> {
         pow,
     );
 
-    // finally, register the UDF
-    ctx.register_udf(pow);
+    // at this point, we can use it or register it, depending on the use-case:
+    // * if the UDF is expected to be used throughout the program in different contexts,
+    //   we can register it, and call it later:
+    ctx.register_udf(pow.clone()); // clone is only required in this example because we show both usages
 
-    // at this point, we can use it. Note that the code below can be in a
-    // scope on which we do not have access to `pow`.
+    // * if the UDF is expected to be used directly in the scope, `.call` it directly:
+    let expr = pow.call(vec![col("a"), col("b")]);
 
     // get a DataFrame from the context
     let df = ctx.table("t")?;
 
-    // get the udf registry.
-    let f = df.registry();
+    // if we do not have `pow` in the scope and we registered it, we can get it from the registry
+    let pow = df.registry().udf("pow")?;
+    // equivalent to expr
+    let expr1 = pow.call(vec![col("a"), col("b")]);
 
-    // equivalent to `'SELECT pow(a, b) FROM t'`
-    let df = df.select(vec![f.udf("pow", vec![col("a"), col("b")])?])?;
+    // equivalent to `'SELECT pow(a, b), pow(a, b) AS pow1 FROM t'`
+    let df = df.select(vec![
+        expr,
+        // alias so that they have different column names
+        expr1.alias("pow1"),
+    ])?;
 
     // note that "b" is f32, not f64. DataFusion coerces the types to match the UDF's signature.
 
     // execute the query
-    let results = df.collect()?;
+    let results = df.collect().await?;
 
     // print the results
     pretty::print_batches(&results)?;

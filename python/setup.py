@@ -120,8 +120,14 @@ class build_ext(_build_ext):
                      ('bundle-cython-cpp', None,
                       'bundle generated Cython C++ code '
                       '(used for code coverage)'),
+                     ('with-rados', None,
+                      'build the Rados extension'),
                      ('bundle-arrow-cpp', None,
-                      'bundle the Arrow C++ libraries')] +
+                      'bundle the Arrow C++ libraries'),
+                     ('bundle-arrow-cpp-headers', None,
+                      'bundle the Arrow C++ headers'),
+                     ('bundle-plasma-executable', None,
+                      'bundle the plasma-store-server executable')] +
                     _build_ext.user_options)
 
     def initialize_options(self):
@@ -134,6 +140,7 @@ class build_ext(_build_ext):
                                          'release').lower()
         self.boost_namespace = os.environ.get('PYARROW_BOOST_NAMESPACE',
                                               'boost')
+        self.with_rados = strtobool(os.environ.get('PYARROW_WITH_RADOS', '0'))
 
         self.cmake_cxxflags = os.environ.get('PYARROW_CXXFLAGS', '')
 
@@ -175,6 +182,10 @@ class build_ext(_build_ext):
             os.environ.get('PYARROW_BUNDLE_CYTHON_CPP', '0'))
         self.bundle_boost = strtobool(
             os.environ.get('PYARROW_BUNDLE_BOOST', '0'))
+        self.bundle_arrow_cpp_headers = strtobool(
+            os.environ.get('PYARROW_BUNDLE_ARROW_CPP_HEADERS', '1'))
+        self.bundle_plasma_executable = strtobool(
+            os.environ.get('PYARROW_BUNDLE_PLASMA_EXECUTABLE', '1'))
 
     CYTHON_MODULE_NAMES = [
         'lib',
@@ -190,6 +201,7 @@ class build_ext(_build_ext):
         '_plasma',
         '_s3fs',
         '_hdfs',
+        '_rados',
         'gandiva']
 
     def _run_cmake(self):
@@ -236,6 +248,7 @@ class build_ext(_build_ext):
             if self.cmake_generator:
                 cmake_options += ['-G', self.cmake_generator]
 
+            append_cmake_bool(self.with_rados, 'PYARROW_BUILD_RADOS')
             append_cmake_bool(self.with_cuda, 'PYARROW_BUILD_CUDA')
             append_cmake_bool(self.with_flight, 'PYARROW_BUILD_FLIGHT')
             append_cmake_bool(self.with_gandiva, 'PYARROW_BUILD_GANDIVA')
@@ -303,11 +316,12 @@ class build_ext(_build_ext):
             else:
                 build_prefix = self.build_type
 
-            print('Bundling includes: ' + pjoin(build_prefix, 'include'))
-            if os.path.exists(pjoin(build_lib, 'pyarrow', 'include')):
-                shutil.rmtree(pjoin(build_lib, 'pyarrow', 'include'))
-            shutil.move(pjoin(build_prefix, 'include'),
-                        pjoin(build_lib, 'pyarrow'))
+            if self.bundle_arrow_cpp or self.bundle_arrow_cpp_headers:
+                print('Bundling includes: ' + pjoin(build_prefix, 'include'))
+                if os.path.exists(pjoin(build_lib, 'pyarrow', 'include')):
+                    shutil.rmtree(pjoin(build_lib, 'pyarrow', 'include'))
+                shutil.move(pjoin(build_prefix, 'include'),
+                            pjoin(build_lib, 'pyarrow'))
 
             # Move the built C-extension to the place expected by the Python
             # build
@@ -345,7 +359,7 @@ class build_ext(_build_ext):
             if self.bundle_arrow_cpp:
                 self._bundle_arrow_cpp(build_prefix, build_lib)
 
-            if self.with_plasma:
+            if self.with_plasma and self.bundle_plasma_executable:
                 # Move the plasma store
                 source = os.path.join(self.build_type, "plasma-store-server")
                 target = os.path.join(build_lib,
@@ -423,6 +437,8 @@ class build_ext(_build_ext):
         if name == '_cuda' and not self.with_cuda:
             return True
         if name == 'gandiva' and not self.with_gandiva:
+            return True
+        if name == '_rados' and not self.with_rados:
             return True
         return False
 
@@ -518,7 +534,7 @@ def _move_shared_libs_unix(build_prefix, build_lib, lib_name):
 
 # If the event of not running from a git clone (e.g. from a git archive
 # or a Python sdist), see if we can set the version number ourselves
-default_version = '2.0.0-SNAPSHOT'
+default_version = '3.0.0-SNAPSHOT'
 if (not os.path.exists('../.git') and
         not os.environ.get('SETUPTOOLS_SCM_PRETEND_VERSION')):
     if os.path.exists('PKG-INFO'):
@@ -609,16 +625,16 @@ setup(
     setup_requires=['setuptools_scm', 'cython >= 0.29'] + setup_requires,
     install_requires=install_requires,
     tests_require=['pytest', 'pandas', 'hypothesis'],
-    python_requires='>=3.5',
+    python_requires='>=3.6',
     description='Python library for Apache Arrow',
     long_description=long_description,
     long_description_content_type='text/markdown',
     classifiers=[
         'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
     ],
     license='Apache License, Version 2.0',
     maintainer='Apache Arrow Developers',

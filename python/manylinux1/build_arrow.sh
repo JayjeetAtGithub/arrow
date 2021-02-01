@@ -62,7 +62,7 @@ export PYARROW_CMAKE_OPTIONS='-DTHRIFT_HOME=/usr -DBoost_NAMESPACE=arrow_boost -
 mkdir -p /io/dist
 
 # Must pass PYTHON_VERSION env variable
-# possible values are: 3.5 3.6 3.7 3.8
+# possible values are: 3.6 3.7 3.8 3.9
 
 UNICODE_WIDTH=32  # Dummy value, irrelevant for Python 3
 CPYTHON_PATH="$(cpython_path ${PYTHON_VERSION} ${UNICODE_WIDTH})"
@@ -70,11 +70,6 @@ PYTHON_INTERPRETER="${CPYTHON_PATH}/bin/python"
 PIP="${CPYTHON_PATH}/bin/pip"
 # Put our Python first to avoid picking up an antiquated Python from CMake
 PATH="${CPYTHON_PATH}/bin:${PATH}"
-
-# XXX The Docker image doesn't include Python libs, this confuses CMake
-# (https://github.com/pypa/manylinux/issues/484)
-py_libname=$(${PYTHON_INTERPRETER} -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))")
-touch ${CPYTHON_PATH}/lib/${py_libname}
 
 echo "=== (${PYTHON_VERSION}) Install the wheel build dependencies ==="
 $PIP install -r requirements-wheel-build.txt
@@ -86,9 +81,6 @@ export PYARROW_WITH_GANDIVA=0
 export BUILD_ARROW_DATASET=ON
 export BUILD_ARROW_FLIGHT=ON
 export BUILD_ARROW_GANDIVA=OFF
-
-# ARROW-3052(wesm): ORC is being bundled until it can be added to the
-# manylinux1 image
 
 echo "=== (${PYTHON_VERSION}) Building Arrow C++ libraries ==="
 ARROW_BUILD_DIR=/tmp/build-PY${PYTHON_VERSION}

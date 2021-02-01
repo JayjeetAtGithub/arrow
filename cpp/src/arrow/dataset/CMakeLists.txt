@@ -32,6 +32,23 @@ set(ARROW_DATASET_SRCS
 set(ARROW_DATASET_LINK_STATIC arrow_static)
 set(ARROW_DATASET_LINK_SHARED arrow_shared)
 
+if(ARROW_RADOS)
+  find_package(librados REQUIRED)
+  include_directories(${LIBRADOS_INCLUDE_DIR})
+
+  find_package(libcephfs REQUIRED)
+  include_directories(${LIBCEPHFS_INCLUDE_DIR})
+
+  set(ARROW_DATASET_LINK_STATIC ${ARROW_DATASET_LINK_STATIC} ${LIBRADOS_LIBRARIES})
+  set(ARROW_DATASET_LINK_SHARED ${ARROW_DATASET_LINK_SHARED} ${LIBRADOS_LIBRARIES})
+  set(ARROW_DATASET_LINK_SHARED ${ARROW_DATASET_LINK_SHARED} ${LIBCEPHFS_LIBRARIES})
+  set(ARROW_DATASET_LINK_SHARED ${ARROW_DATASET_LINK_SHARED} ${LIBCEPHFS_LIBRARIES})
+
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} dataset_rados.cc)
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} rados_utils.cc)
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} rados.cc)
+endif()
+
 if(ARROW_CSV)
   set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} file_csv.cc)
 endif()
@@ -111,6 +128,10 @@ add_arrow_dataset_test(file_test)
 add_arrow_dataset_test(filter_test)
 add_arrow_dataset_test(partition_test)
 add_arrow_dataset_test(scanner_test)
+
+if(ARROW_RADOS)
+  add_arrow_dataset_test(dataset_rados_test)
+endif()
 
 if(ARROW_CSV)
   add_arrow_dataset_test(file_csv_test)

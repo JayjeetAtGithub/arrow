@@ -17,16 +17,23 @@
 
 //! Execution plan for reading CSV files
 
+use std::any::Any;
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::{common, Partitioning};
 use arrow::csv;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
-use arrow::record_batch::{RecordBatch, RecordBatchReader};
+use arrow::record_batch::RecordBatch;
+use futures::Stream;
+
+use super::{RecordBatchStream, SendableRecordBatchStream};
+use async_trait::async_trait;
 
 /// CSV file read option
 #[derive(Copy, Clone)]
@@ -80,11 +87,8 @@ impl<'a> CsvReadOptions<'a> {
 
     /// Configure delimiter setting with Option, None value will be ignored
     pub fn delimiter_option(mut self, delimiter: Option<u8>) -> Self {
-        match delimiter {
-            Some(d) => {
-                self.delimiter = d;
-            }
-            _ => (),
+        if let Some(d) = delimiter {
+            self.delimiter = d;
         }
         self
     }
@@ -138,7 +142,7 @@ impl CsvExec {
         let mut filenames: Vec<String> = vec![];
         common::build_file_list(path, &mut filenames, file_extension.as_str())?;
         if filenames.is_empty() {
-            return Err(ExecutionError::General("No files found".to_string()));
+            return Err(DataFusionError::Execution("No files found".to_string()));
         }
 
         let schema = match options.schema {
@@ -178,7 +182,13 @@ impl CsvExec {
     }
 }
 
+#[async_trait]
 impl ExecutionPlan for CsvExec {
+    /// Return a reference to Any that can be used for downcasting
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
@@ -201,35 +211,32 @@ impl ExecutionPlan for CsvExec {
         if children.is_empty() {
             Ok(Arc::new(self.clone()))
         } else {
-            Err(ExecutionError::General(format!(
+            Err(DataFusionError::Internal(format!(
                 "Children cannot be replaced in {:?}",
                 self
             )))
         }
     }
 
-    fn execute(
-        &self,
-        partition: usize,
-    ) -> Result<Arc<Mutex<dyn RecordBatchReader + Send + Sync>>> {
-        Ok(Arc::new(Mutex::new(CsvIterator::try_new(
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
+        Ok(Box::pin(CsvStream::try_new(
             &self.filenames[partition],
             self.schema.clone(),
             self.has_header,
             self.delimiter,
             &self.projection,
             self.batch_size,
-        )?)))
+        )?))
     }
 }
 
 /// Iterator over batches
-struct CsvIterator {
+struct CsvStream {
     /// Arrow CSV reader
     reader: csv::Reader<File>,
 }
 
-impl CsvIterator {
+impl CsvStream {
     /// Create an iterator for a CSV file
     pub fn try_new(
         filename: &str,
@@ -242,10 +249,11 @@ impl CsvIterator {
         let file = File::open(filename)?;
         let reader = csv::Reader::new(
             file,
-            schema.clone(),
+            schema,
             has_header,
             delimiter,
             batch_size,
+            None,
             projection.clone(),
         );
 
@@ -253,27 +261,34 @@ impl CsvIterator {
     }
 }
 
-impl RecordBatchReader for CsvIterator {
+impl Stream for CsvStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.reader.next())
+    }
+}
+
+impl RecordBatchStream for CsvStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
         self.reader.schema()
-    }
-
-    /// Get the next RecordBatch
-    fn next_batch(&mut self) -> ArrowResult<Option<RecordBatch>> {
-        Ok(self.reader.next()?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{aggr_test_schema, arrow_testdata_path};
+    use crate::test::aggr_test_schema;
+    use futures::StreamExt;
 
-    #[test]
-    fn csv_exec_with_projection() -> Result<()> {
+    #[tokio::test]
+    async fn csv_exec_with_projection() -> Result<()> {
         let schema = aggr_test_schema();
-        let testdata = arrow_testdata_path();
+        let testdata = arrow::util::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let csv = CsvExec::try_new(
@@ -285,9 +300,8 @@ mod tests {
         assert_eq!(13, csv.schema.fields().len());
         assert_eq!(3, csv.projected_schema.fields().len());
         assert_eq!(3, csv.schema().fields().len());
-        let it = csv.execute(0)?;
-        let mut it = it.lock().unwrap();
-        let batch = it.next_batch()?.unwrap();
+        let mut stream = csv.execute(0).await?;
+        let batch = stream.next().await.unwrap()?;
         assert_eq!(3, batch.num_columns());
         let batch_schema = batch.schema();
         assert_eq!(3, batch_schema.fields().len());
@@ -297,10 +311,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn csv_exec_without_projection() -> Result<()> {
+    #[tokio::test]
+    async fn csv_exec_without_projection() -> Result<()> {
         let schema = aggr_test_schema();
-        let testdata = arrow_testdata_path();
+        let testdata = arrow::util::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let csv =
@@ -308,9 +322,8 @@ mod tests {
         assert_eq!(13, csv.schema.fields().len());
         assert_eq!(13, csv.projected_schema.fields().len());
         assert_eq!(13, csv.schema().fields().len());
-        let it = csv.execute(0)?;
-        let mut it = it.lock().unwrap();
-        let batch = it.next_batch()?.unwrap();
+        let mut it = csv.execute(0).await?;
+        let batch = it.next().await.unwrap()?;
         assert_eq!(13, batch.num_columns());
         let batch_schema = batch.schema();
         assert_eq!(13, batch_schema.fields().len());

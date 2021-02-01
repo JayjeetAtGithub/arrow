@@ -16,16 +16,31 @@
 // under the License.
 
 //! Type coercion rules for functions with multiple valid signatures
+//!
+//! Coercion is performed automatically by DataFusion when the types
+//! of arguments passed to a function do not exacty match the types
+//! required by that function. In this case, DataFusion will attempt to
+//! *coerce* the arguments to types accepted by the function by
+//! inserting CAST operations.
+//!
+//! CAST operations added by coercion are lossless and never discard
+//! information. For example coercion from i32 -> i64 might be
+//! performed because all valid i32 values can be represented using an
+//! i64. However, i64 -> i32 is never performed as there are i64
+//! values which can not be represented by i32 values.
 
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
 
 use super::{functions::Signature, PhysicalExpr};
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
 use crate::physical_plan::expressions::cast;
 
-/// Returns expressions constructed by casting `expressions` to types compatible with `signatures`.
+/// Returns `expressions` coerced to types compatible with
+/// `signature`, if possible.
+///
+/// See the module level documentation for more detail on coercion.
 pub fn coerce(
     expressions: &Vec<Arc<dyn PhysicalExpr>>,
     schema: &Schema,
@@ -45,7 +60,10 @@ pub fn coerce(
         .collect::<Result<Vec<_>>>()
 }
 
-/// returns the data types that each argument must be casted to match the `signature`.
+/// Returns the data types that each argument must be coerced to match
+/// `signature`.
+///
+/// See the module level documentation for more detail on coercion.
 pub fn data_types(
     current_types: &Vec<DataType>,
     signature: &Signature,
@@ -67,6 +85,16 @@ pub fn data_types(
                 .collect()]
         }
         Signature::Exact(valid_types) => vec![valid_types.clone()],
+        Signature::Any(number) => {
+            if current_types.len() != *number {
+                return Err(DataFusionError::Plan(format!(
+                    "The function expected {} arguments but received {}",
+                    number,
+                    current_types.len()
+                )));
+            }
+            vec![(0..*number).map(|i| current_types[i].clone()).collect()]
+        }
     };
 
     if valid_types.contains(current_types) {
@@ -80,7 +108,7 @@ pub fn data_types(
     }
 
     // none possible -> Error
-    Err(ExecutionError::General(format!(
+    Err(DataFusionError::Plan(format!(
         "Coercion from {:?} to the signature {:?} failed.",
         current_types, signature
     )))
@@ -114,54 +142,40 @@ fn maybe_data_types(
     Some(new_type)
 }
 
-/// Verify that the type cast can be performed
+/// Return true if a value of type `type_from` can be coerced
+/// (losslessly converted) into a value of `type_to`
+///
+/// See the module level documentation for more detail on coercion.
 pub fn can_coerce_from(type_into: &DataType, type_from: &DataType) -> bool {
     use self::DataType::*;
     match type_into {
-        Int8 => match type_from {
-            Int8 => true,
-            _ => false,
-        },
-        Int16 => match type_from {
-            Int8 | Int16 | UInt8 => true,
-            _ => false,
-        },
-        Int32 => match type_from {
-            Int8 | Int16 | Int32 | UInt8 | UInt16 => true,
-            _ => false,
-        },
-        Int64 => match type_from {
-            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 => true,
-            _ => false,
-        },
-        UInt8 => match type_from {
-            UInt8 => true,
-            _ => false,
-        },
-        UInt16 => match type_from {
-            UInt8 | UInt16 => true,
-            _ => false,
-        },
-        UInt32 => match type_from {
-            UInt8 | UInt16 | UInt32 => true,
-            _ => false,
-        },
-        UInt64 => match type_from {
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            _ => false,
-        },
-        Float32 => match type_from {
-            Int8 | Int16 | Int32 | Int64 => true,
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            Float32 => true,
-            _ => false,
-        },
-        Float64 => match type_from {
-            Int8 | Int16 | Int32 | Int64 => true,
-            UInt8 | UInt16 | UInt32 | UInt64 => true,
-            Float32 | Float64 => true,
-            _ => false,
-        },
+        Int8 => matches!(type_from, Int8),
+        Int16 => matches!(type_from, Int8 | Int16 | UInt8),
+        Int32 => matches!(type_from, Int8 | Int16 | Int32 | UInt8 | UInt16),
+        Int64 => matches!(
+            type_from,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32
+        ),
+        UInt8 => matches!(type_from, UInt8),
+        UInt16 => matches!(type_from, UInt8 | UInt16),
+        UInt32 => matches!(type_from, UInt8 | UInt16 | UInt32),
+        UInt64 => matches!(type_from, UInt8 | UInt16 | UInt32 | UInt64),
+        Float32 => matches!(
+            type_from,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32
+        ),
+        Float64 => matches!(
+            type_from,
+            Int8 | Int16
+                | Int32
+                | Int64
+                | UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Float32
+                | Float64
+        ),
         Utf8 => true,
         _ => false,
     }
@@ -276,6 +290,12 @@ mod tests {
                 Signature::Variadic(vec![DataType::UInt32, DataType::UInt64]),
                 vec![DataType::UInt64, DataType::UInt64],
             )?,
+            // f32 -> f32
+            case(
+                vec![DataType::Float32],
+                Signature::Any(1),
+                vec![DataType::Float32],
+            )?,
         ];
 
         for case in cases {
@@ -304,11 +324,13 @@ mod tests {
                 Signature::Variadic(vec![DataType::UInt32]),
                 vec![],
             )?,
+            // expected two arguments
+            case(vec![DataType::UInt32], Signature::Any(2), vec![])?,
         ];
 
         for case in cases {
-            if let Ok(_) = coerce(&case.0, &case.1, &case.2) {
-                return Err(ExecutionError::General(format!(
+            if coerce(&case.0, &case.1, &case.2).is_ok() {
+                return Err(DataFusionError::Plan(format!(
                     "Error was expected in {:?}",
                     case
                 )));

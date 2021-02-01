@@ -39,37 +39,25 @@ installation will also build necessary C++ dependencies. For a faster,
 more complete installation, set the environment variable `NOT_CRAN=true`.
 See `vignette("install", package = "arrow")` for details.
 
-If you install the `arrow` package from source and the C++ library is
-not found, the R package functions will notify you that Arrow is not
-available. Call
-
-```r
-arrow::install_arrow()
-```
-
-to retry installation with dependencies.
-
-Note that `install_arrow()` is available as a standalone script, so you can
-access it for convenience without first installing the package:
-
-```r
-source("https://raw.githubusercontent.com/apache/arrow/master/r/R/install-arrow.R")
-install_arrow()
-```
-
 ## Installing a development version
 
 Development versions of the package (binary and source) are built daily and hosted at
-<https://dl.bintray.com/ursalabs/arrow-r/>. To install from there:
+<https://arrow-r-nightly.s3.amazonaws.com>. To install from there:
 
 ``` r
-install.packages("arrow", repos = "https://dl.bintray.com/ursalabs/arrow-r")
+install.packages("arrow", repos = "https://arrow-r-nightly.s3.amazonaws.com")
 ```
 
 Or
 
 ```r
-install_arrow(nightly = TRUE)
+arrow::install_arrow(nightly = TRUE)
+```
+
+Conda users can install `arrow` nightlies from our nightlies channel using:
+
+```
+conda install -c arrow-nightlies -c conda-forge --strict-channel-priority r-arrow
 ```
 
 These daily package builds are not official Apache releases and are not
@@ -91,7 +79,7 @@ brew install apache-arrow --HEAD
 ```
 
 On Windows, you can download a .zip file with the arrow dependencies from the
-[nightly bintray repository](https://dl.bintray.com/ursalabs/arrow-r/libarrow/bin/windows/),
+[nightly repository](https://dl.bintray.com/ursalabs/arrow-r/libarrow/bin/windows/),
 and then set the `RWINLIB_LOCAL` environment variable to point to that
 zip file before installing the `arrow` R package. Version numbers in that
 repository correspond to dates, and you will likely want the most recent.
@@ -102,6 +90,43 @@ elsewhere, you’ll need to build it from source too.
 
 First, install the C++ library. See the [developer
 guide](https://arrow.apache.org/docs/developers/cpp/building.html) for details.
+It's recommended to make a `build` directory inside of the `cpp` directory of
+the Arrow git repository (it is git-ignored). Assuming you are inside `cpp/build`,
+you'll first call `cmake` to configure the build and then `make install`.
+For the R package, you'll need to enable several features in the C++ library
+using `-D` flags:
+
+```
+cmake
+  -DARROW_COMPUTE=ON \
+  -DARROW_CSV=ON \
+  -DARROW_DATASET=ON \
+  -DARROW_FILESYSTEM=ON \
+  -DARROW_JEMALLOC=ON \
+  -DARROW_JSON=ON \
+  -DARROW_PARQUET=ON \
+  -DCMAKE_BUILD_TYPE=release \
+  ..
+```
+
+where `..` is the path to the `cpp/` directory when you're in `cpp/build`.
+
+If you want to enable support for compression libraries, add some or all of these:
+
+```
+  -DARROW_WITH_BROTLI=ON \
+  -DARROW_WITH_BZ2=ON \
+  -DARROW_WITH_LZ4=ON \
+  -DARROW_WITH_SNAPPY=ON \
+  -DARROW_WITH_ZLIB=ON \
+  -DARROW_WITH_ZSTD=ON \
+```
+
+Other flags that may be useful:
+
+* `-DARROW_EXTRA_ERROR_CONTEXT=ON` makes errors coming from the C++ library point to files and line numbers
+* `-DARROW_INSTALL_NAME_RPATH=OFF` may be needed on macOS if there are problems at link time
+* `-DBOOST_SOURCE=BUNDLED`, for example, or any other dependency `*_SOURCE`, if you have a system version of a C++ dependency that doesn't work correctly with Arrow. This tells the build to compile its own version of the dependency from source.
 
 Note that after any change to the C++ library, you must reinstall it and
 run `make clean` or `git clean -fdx .` to remove any cached object code
@@ -171,6 +196,27 @@ isn’t found, you can explicitly provide the path to it like
 `CLANG_FORMAT=$(which clang-format-8) ./lint.sh`. On macOS, you can get
 this by installing LLVM via Homebrew and running the script as
 `CLANG_FORMAT=$(brew --prefix llvm@8)/bin/clang-format ./lint.sh`
+
+### Running tests
+
+Some tests are conditionally enabled based on the availability of certain
+features in the package build (S3 support, compression libraries, etc.).
+Others are generally skipped by default but can be enabled with environment
+variables or other settings:
+
+* All tests are skipped on Linux if the package builds without the C++ libarrow.
+  To make the build fail if libarrow is not available (as in, to test that
+  the C++ build was successful), set `TEST_R_WITH_ARROW=TRUE`
+* Some tests are disabled unless `ARROW_R_DEV=TRUE`
+* Tests that require allocating >2GB of memory to test Large types are disabled
+  unless `ARROW_LARGE_MEMORY_TESTS=TRUE`
+* Integration tests against a real S3 bucket are disabled unless credentials
+  are set in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; these are available
+  on request
+* S3 tests using [MinIO](https://min.io/) locally are enabled if the
+  `minio server` process is found running. If you're running MinIO with custom
+  settings, you can set `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and
+  `MINIO_PORT` to override the defaults.
 
 ### Useful functions
 

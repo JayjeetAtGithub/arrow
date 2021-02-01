@@ -94,7 +94,6 @@ x-hierarchy:
       - conda-python-turbodbc
       - conda-python-kartothek
       - conda-python-spark
-    - conda-r
   - debian-cpp:
     - debian-c-glib:
       - debian-ruby
@@ -103,11 +102,11 @@ x-hierarchy:
   - debian-java:
     - debian-java-jni
   - debian-js
-  - debian-rust
   - fedora-cpp:
     - fedora-python
   - ubuntu-cpp:
-    - ubuntu-cpp-cmake32
+    - ubuntu-cpp-cls
+    - ubuntu-python-cls
     - ubuntu-c-glib:
       - ubuntu-ruby
     - ubuntu-lint
@@ -248,6 +247,7 @@ services:
       cache_from:
         - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
       args:
+        arch: ${ARCH}
         base: "${ARCH}/ubuntu:${UBUNTU}"
         clang_tools: ${CLANG_TOOLS}
         llvm: ${LLVM}
@@ -277,6 +277,7 @@ services:
       cache_from:
         - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cuda-${CUDA}-cpp
       args:
+        arch: ${ARCH}
         base: nvidia/cuda:${CUDA}-devel-ubuntu${UBUNTU}
         clang_tools: ${CLANG_TOOLS}
         llvm: ${LLVM}
@@ -330,7 +331,7 @@ services:
     #   docker-compose run --rm fedora-cpp
     # Parameters:
     #   ARCH: amd64, arm64v8, ...
-    #   FEDORA: 32
+    #   FEDORA: 33
     image: ${REPO}:${ARCH}-fedora-${FEDORA}-cpp
     build:
       context: .
@@ -472,7 +473,7 @@ services:
     #   docker-compose run --rm conda-python
     # Parameters:
     #   ARCH: amd64, arm32v7
-    #   PYTHON: 3.6, 3.7, 3.8
+    #   PYTHON: 3.6, 3.7, 3.8, 3.9
     image: ${REPO}:${ARCH}-conda-python-${PYTHON}
     build:
       context: .
@@ -570,7 +571,7 @@ services:
     #   docker-compose run --rm fedora-python
     # Parameters:
     #   ARCH: amd64, arm64v8, ...
-    #   FEDORA: 32
+    #   FEDORA: 33
     image: ${REPO}:${ARCH}-fedora-${FEDORA}-python-3
     build:
       context: .
@@ -587,31 +588,59 @@ services:
 
   ##############################  Integration #################################
 
-  ubuntu-cpp-cmake32:
+  ubuntu-cpp-cls:
     # Usage:
     #   docker-compose build ubuntu-cpp
-    #   docker-compose build ubuntu-cpp-cmake32
-    #   docker-compose run ubuntu-cpp-cmake32
-    image: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp-cmake-3.2
+    #   docker-compose run --rm ubuntu-cpp
+    # Parameters:
+    #   ARCH: amd64, arm64v8, s390x, ...
+    #   UBUNTU: 16.04, 18.04, 20.04
+    image: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
     build:
       context: .
+      dockerfile: ci/docker/ubuntu-${UBUNTU}-cpp.dockerfile
       cache_from:
-        - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp-cmake-3.2
-      dockerfile: ci/docker/linux-apt-cmake.dockerfile
+        - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
       args:
-        base: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
-        cmake: 3.2.3
+        arch: ${ARCH}
+        base: "${ARCH}/ubuntu:${UBUNTU}"
+        clang_tools: ${CLANG_TOOLS}
+        llvm: ${LLVM}
+    shm_size: *shm-size
     ulimits: *ulimits
     environment:
       <<: *ccache
-      ARROW_ORC: "OFF"
-      ARROW_GANDIVA: "OFF"
-      # uriparser requires cmake 3.3
-      ARROW_FLIGHT: "OFF"
-      # Vendor boost to avoid dealing with stale FindBoost.
-      BOOST_SOURCE: "BUNDLED"
+      ARROW_ENABLE_TIMING_TESTS:  # inherit
+      ARROW_CLS: "ON"
     volumes: *ubuntu-volumes
-    command: *cpp-command
+    command: &cpp-cls-command >
+      /bin/bash -c "
+        /arrow/ci/scripts/cpp_build.sh /arrow /build &&
+        /arrow/ci/scripts/integration_ceph.sh /arrow /build &&
+        /arrow/ci/scripts/cpp_test.sh /arrow /build"
+
+  ubuntu-python-cls:
+    image: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-python-3
+    build:
+      context: .
+      dockerfile: ci/docker/linux-apt-python-3.dockerfile
+      cache_from:
+        - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-python-3
+      args:
+        base: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
+    shm_size: *shm-size
+    environment:
+      <<: *ccache
+      ARROW_ENABLE_TIMING_TESTS:  # inherit
+      ARROW_CLS: "ON"
+      ARROW_RADOS: "ON"
+    volumes: *ubuntu-volumes
+    command: &python-cls-command >
+      /bin/bash -c "
+        /arrow/ci/scripts/cpp_build.sh /arrow /build &&
+        /arrow/ci/scripts/integration_ceph.sh /arrow /build &&
+        /arrow/ci/scripts/python_build.sh /arrow /build &&
+        /arrow/ci/scripts/python_test.sh /arrow"
 
   conda-python-pandas:
     # Possible $PANDAS parameters:
@@ -633,6 +662,7 @@ services:
         repo: ${REPO}
         arch: ${ARCH}
         python: ${PYTHON}
+        numpy: ${NUMPY}
         pandas: ${PANDAS}
     shm_size: *shm-size
     environment:
@@ -822,30 +852,6 @@ services:
 
   ################################## R ########################################
 
-  conda-r:
-    # Usage:
-    #   docker-compose build conda-cpp
-    #   docker-compose build conda-r
-    #   docker-compose run conda-r
-    image: ${REPO}:${ARCH}-conda-r-${R}
-    build:
-      context: .
-      dockerfile: ci/docker/conda-r.dockerfile
-      cache_from:
-        - ${REPO}:${ARCH}-conda-r-${R}
-      args:
-        repo: ${REPO}
-        arch: ${ARCH}
-        r: ${R}
-    shm_size: *shm-size
-    environment:
-      <<: *ccache
-      NOT_CRAN: 'true'
-    volumes: *conda-volumes
-    command:
-      ["/arrow/ci/scripts/cpp_build.sh /arrow /build &&
-        /arrow/ci/scripts/r_test.sh /arrow"]
-
   ubuntu-r:
     # Usage:
     #   docker-compose build ubuntu-cpp
@@ -858,6 +864,7 @@ services:
       cache_from:
         - ${REPO}:${ARCH}-ubuntu-${UBUNTU}-r-${R}
       args:
+        arch: ${ARCH}
         r: ${R}
         base: ${REPO}:${ARCH}-ubuntu-${UBUNTU}-cpp
     shm_size: *shm-size
@@ -888,18 +895,20 @@ services:
         - ${REPO}:r-${R_ORG}-${R_IMAGE}-${R_TAG}
       args:
         base: ${R_ORG}/${R_IMAGE}:${R_TAG}
+        r_dev: ${ARROW_R_DEV}
+        devtoolset_version: ${DEVTOOLSET_VERSION}
     shm_size: *shm-size
     environment:
       LIBARROW_DOWNLOAD: "false"
       ARROW_HOME: "/arrow"
+      ARROW_R_DEV: ${ARROW_R_DEV}
       # To test for CRAN release, delete ^^ these two env vars so we download the Apache release
       ARROW_USE_PKG_CONFIG: "false"
+      DEVTOOLSET_VERSION: ${DEVTOOLSET_VERSION}
     volumes:
       - .:/arrow:delegated
     command: >
-      /bin/bash -c "
-        export ARROW_R_DEV=${ARROW_R_DEV} &&
-        /arrow/ci/scripts/r_test.sh /arrow"
+      /bin/bash -c "/arrow/ci/scripts/r_test.sh /arrow"
 
   ubuntu-r-sanitizer:
     # Only 18.04 and amd64 supported
@@ -924,35 +933,6 @@ services:
     command: >
       /bin/bash -c "
         /arrow/ci/scripts/r_sanitize.sh /arrow"
-
-  ################################ Rust #######################################
-
-  debian-rust:
-    # Usage:
-    #   docker-compose build debian-rust
-    #   docker-compose run debian-rust
-    image: ${REPO}:${ARCH}-debian-10-rust-${RUST}
-    build:
-      context: .
-      dockerfile: ci/docker/debian-10-rust.dockerfile
-      cache_from:
-        - ${REPO}:${ARCH}-debian-10-rust-${RUST}
-      args:
-        arch: ${ARCH}
-        rust: ${RUST}
-    shm_size: *shm-size
-    environment:
-      CARGO_HOME: /rust/cargo
-      CARGO_TARGET_DIR: /build/rust
-    volumes: &rust-volumes
-      - .:/arrow:delegated
-      - ${DOCKER_VOLUME_DIRECTORY:-.docker}/${ARCH}-debian-${DEBIAN}-rust:/build:delegated
-    command: &rust-command >
-      /bin/bash -c "
-        echo ${RUST} > /arrow/rust/rust-toolchain &&
-        if [ ! -d "/build/rust" ]; then mv /rust/target /build/rust; fi &&
-        /arrow/ci/scripts/rust_build.sh /arrow /build &&
-        /arrow/ci/scripts/rust_test.sh /arrow /build"
 
   ################################# Go ########################################
 

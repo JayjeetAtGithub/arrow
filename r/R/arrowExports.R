@@ -312,6 +312,10 @@ csv___ParseOptions__initialize <- function(options){
     .Call(`_arrow_csv___ParseOptions__initialize` , options)
 }
 
+csv___ReadOptions__column_names <- function(options){
+    .Call(`_arrow_csv___ReadOptions__column_names` , options)
+}
+
 csv___ConvertOptions__initialize <- function(options){
     .Call(`_arrow_csv___ConvertOptions__initialize` , options)
 }
@@ -322,6 +326,22 @@ csv___TableReader__Make <- function(input, read_options, parse_options, convert_
 
 csv___TableReader__Read <- function(table_reader){
     .Call(`_arrow_csv___TableReader__Read` , table_reader)
+}
+
+TimestampParser__kind <- function(parser){
+    .Call(`_arrow_TimestampParser__kind` , parser)
+}
+
+TimestampParser__format <- function(parser){
+    .Call(`_arrow_TimestampParser__format` , parser)
+}
+
+TimestampParser__MakeStrptime <- function(format){
+    .Call(`_arrow_TimestampParser__MakeStrptime` , format)
+}
+
+TimestampParser__MakeISO8601 <- function(){
+    .Call(`_arrow_TimestampParser__MakeISO8601` )
 }
 
 dataset___Dataset__NewScan <- function(ds){
@@ -396,12 +416,28 @@ dataset___FileFormat__type_name <- function(format){
     .Call(`_arrow_dataset___FileFormat__type_name` , format)
 }
 
-dataset___ParquetFileFormat__MakeRead <- function(use_buffered_stream, buffer_size, dict_columns){
-    .Call(`_arrow_dataset___ParquetFileFormat__MakeRead` , use_buffered_stream, buffer_size, dict_columns)
+dataset___FileFormat__DefaultWriteOptions <- function(fmt){
+    .Call(`_arrow_dataset___FileFormat__DefaultWriteOptions` , fmt)
 }
 
-dataset___ParquetFileFormat__MakeWrite <- function(writer_props, arrow_props){
-    .Call(`_arrow_dataset___ParquetFileFormat__MakeWrite` , writer_props, arrow_props)
+dataset___ParquetFileFormat__Make <- function(use_buffered_stream, buffer_size, dict_columns){
+    .Call(`_arrow_dataset___ParquetFileFormat__Make` , use_buffered_stream, buffer_size, dict_columns)
+}
+
+dataset___FileWriteOptions__type_name <- function(options){
+    .Call(`_arrow_dataset___FileWriteOptions__type_name` , options)
+}
+
+dataset___ParquetFileWriteOptions__update <- function(options, writer_props, arrow_writer_props){
+    invisible(.Call(`_arrow_dataset___ParquetFileWriteOptions__update` , options, writer_props, arrow_writer_props))
+}
+
+dataset___IpcFileWriteOptions__update2 <- function(ipc_options, use_legacy_format, codec, metadata_version){
+    invisible(.Call(`_arrow_dataset___IpcFileWriteOptions__update2` , ipc_options, use_legacy_format, codec, metadata_version))
+}
+
+dataset___IpcFileWriteOptions__update1 <- function(ipc_options, use_legacy_format, metadata_version){
+    invisible(.Call(`_arrow_dataset___IpcFileWriteOptions__update1` , ipc_options, use_legacy_format, metadata_version))
 }
 
 dataset___IpcFileFormat__Make <- function(){
@@ -464,20 +500,16 @@ dataset___Scanner__Scan <- function(scanner){
     .Call(`_arrow_dataset___Scanner__Scan` , scanner)
 }
 
+dataset___Scanner__schema <- function(sc){
+    .Call(`_arrow_dataset___Scanner__schema` , sc)
+}
+
 dataset___ScanTask__get_batches <- function(scan_task){
     .Call(`_arrow_dataset___ScanTask__get_batches` , scan_task)
 }
 
-dataset___Dataset__Write <- function(ds, schema, format, filesystem, path, partitioning){
-    invisible(.Call(`_arrow_dataset___Dataset__Write` , ds, schema, format, filesystem, path, partitioning))
-}
-
-shared_ptr_is_null <- function(xp){
-    .Call(`_arrow_shared_ptr_is_null` , xp)
-}
-
-unique_ptr_is_null <- function(xp){
-    .Call(`_arrow_unique_ptr_is_null` , xp)
+dataset___Dataset__Write <- function(file_write_options, filesystem, base_dir, partitioning, basename_template, scanner){
+    invisible(.Call(`_arrow_dataset___Dataset__Write` , file_write_options, filesystem, base_dir, partitioning, basename_template, scanner))
 }
 
 Int8__initialize <- function(){
@@ -604,12 +636,12 @@ DataType__Equals <- function(lhs, rhs){
     .Call(`_arrow_DataType__Equals` , lhs, rhs)
 }
 
-DataType__num_children <- function(type){
-    .Call(`_arrow_DataType__num_children` , type)
+DataType__num_fields <- function(type){
+    .Call(`_arrow_DataType__num_fields` , type)
 }
 
-DataType__children_pointer <- function(type){
-    .Call(`_arrow_DataType__children_pointer` , type)
+DataType__fields <- function(type){
+    .Call(`_arrow_DataType__fields` , type)
 }
 
 DataType__id <- function(type){
@@ -924,16 +956,28 @@ fs___SubTreeFileSystem__create <- function(base_path, base_fs){
     .Call(`_arrow_fs___SubTreeFileSystem__create` , base_path, base_fs)
 }
 
+fs___SubTreeFileSystem__base_fs <- function(file_system){
+    .Call(`_arrow_fs___SubTreeFileSystem__base_fs` , file_system)
+}
+
+fs___SubTreeFileSystem__base_path <- function(file_system){
+    .Call(`_arrow_fs___SubTreeFileSystem__base_path` , file_system)
+}
+
 fs___FileSystemFromUri <- function(path){
     .Call(`_arrow_fs___FileSystemFromUri` , path)
 }
 
-fs___EnsureS3Initialized <- function(){
-    invisible(.Call(`_arrow_fs___EnsureS3Initialized` ))
+fs___CopyFiles <- function(source_fs, source_sel, destination_fs, destination_base_dir, chunk_size, use_threads){
+    invisible(.Call(`_arrow_fs___CopyFiles` , source_fs, source_sel, destination_fs, destination_base_dir, chunk_size, use_threads))
 }
 
-fs___S3FileSystem__create <- function(){
-    .Call(`_arrow_fs___S3FileSystem__create` )
+fs___S3FileSystem__create <- function(anonymous, access_key, secret_key, session_token, role_arn, session_name, external_id, load_frequency, region, endpoint_override, scheme, background_writes){
+    .Call(`_arrow_fs___S3FileSystem__create` , anonymous, access_key, secret_key, session_token, role_arn, session_name, external_id, load_frequency, region, endpoint_override, scheme, background_writes)
+}
+
+fs___S3FileSystem__region <- function(fs){
+    .Call(`_arrow_fs___S3FileSystem__region` , fs)
 }
 
 io___Readable__Read <- function(x, nbytes){
@@ -1132,8 +1176,36 @@ parquet___arrow___FileReader__ReadTable2 <- function(reader, column_indices){
     .Call(`_arrow_parquet___arrow___FileReader__ReadTable2` , reader, column_indices)
 }
 
+parquet___arrow___FileReader__ReadRowGroup1 <- function(reader, i){
+    .Call(`_arrow_parquet___arrow___FileReader__ReadRowGroup1` , reader, i)
+}
+
+parquet___arrow___FileReader__ReadRowGroup2 <- function(reader, i, column_indices){
+    .Call(`_arrow_parquet___arrow___FileReader__ReadRowGroup2` , reader, i, column_indices)
+}
+
+parquet___arrow___FileReader__ReadRowGroups1 <- function(reader, row_groups){
+    .Call(`_arrow_parquet___arrow___FileReader__ReadRowGroups1` , reader, row_groups)
+}
+
+parquet___arrow___FileReader__ReadRowGroups2 <- function(reader, row_groups, column_indices){
+    .Call(`_arrow_parquet___arrow___FileReader__ReadRowGroups2` , reader, row_groups, column_indices)
+}
+
 parquet___arrow___FileReader__num_rows <- function(reader){
     .Call(`_arrow_parquet___arrow___FileReader__num_rows` , reader)
+}
+
+parquet___arrow___FileReader__num_columns <- function(reader){
+    .Call(`_arrow_parquet___arrow___FileReader__num_columns` , reader)
+}
+
+parquet___arrow___FileReader__num_row_groups <- function(reader){
+    .Call(`_arrow_parquet___arrow___FileReader__num_row_groups` , reader)
+}
+
+parquet___arrow___FileReader__ReadColumn <- function(reader, i){
+    .Call(`_arrow_parquet___arrow___FileReader__ReadColumn` , reader, i)
 }
 
 parquet___ArrowWriterProperties___create <- function(allow_truncated_timestamps, use_deprecated_int96_timestamps, timestamp_unit){
@@ -1200,6 +1272,10 @@ ImportRecordBatch <- function(array, schema){
     .Call(`_arrow_ImportRecordBatch` , array, schema)
 }
 
+ImportSchema <- function(schema){
+    .Call(`_arrow_ImportSchema` , schema)
+}
+
 allocate_arrow_schema <- function(){
     .Call(`_arrow_allocate_arrow_schema` )
 }
@@ -1244,6 +1320,10 @@ RecordBatch__schema <- function(x){
     .Call(`_arrow_RecordBatch__schema` , x)
 }
 
+RecordBatch__RenameColumns <- function(batch, names){
+    .Call(`_arrow_RecordBatch__RenameColumns` , batch, names)
+}
+
 RecordBatch__ReplaceSchemaMetadata <- function(x, metadata){
     .Call(`_arrow_RecordBatch__ReplaceSchemaMetadata` , x, metadata)
 }
@@ -1260,8 +1340,8 @@ RecordBatch__GetColumnByName <- function(batch, name){
     .Call(`_arrow_RecordBatch__GetColumnByName` , batch, name)
 }
 
-RecordBatch__select <- function(batch, indices){
-    .Call(`_arrow_RecordBatch__select` , batch, indices)
+RecordBatch__SelectColumns <- function(batch, indices){
+    .Call(`_arrow_RecordBatch__SelectColumns` , batch, indices)
 }
 
 RecordBatch__Equals <- function(self, other, check_metadata){
@@ -1332,12 +1412,12 @@ ipc___RecordBatchFileReader__Open <- function(file){
     .Call(`_arrow_ipc___RecordBatchFileReader__Open` , file)
 }
 
-Table__from_RecordBatchFileReader <- function(reader){
-    .Call(`_arrow_Table__from_RecordBatchFileReader` , reader)
+Table__from_RecordBatchReader <- function(reader){
+    .Call(`_arrow_Table__from_RecordBatchReader` , reader)
 }
 
-Table__from_RecordBatchStreamReader <- function(reader){
-    .Call(`_arrow_Table__from_RecordBatchStreamReader` , reader)
+Table__from_RecordBatchFileReader <- function(reader){
+    .Call(`_arrow_Table__from_RecordBatchFileReader` , reader)
 }
 
 ipc___RecordBatchFileReader__batches <- function(reader){
@@ -1480,6 +1560,10 @@ Table__ColumnNames <- function(table){
     .Call(`_arrow_Table__ColumnNames` , table)
 }
 
+Table__RenameColumns <- function(table, names){
+    .Call(`_arrow_Table__RenameColumns` , table, names)
+}
+
 Table__Slice1 <- function(table, offset){
     .Call(`_arrow_Table__Slice1` , table, offset)
 }
@@ -1504,8 +1588,20 @@ Table__GetColumnByName <- function(table, name){
     .Call(`_arrow_Table__GetColumnByName` , table, name)
 }
 
-Table__select <- function(table, indices){
-    .Call(`_arrow_Table__select` , table, indices)
+Table__RemoveColumn <- function(table, i){
+    .Call(`_arrow_Table__RemoveColumn` , table, i)
+}
+
+Table__AddColumn <- function(table, i, field, column){
+    .Call(`_arrow_Table__AddColumn` , table, i, field, column)
+}
+
+Table__SetColumn <- function(table, i, field, column){
+    .Call(`_arrow_Table__SetColumn` , table, i, field, column)
+}
+
+Table__SelectColumns <- function(table, indices){
+    .Call(`_arrow_Table__SelectColumns` , table, indices)
 }
 
 all_record_batches <- function(lst){

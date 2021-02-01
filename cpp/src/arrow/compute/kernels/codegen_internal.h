@@ -427,12 +427,28 @@ void SimpleUnary(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
 //
 // static void Call(KernelContext*, const ArrayData& arg0, const ArrayData& arg1,
 //                  ArrayData* out)
+// static void Call(KernelContext*, const ArrayData& arg0, const Scalar& arg1,
+//                  ArrayData* out)
+// static void Call(KernelContext*, const Scalar& arg0, const ArrayData& arg1,
+//                  ArrayData* out)
+// static void Call(KernelContext*, const Scalar& arg0, const Scalar& arg1,
+//                  Scalar* out)
 template <typename Operator>
 void SimpleBinary(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
-  if (batch[0].kind() == Datum::SCALAR || batch[1].kind() == Datum::SCALAR) {
-    ctx->SetStatus(Status::NotImplemented("NYI"));
-  } else if (batch.length > 0) {
-    Operator::Call(ctx, *batch[0].array(), *batch[1].array(), out->mutable_array());
+  if (batch.length == 0) return;
+
+  if (batch[0].kind() == Datum::ARRAY) {
+    if (batch[1].kind() == Datum::ARRAY) {
+      Operator::Call(ctx, *batch[0].array(), *batch[1].array(), out->mutable_array());
+    } else {
+      Operator::Call(ctx, *batch[0].array(), *batch[1].scalar(), out->mutable_array());
+    }
+  } else {
+    if (batch[1].kind() == Datum::ARRAY) {
+      Operator::Call(ctx, *batch[0].scalar(), *batch[1].array(), out->mutable_array());
+    } else {
+      Operator::Call(ctx, *batch[0].scalar(), *batch[1].scalar(), out->scalar().get());
+    }
   }
 }
 
@@ -496,28 +512,30 @@ struct ScalarUnary {
   using OutValue = typename GetOutputType<OutType>::T;
   using Arg0Value = typename GetViewType<Arg0Type>::T;
 
-  static void Array(KernelContext* ctx, const ArrayData& arg0, Datum* out) {
+  static void ExecArray(KernelContext* ctx, const ArrayData& arg0, Datum* out) {
     ArrayIterator<Arg0Type> arg0_it(arg0);
     OutputAdapter<OutType>::Write(ctx, out, [&]() -> OutValue {
       return Op::template Call<OutValue, Arg0Value>(ctx, arg0_it());
     });
   }
 
-  static void Scalar(KernelContext* ctx, const Scalar& arg0, Datum* out) {
+  static void ExecScalar(KernelContext* ctx, const Scalar& arg0, Datum* out) {
+    Scalar* out_scalar = out->scalar().get();
     if (arg0.is_valid) {
       Arg0Value arg0_val = UnboxScalar<Arg0Type>::Unbox(arg0);
+      out_scalar->is_valid = true;
       BoxScalar<OutType>::Box(Op::template Call<OutValue, Arg0Value>(ctx, arg0_val),
-                              out->scalar().get());
+                              out_scalar);
     } else {
-      out->value = MakeNullScalar(arg0.type);
+      out_scalar->is_valid = false;
     }
   }
 
   static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
     if (batch[0].kind() == Datum::ARRAY) {
-      return Array(ctx, *batch[0].array(), out);
+      return ExecArray(ctx, *batch[0].array(), out);
     } else {
-      return Scalar(ctx, *batch[0].scalar(), out);
+      return ExecScalar(ctx, *batch[0].scalar(), out);
     }
   }
 };
@@ -631,8 +649,6 @@ struct ScalarUnaryNotNullStateful {
       Arg0Value arg0_val = UnboxScalar<Arg0Type>::Unbox(arg0);
       BoxScalar<OutType>::Box(this->op.template Call<OutValue, Arg0Value>(ctx, arg0_val),
                               out->scalar().get());
-    } else {
-      out->value = MakeNullScalar(arg0.type);
     }
   }
 
@@ -1052,6 +1068,22 @@ ArrayKernelExec GenerateTypeAgnosticPrimitive(detail::GetTypeId get_id) {
     case Type::TIME64:
     case Type::DURATION:
       return Generator<UInt64Type>::Exec;
+    default:
+      DCHECK(false);
+      return ExecFail;
+  }
+}
+
+// similar to GenerateTypeAgnosticPrimitive, but for variable types
+template <template <typename...> class Generator>
+ArrayKernelExec GenerateTypeAgnosticVarBinaryBase(detail::GetTypeId get_id) {
+  switch (get_id.id) {
+    case Type::BINARY:
+    case Type::STRING:
+      return Generator<BinaryType>::Exec;
+    case Type::LARGE_BINARY:
+    case Type::LARGE_STRING:
+      return Generator<LargeBinaryType>::Exec;
     default:
       DCHECK(false);
       return ExecFail;

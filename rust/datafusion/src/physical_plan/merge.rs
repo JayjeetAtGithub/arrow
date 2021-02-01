@@ -18,16 +18,29 @@
 //! Defines the merge plan for executing partitions in parallel and then merging the results
 //! into a single partition
 
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::any::Any;
+use std::sync::Arc;
 
-use crate::error::{ExecutionError, Result};
-use crate::physical_plan::common::RecordBatchIterator;
+use futures::channel::mpsc;
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use futures::Stream;
+
+use async_trait::async_trait;
+
+use arrow::record_batch::RecordBatch;
+use arrow::{
+    datatypes::SchemaRef,
+    error::{ArrowError, Result as ArrowResult},
+};
+
+use super::RecordBatchStream;
+use crate::error::{DataFusionError, Result};
+use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::Partitioning;
-use crate::physical_plan::{common, ExecutionPlan};
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::{RecordBatch, RecordBatchReader};
+use super::SendableRecordBatchStream;
+use pin_project_lite::pin_project;
 
 /// Merge execution plan executes partitions in parallel and combines them into a single
 /// partition. No guarantees are made about the order of the resulting partition.
@@ -35,21 +48,22 @@ use arrow::record_batch::{RecordBatch, RecordBatchReader};
 pub struct MergeExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
-    /// Maximum number of concurrent threads
-    concurrency: usize,
 }
 
 impl MergeExec {
     /// Create a new MergeExec
-    pub fn new(input: Arc<dyn ExecutionPlan>, max_concurrency: usize) -> Self {
-        MergeExec {
-            input,
-            concurrency: max_concurrency,
-        }
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        MergeExec { input }
     }
 }
 
+#[async_trait]
 impl ExecutionPlan for MergeExec {
+    /// Return a reference to Any that can be used for downcasting
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -68,23 +82,17 @@ impl ExecutionPlan for MergeExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match children.len() {
-            1 => Ok(Arc::new(MergeExec::new(
-                children[0].clone(),
-                self.concurrency,
-            ))),
-            _ => Err(ExecutionError::General(
+            1 => Ok(Arc::new(MergeExec::new(children[0].clone()))),
+            _ => Err(DataFusionError::Internal(
                 "MergeExec wrong number of children".to_string(),
             )),
         }
     }
 
-    fn execute(
-        &self,
-        partition: usize,
-    ) -> Result<Arc<Mutex<dyn RecordBatchReader + Send + Sync>>> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
         // MergeExec produces a single partition
         if 0 != partition {
-            return Err(ExecutionError::General(format!(
+            return Err(DataFusionError::Internal(format!(
                 "MergeExec invalid partition {}",
                 partition
             )));
@@ -92,64 +100,77 @@ impl ExecutionPlan for MergeExec {
 
         let input_partitions = self.input.output_partitioning().partition_count();
         match input_partitions {
-            0 => Err(ExecutionError::General(
+            0 => Err(DataFusionError::Internal(
                 "MergeExec requires at least one input partition".to_owned(),
             )),
             1 => {
                 // bypass any threading if there is a single partition
-                self.input.execute(0)
+                self.input.execute(0).await
             }
             _ => {
-                let partitions_per_thread = (input_partitions / self.concurrency).max(1);
-                let range: Vec<usize> = (0..input_partitions).collect();
-                let chunks = range.chunks(partitions_per_thread);
-                let threads: Vec<JoinHandle<Result<Vec<RecordBatch>>>> = chunks
-                    .map(|chunk| {
-                        let chunk = chunk.to_vec();
-                        let input = self.input.clone();
-                        thread::spawn(move || {
-                            let mut batches = vec![];
-                            for partition in chunk {
-                                let it = input.execute(partition)?;
-                                common::collect(it).iter().for_each(|b| {
-                                    b.iter().for_each(|b| batches.push(b.clone()))
-                                });
-                            }
-                            Ok(batches)
-                        })
-                    })
-                    .collect();
+                // use a stream that allows each sender to put in at
+                // least one result in an attempt to maximize
+                // parallelism.
+                let (sender, receiver) =
+                    mpsc::channel::<ArrowResult<RecordBatch>>(input_partitions);
 
-                // combine the results from each thread
-                let mut combined_results: Vec<Arc<RecordBatch>> = vec![];
-                for thread in threads {
-                    collect_from_thread(thread, &mut combined_results)?;
+                // spawn independent tasks whose resulting streams (of batches)
+                // are sent to the channel for consumption.
+                for part_i in (0..input_partitions) {
+                    let input = self.input.clone();
+                    let mut sender = sender.clone();
+                    tokio::spawn(async move {
+                        let mut stream = match input.execute(part_i).await {
+                            Err(e) => {
+                                // If send fails, plan being torn
+                                // down, no place to send the error
+                                let arrow_error = ArrowError::ExternalError(Box::new(e));
+                                sender.send(Err(arrow_error)).await.ok();
+                                return;
+                            }
+                            Ok(stream) => stream,
+                        };
+
+                        while let Some(item) = stream.next().await {
+                            // If send fails, plan being torn down,
+                            // there is no place to send the error
+                            sender.send(item).await.ok();
+                        }
+                    });
                 }
 
-                Ok(Arc::new(Mutex::new(RecordBatchIterator::new(
-                    self.input.schema(),
-                    combined_results,
-                ))))
+                Ok(Box::pin(MergeStream {
+                    input: receiver,
+                    schema: self.schema(),
+                }))
             }
         }
     }
 }
 
-fn collect_from_thread(
-    thread: JoinHandle<Result<Vec<RecordBatch>>>,
-    combined_results: &mut Vec<Arc<RecordBatch>>,
-) -> Result<()> {
-    match thread.join() {
-        Ok(join) => {
-            join?
-                .iter()
-                .for_each(|batch| combined_results.push(Arc::new(batch.clone())));
-            Ok(())
-        }
-        Err(e) => Err(ExecutionError::General(format!(
-            "Error collecting batches from thread: {:?}",
-            e
-        ))),
+pin_project! {
+    struct MergeStream {
+        schema: SchemaRef,
+        #[pin]
+        input: mpsc::Receiver<ArrowResult<RecordBatch>>,
+    }
+}
+
+impl Stream for MergeStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.input.poll_next(cx)
+    }
+}
+
+impl RecordBatchStream for MergeStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -161,8 +182,8 @@ mod tests {
     use crate::physical_plan::csv::{CsvExec, CsvReadOptions};
     use crate::test;
 
-    #[test]
-    fn merge() -> Result<()> {
+    #[tokio::test]
+    async fn merge() -> Result<()> {
         let schema = test::aggr_test_schema();
 
         let num_partitions = 4;
@@ -175,14 +196,14 @@ mod tests {
         // input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let merge = MergeExec::new(Arc::new(csv), 2);
+        let merge = MergeExec::new(Arc::new(csv));
 
         // output of MergeExec should have a single partition
         assert_eq!(merge.output_partitioning().partition_count(), 1);
 
         // the result should contain 4 batches (one per input partition)
-        let iter = merge.execute(0)?;
-        let batches = common::collect(iter)?;
+        let iter = merge.execute(0).await?;
+        let batches = common::collect(iter).await?;
         assert_eq!(batches.len(), num_partitions);
 
         // there should be a total of 100 rows
