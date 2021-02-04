@@ -31,9 +31,9 @@
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
+#include "arrow/array/builder_binary.h"
 #include "arrow/array/concatenate.h"
 #include "arrow/buffer.h"
-#include "arrow/builder.h"
 #include "arrow/status.h"
 #include "arrow/testing/gtest_common.h"
 #include "arrow/testing/random.h"
@@ -161,6 +161,16 @@ TEST_F(ConcatenateTest, LargeStringType) {
   Check([this](int32_t size, double null_probability, std::shared_ptr<Array>* out) {
     *out =
         rng_.LargeString(size, /*min_length =*/0, /*max_length =*/15, null_probability);
+    ASSERT_OK((**out).ValidateFull());
+  });
+}
+
+TEST_F(ConcatenateTest, FixedSizeListType) {
+  Check([this](int32_t size, double null_probability, std::shared_ptr<Array>* out) {
+    auto list_size = 3;
+    auto values_size = size * list_size;
+    auto values = this->GeneratePrimitive<Int8Type>(values_size, null_probability);
+    ASSERT_OK_AND_ASSIGN(*out, FixedSizeListArray::FromArrays(values, list_size));
     ASSERT_OK((**out).ValidateFull());
   });
 }

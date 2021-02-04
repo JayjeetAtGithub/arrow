@@ -23,6 +23,11 @@
 #include <arrow/record_batch.h>
 #include <arrow/table.h>
 
+arrow::compute::ExecContext* gc_context() {
+  static arrow::compute::ExecContext context(gc_memory_pool());
+  return &context;
+}
+
 // [[arrow::export]]
 std::shared_ptr<arrow::compute::CastOptions> compute___CastOptions__initialize(
     bool allow_int_overflow, bool allow_time_truncate, bool allow_float_truncate) {
@@ -38,7 +43,7 @@ std::shared_ptr<arrow::Array> Array__cast(
     const std::shared_ptr<arrow::Array>& array,
     const std::shared_ptr<arrow::DataType>& target_type,
     const std::shared_ptr<arrow::compute::CastOptions>& options) {
-  return ValueOrStop(arrow::compute::Cast(*array, target_type, *options));
+  return ValueOrStop(arrow::compute::Cast(*array, target_type, *options, gc_context()));
 }
 
 // [[arrow::export]]
@@ -47,7 +52,8 @@ std::shared_ptr<arrow::ChunkedArray> ChunkedArray__cast(
     const std::shared_ptr<arrow::DataType>& target_type,
     const std::shared_ptr<arrow::compute::CastOptions>& options) {
   arrow::Datum value(chunked_array);
-  arrow::Datum out = ValueOrStop(arrow::compute::Cast(value, target_type, *options));
+  arrow::Datum out =
+      ValueOrStop(arrow::compute::Cast(value, target_type, *options, gc_context()));
   return out.chunked_array();
 }
 
@@ -60,7 +66,8 @@ std::shared_ptr<arrow::RecordBatch> RecordBatch__cast(
 
   arrow::ArrayVector columns(nc);
   for (int i = 0; i < nc; i++) {
-    columns[i] = Array__cast(batch->column(i), schema->field(i)->type(), options);
+    columns[i] = ValueOrStop(
+        arrow::compute::Cast(*batch->column(i), schema->field(i)->type(), *options));
   }
 
   return arrow::RecordBatch::Make(schema, batch->num_rows(), std::move(columns));
@@ -76,7 +83,10 @@ std::shared_ptr<arrow::Table> Table__cast(
   using ColumnVector = std::vector<std::shared_ptr<arrow::ChunkedArray>>;
   ColumnVector columns(nc);
   for (int i = 0; i < nc; i++) {
-    columns[i] = ChunkedArray__cast(table->column(i), schema->field(i)->type(), options);
+    arrow::Datum value(table->column(i));
+    arrow::Datum out =
+        ValueOrStop(arrow::compute::Cast(value, schema->field(i)->type(), *options));
+    columns[i] = out.chunked_array();
   }
   return arrow::Table::Make(schema, std::move(columns), table->num_rows());
 }
@@ -123,19 +133,19 @@ arrow::Datum as_cpp<arrow::Datum>(SEXP x) {
 SEXP from_datum(arrow::Datum datum) {
   switch (datum.kind()) {
     case arrow::Datum::SCALAR:
-      return cpp11::as_sexp(datum.scalar());
+      return cpp11::to_r6(datum.scalar());
 
     case arrow::Datum::ARRAY:
-      return cpp11::as_sexp(datum.make_array());
+      return cpp11::to_r6(datum.make_array());
 
     case arrow::Datum::CHUNKED_ARRAY:
-      return cpp11::as_sexp(datum.chunked_array());
+      return cpp11::to_r6(datum.chunked_array());
 
     case arrow::Datum::RECORD_BATCH:
-      return cpp11::as_sexp(datum.record_batch());
+      return cpp11::to_r6(datum.record_batch());
 
     case arrow::Datum::TABLE:
-      return cpp11::as_sexp(datum.table());
+      return cpp11::to_r6(datum.table());
 
     default:
       break;
@@ -168,7 +178,7 @@ std::shared_ptr<arrow::compute::FunctionOptions> make_compute_options(
     using Options = arrow::compute::MinMaxOptions;
     auto out = std::make_shared<Options>(Options::Defaults());
     out->null_handling =
-        cpp11::as_cpp<bool>(options["na.rm"]) ? Options::SKIP : Options::OUTPUT_NULL;
+        cpp11::as_cpp<bool>(options["na.rm"]) ? Options::SKIP : Options::EMIT_NULL;
     return out;
   }
 
@@ -179,7 +189,8 @@ std::shared_ptr<arrow::compute::FunctionOptions> make_compute_options(
 SEXP compute__CallFunction(std::string func_name, cpp11::list args, cpp11::list options) {
   auto opts = make_compute_options(func_name, options);
   auto datum_args = arrow::r::from_r_list<arrow::Datum>(args);
-  auto out = ValueOrStop(arrow::compute::CallFunction(func_name, datum_args, opts.get()));
+  auto out = ValueOrStop(
+      arrow::compute::CallFunction(func_name, datum_args, opts.get(), gc_context()));
   return from_datum(out);
 }
 

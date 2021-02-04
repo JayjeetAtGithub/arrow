@@ -27,10 +27,10 @@ on:
 jobs:
   package:
     name: Package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     steps:
       - name: Set up Ruby
-        uses: actions/setup-ruby@master
+        uses: actions/setup-ruby@v1
       - name: Checkout Arrow
         run: |
           git clone --no-checkout {{ arrow.remote }} arrow
@@ -74,7 +74,9 @@ jobs:
       # The tag upload took 43 minutes because of this scan, so use an
       # alternative upload script.
       - name: Set up Python
-        uses: actions/setup-python@master
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
       - name: Set up Crossbow
         run: |
           pip install \

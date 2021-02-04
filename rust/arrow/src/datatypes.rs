@@ -23,10 +23,12 @@
 //!  * [`DataType`](crate::datatypes::DataType) to describe the type of a field.
 
 use std::collections::HashMap;
+use std::default::Default;
 use std::fmt;
 use std::mem::size_of;
+use std::ops::Neg;
 #[cfg(feature = "simd")]
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, BitAnd, BitAndAssign, BitOr, BitOrAssign, Div, Mul, Not, Sub};
 use std::slice::from_raw_parts;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -94,7 +96,7 @@ pub enum DataType {
     /// * As used in the Olson time zone database (the "tz database" or
     ///   "tzdata"), such as "America/New_York"
     /// * An absolute time zone offset of the form +XX:XX or -XX:XX, such as +07:30
-    Timestamp(TimeUnit, Option<Arc<String>>),
+    Timestamp(TimeUnit, Option<String>),
     /// A 32-bit date representing the elapsed time since UNIX epoch (1970-01-01)
     /// in days (32 bits).
     Date32(DateUnit),
@@ -123,18 +125,28 @@ pub enum DataType {
     /// A variable-length string in Unicode with UFT-8 encoding and 64-bit offsets.
     LargeUtf8,
     /// A list of some logical data type with variable length.
-    List(Box<DataType>),
+    List(Box<Field>),
     /// A list of some logical data type with fixed length.
-    FixedSizeList(Box<DataType>, i32),
+    FixedSizeList(Box<Field>, i32),
     /// A list of some logical data type with variable length and 64-bit offsets.
-    LargeList(Box<DataType>),
+    LargeList(Box<Field>),
     /// A nested datatype that contains a number of sub-fields.
     Struct(Vec<Field>),
     /// A nested datatype that can represent slots of differing types.
     Union(Vec<Field>),
-    /// A dictionary array where each element is a single value indexed by an integer key.
-    /// This is mostly used to represent strings or a limited set of primitive types as integers.
+    /// A dictionary encoded array (`key_type`, `value_type`), where
+    /// each array element is an index of `key_type` into an
+    /// associated dictionary of `value_type`.
+    ///
+    /// Dictionary arrays are used to store columns of `value_type`
+    /// that contain many repeated values using less memory, but with
+    /// a higher CPU overhead for some operations.
+    ///
+    /// This type mostly used to represent low cardinality string
+    /// arrays or a limited set of primitive types as integers.
     Dictionary(Box<DataType>, Box<DataType>),
+    /// Decimal value with precision and scale
+    Decimal(usize, usize),
 }
 
 /// Date is either a 32-bit or 64-bit type representing elapsed time since UNIX
@@ -184,7 +196,7 @@ pub struct Field {
 }
 
 pub trait ArrowNativeType:
-    fmt::Debug + Send + Sync + Copy + PartialOrd + FromStr + 'static
+    fmt::Debug + Send + Sync + Copy + PartialOrd + FromStr + Default + 'static
 {
     fn into_json_value(self) -> Option<Value>;
 
@@ -197,6 +209,16 @@ pub trait ArrowNativeType:
     fn to_usize(&self) -> Option<usize> {
         None
     }
+
+    /// Convert native type from i32.
+    fn from_i32(_: i32) -> Option<Self> {
+        None
+    }
+
+    /// Convert native type from i64.
+    fn from_i64(_: i64) -> Option<Self> {
+        None
+    }
 }
 
 /// Trait indicating a primitive fixed-width type (bool, ints and floats).
@@ -204,16 +226,20 @@ pub trait ArrowPrimitiveType: 'static {
     /// Corresponding Rust native type for the primitive type.
     type Native: ArrowNativeType;
 
-    /// Returns the corresponding Arrow data type of this primitive type.
-    fn get_data_type() -> DataType;
+    /// the corresponding Arrow data type of this primitive type.
+    const DATA_TYPE: DataType;
 
-    /// Returns the bit width of this primitive type.
-    fn get_bit_width() -> usize;
+    /// Returns the byte width of this primitive type.
+    fn get_byte_width() -> usize {
+        size_of::<Self::Native>()
+    }
 
     /// Returns a default value of this primitive type.
     ///
     /// This is useful for aggregate array ops like `sum()`, `mean()`.
-    fn default_value() -> Self::Native;
+    fn default_value() -> Self::Native {
+        Default::default()
+    }
 }
 
 impl ArrowNativeType for bool {
@@ -262,6 +288,11 @@ impl ArrowNativeType for i32 {
     fn to_usize(&self) -> Option<usize> {
         num::ToPrimitive::to_usize(self)
     }
+
+    /// Convert native type from i32.
+    fn from_i32(val: i32) -> Option<Self> {
+        Some(val)
+    }
 }
 
 impl ArrowNativeType for i64 {
@@ -275,6 +306,11 @@ impl ArrowNativeType for i64 {
 
     fn to_usize(&self) -> Option<usize> {
         num::ToPrimitive::to_usize(self)
+    }
+
+    /// Convert native type from i64.
+    fn from_i64(val: i64) -> Option<Self> {
+        Some(val)
     }
 }
 
@@ -346,145 +382,104 @@ impl ArrowNativeType for f64 {
     }
 }
 
+// BooleanType is special: its bit-width is not the size of the primitive type, and its `index`
+// operation assumes bit-packing.
+#[derive(Debug)]
+pub struct BooleanType {}
+
+impl BooleanType {
+    pub const DATA_TYPE: DataType = DataType::Boolean;
+}
+
 macro_rules! make_type {
-    ($name:ident, $native_ty:ty, $data_ty:expr, $bit_width:expr, $default_val:expr) => {
+    ($name:ident, $native_ty:ty, $data_ty:expr) => {
         #[derive(Debug)]
         pub struct $name {}
 
         impl ArrowPrimitiveType for $name {
             type Native = $native_ty;
-
-            fn get_data_type() -> DataType {
-                $data_ty
-            }
-
-            fn get_bit_width() -> usize {
-                $bit_width
-            }
-
-            fn default_value() -> Self::Native {
-                $default_val
-            }
+            const DATA_TYPE: DataType = $data_ty;
         }
     };
 }
 
-make_type!(BooleanType, bool, DataType::Boolean, 1, false);
-make_type!(Int8Type, i8, DataType::Int8, 8, 0i8);
-make_type!(Int16Type, i16, DataType::Int16, 16, 0i16);
-make_type!(Int32Type, i32, DataType::Int32, 32, 0i32);
-make_type!(Int64Type, i64, DataType::Int64, 64, 0i64);
-make_type!(UInt8Type, u8, DataType::UInt8, 8, 0u8);
-make_type!(UInt16Type, u16, DataType::UInt16, 16, 0u16);
-make_type!(UInt32Type, u32, DataType::UInt32, 32, 0u32);
-make_type!(UInt64Type, u64, DataType::UInt64, 64, 0u64);
-make_type!(Float32Type, f32, DataType::Float32, 32, 0.0f32);
-make_type!(Float64Type, f64, DataType::Float64, 64, 0.0f64);
+make_type!(Int8Type, i8, DataType::Int8);
+make_type!(Int16Type, i16, DataType::Int16);
+make_type!(Int32Type, i32, DataType::Int32);
+make_type!(Int64Type, i64, DataType::Int64);
+make_type!(UInt8Type, u8, DataType::UInt8);
+make_type!(UInt16Type, u16, DataType::UInt16);
+make_type!(UInt32Type, u32, DataType::UInt32);
+make_type!(UInt64Type, u64, DataType::UInt64);
+make_type!(Float32Type, f32, DataType::Float32);
+make_type!(Float64Type, f64, DataType::Float64);
 make_type!(
     TimestampSecondType,
     i64,
-    DataType::Timestamp(TimeUnit::Second, None),
-    64,
-    0i64
+    DataType::Timestamp(TimeUnit::Second, None)
 );
 make_type!(
     TimestampMillisecondType,
     i64,
-    DataType::Timestamp(TimeUnit::Millisecond, None),
-    64,
-    0i64
+    DataType::Timestamp(TimeUnit::Millisecond, None)
 );
 make_type!(
     TimestampMicrosecondType,
     i64,
-    DataType::Timestamp(TimeUnit::Microsecond, None),
-    64,
-    0i64
+    DataType::Timestamp(TimeUnit::Microsecond, None)
 );
 make_type!(
     TimestampNanosecondType,
     i64,
-    DataType::Timestamp(TimeUnit::Nanosecond, None),
-    64,
-    0i64
+    DataType::Timestamp(TimeUnit::Nanosecond, None)
 );
-make_type!(Date32Type, i32, DataType::Date32(DateUnit::Day), 32, 0i32);
-make_type!(
-    Date64Type,
-    i64,
-    DataType::Date64(DateUnit::Millisecond),
-    64,
-    0i64
-);
-make_type!(
-    Time32SecondType,
-    i32,
-    DataType::Time32(TimeUnit::Second),
-    32,
-    0i32
-);
+make_type!(Date32Type, i32, DataType::Date32(DateUnit::Day));
+make_type!(Date64Type, i64, DataType::Date64(DateUnit::Millisecond));
+make_type!(Time32SecondType, i32, DataType::Time32(TimeUnit::Second));
 make_type!(
     Time32MillisecondType,
     i32,
-    DataType::Time32(TimeUnit::Millisecond),
-    32,
-    0i32
+    DataType::Time32(TimeUnit::Millisecond)
 );
 make_type!(
     Time64MicrosecondType,
     i64,
-    DataType::Time64(TimeUnit::Microsecond),
-    64,
-    0i64
+    DataType::Time64(TimeUnit::Microsecond)
 );
 make_type!(
     Time64NanosecondType,
     i64,
-    DataType::Time64(TimeUnit::Nanosecond),
-    64,
-    0i64
+    DataType::Time64(TimeUnit::Nanosecond)
 );
 make_type!(
     IntervalYearMonthType,
     i32,
-    DataType::Interval(IntervalUnit::YearMonth),
-    32,
-    0i32
+    DataType::Interval(IntervalUnit::YearMonth)
 );
 make_type!(
     IntervalDayTimeType,
     i64,
-    DataType::Interval(IntervalUnit::DayTime),
-    64,
-    0i64
+    DataType::Interval(IntervalUnit::DayTime)
 );
 make_type!(
     DurationSecondType,
     i64,
-    DataType::Duration(TimeUnit::Second),
-    64,
-    0i64
+    DataType::Duration(TimeUnit::Second)
 );
 make_type!(
     DurationMillisecondType,
     i64,
-    DataType::Duration(TimeUnit::Millisecond),
-    64,
-    0i64
+    DataType::Duration(TimeUnit::Millisecond)
 );
 make_type!(
     DurationMicrosecondType,
     i64,
-    DataType::Duration(TimeUnit::Microsecond),
-    64,
-    0i64
+    DataType::Duration(TimeUnit::Microsecond)
 );
 make_type!(
     DurationNanosecondType,
     i64,
-    DataType::Duration(TimeUnit::Nanosecond),
-    64,
-    0i64
+    DataType::Duration(TimeUnit::Nanosecond)
 );
 
 /// A subtype of primitive type that represents legal dictionary keys.
@@ -510,13 +505,19 @@ impl ArrowDictionaryKeyType for UInt64Type {}
 /// A subtype of primitive type that represents numeric values.
 ///
 /// SIMD operations are defined in this trait if available on the target system.
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+#[cfg(simd_x86)]
 pub trait ArrowNumericType: ArrowPrimitiveType
 where
     Self::Simd: Add<Output = Self::Simd>
         + Sub<Output = Self::Simd>
         + Mul<Output = Self::Simd>
         + Div<Output = Self::Simd>
+        + Copy,
+    Self::SimdMask: BitAnd<Output = Self::SimdMask>
+        + BitOr<Output = Self::SimdMask>
+        + BitAndAssign
+        + BitOrAssign
+        + Not<Output = Self::SimdMask>
         + Copy,
 {
     /// Defines the SIMD type that should be used for this numeric type
@@ -537,13 +538,16 @@ where
     /// Creates a new SIMD mask for this SIMD type filling it with `value`
     fn mask_init(value: bool) -> Self::SimdMask;
 
+    /// Creates a new SIMD mask for this SIMD type from the lower-most bits of the given `mask`.
+    /// The number of bits used corresponds to the number of lanes of this type
+    fn mask_from_u64(mask: u64) -> Self::SimdMask;
+
+    /// Creates a bitmask from the given SIMD mask.
+    /// Each bit corresponds to one vector lane, starting with the least-significant bit.
+    fn mask_to_u64(mask: &Self::SimdMask) -> u64;
+
     /// Gets the value of a single lane in a SIMD mask
     fn mask_get(mask: &Self::SimdMask, idx: usize) -> bool;
-
-    /// Gets the bitmask for a SimdMask as a byte slice and passes it to the closure used as the action parameter
-    fn bitmask<T>(mask: &Self::SimdMask, action: T)
-    where
-        T: FnMut(&[u8]);
 
     /// Sets the value of a single lane of a SIMD mask
     fn mask_set(mask: Self::SimdMask, idx: usize, value: bool) -> Self::SimdMask;
@@ -583,52 +587,149 @@ where
     fn write(simd_result: Self::Simd, slice: &mut [Self::Native]);
 }
 
-#[cfg(any(
-    not(any(target_arch = "x86", target_arch = "x86_64")),
-    not(feature = "simd")
-))]
+#[cfg(not(simd_x86))]
 pub trait ArrowNumericType: ArrowPrimitiveType {}
 
 macro_rules! make_numeric_type {
     ($impl_ty:ty, $native_ty:ty, $simd_ty:ident, $simd_mask_ty:ident) => {
-        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+        #[cfg(simd_x86)]
         impl ArrowNumericType for $impl_ty {
             type Simd = $simd_ty;
 
             type SimdMask = $simd_mask_ty;
 
+            #[inline]
             fn lanes() -> usize {
                 Self::Simd::lanes()
             }
 
+            #[inline]
             fn init(value: Self::Native) -> Self::Simd {
                 Self::Simd::splat(value)
             }
 
+            #[inline]
             fn load(slice: &[Self::Native]) -> Self::Simd {
                 unsafe { Self::Simd::from_slice_unaligned_unchecked(slice) }
             }
 
+            #[inline]
             fn mask_init(value: bool) -> Self::SimdMask {
                 Self::SimdMask::splat(value)
             }
 
+            #[inline]
+            fn mask_from_u64(mask: u64) -> Self::SimdMask {
+                // this match will get removed by the compiler since the number of lanes is known at
+                // compile-time for each concrete numeric type
+                match Self::lanes() {
+                    8 => {
+                        // the bit position in each lane indicates the index of that lane
+                        let vecidx = i64x8::new(1, 2, 4, 8, 16, 32, 64, 128);
+
+                        // broadcast the lowermost 8 bits of mask to each lane
+                        let vecmask = i64x8::splat((mask & 0xFF) as i64);
+                        // compute whether the bit corresponding to each lanes index is set
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        // transmute is necessary because the different match arms return different
+                        // mask types, at runtime only one of those expressions will exist per type,
+                        // with the type being equal to `SimdMask`.
+                        unsafe { std::mem::transmute(vecmask) }
+                    }
+                    16 => {
+                        // same general logic as for 8 lanes, extended to 16 bits
+                        let vecidx = i32x16::new(
+                            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                            8192, 16384, 32768,
+                        );
+
+                        let vecmask = i32x16::splat((mask & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        unsafe { std::mem::transmute(vecmask) }
+                    }
+                    32 => {
+                        // compute two separate m32x16 vector masks from  from the lower-most 32 bits of `mask`
+                        // and then combine them into one m16x32 vector mask by writing and reading a temporary
+                        let tmp = &mut [0_i16; 32];
+
+                        let vecidx = i32x16::new(
+                            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                            8192, 16384, 32768,
+                        );
+
+                        let vecmask = i32x16::splat((mask & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i16x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[0..16]);
+
+                        let vecmask = i32x16::splat(((mask >> 16) & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i16x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[16..32]);
+
+                        unsafe { std::mem::transmute(i16x32::from_slice_unaligned(tmp)) }
+                    }
+                    64 => {
+                        // compute four m32x16 vector masks from  from all 64 bits of `mask`
+                        // and convert them into one m8x64 vector mask by writing and reading a temporary
+                        let tmp = &mut [0_i8; 64];
+
+                        let vecidx = i32x16::new(
+                            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                            8192, 16384, 32768,
+                        );
+
+                        let vecmask = i32x16::splat((mask & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i8x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[0..16]);
+
+                        let vecmask = i32x16::splat(((mask >> 16) & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i8x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[16..32]);
+
+                        let vecmask = i32x16::splat(((mask >> 32) & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i8x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[32..48]);
+
+                        let vecmask = i32x16::splat(((mask >> 48) & 0xFFFF) as i32);
+                        let vecmask = (vecidx & vecmask).eq(vecidx);
+
+                        i8x16::from_cast(vecmask)
+                            .write_to_slice_unaligned(&mut tmp[48..64]);
+
+                        unsafe { std::mem::transmute(i8x64::from_slice_unaligned(tmp)) }
+                    }
+                    _ => panic!("Invalid number of vector lanes"),
+                }
+            }
+
+            #[inline]
+            fn mask_to_u64(mask: &Self::SimdMask) -> u64 {
+                mask.bitmask() as u64
+            }
+
+            #[inline]
             fn mask_get(mask: &Self::SimdMask, idx: usize) -> bool {
                 unsafe { mask.extract_unchecked(idx) }
             }
 
-            fn bitmask<T>(mask: &Self::SimdMask, mut action: T)
-            where
-                T: FnMut(&[u8]),
-            {
-                action(mask.bitmask().to_byte_slice());
-            }
-
+            #[inline]
             fn mask_set(mask: Self::SimdMask, idx: usize, value: bool) -> Self::SimdMask {
                 unsafe { mask.replace_unchecked(idx, value) }
             }
 
             /// Selects elements of `a` and `b` using `mask`
+            #[inline]
             fn mask_select(
                 mask: Self::SimdMask,
                 a: Self::Simd,
@@ -637,10 +738,12 @@ macro_rules! make_numeric_type {
                 mask.select(a, b)
             }
 
+            #[inline]
             fn mask_any(mask: Self::SimdMask) -> bool {
                 mask.any()
             }
 
+            #[inline]
             fn bin_op<F: Fn(Self::Simd, Self::Simd) -> Self::Simd>(
                 left: Self::Simd,
                 right: Self::Simd,
@@ -649,38 +752,43 @@ macro_rules! make_numeric_type {
                 op(left, right)
             }
 
+            #[inline]
             fn eq(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.eq(right)
             }
 
+            #[inline]
             fn ne(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.ne(right)
             }
 
+            #[inline]
             fn lt(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.lt(right)
             }
 
+            #[inline]
             fn le(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.le(right)
             }
 
+            #[inline]
             fn gt(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.gt(right)
             }
 
+            #[inline]
             fn ge(left: Self::Simd, right: Self::Simd) -> Self::SimdMask {
                 left.ge(right)
             }
 
+            #[inline]
             fn write(simd_result: Self::Simd, slice: &mut [Self::Native]) {
                 unsafe { simd_result.write_to_slice_unaligned_unchecked(slice) };
             }
         }
-        #[cfg(any(
-            not(any(target_arch = "x86", target_arch = "x86_64")),
-            not(feature = "simd")
-        ))]
+
+        #[cfg(not(simd_x86))]
         impl ArrowNumericType for $impl_ty {}
     };
 }
@@ -712,6 +820,74 @@ make_numeric_type!(DurationSecondType, i64, i64x8, m64x8);
 make_numeric_type!(DurationMillisecondType, i64, i64x8, m64x8);
 make_numeric_type!(DurationMicrosecondType, i64, i64x8, m64x8);
 make_numeric_type!(DurationNanosecondType, i64, i64x8, m64x8);
+
+/// A subtype of primitive type that represents signed numeric values.
+///
+/// SIMD operations are defined in this trait if available on the target system.
+#[cfg(simd_x86)]
+pub trait ArrowSignedNumericType: ArrowNumericType
+where
+    Self::SignedSimd: Neg<Output = Self::SignedSimd>,
+{
+    /// Defines the SIMD type that should be used for this numeric type
+    type SignedSimd;
+
+    /// Loads a slice of signed numeric type into a SIMD register
+    fn load_signed(slice: &[Self::Native]) -> Self::SignedSimd;
+
+    /// Performs a SIMD unary operation on signed numeric type
+    fn signed_unary_op<F: Fn(Self::SignedSimd) -> Self::SignedSimd>(
+        a: Self::SignedSimd,
+        op: F,
+    ) -> Self::SignedSimd;
+
+    /// Writes a signed SIMD result back to a slice
+    fn write_signed(simd_result: Self::SignedSimd, slice: &mut [Self::Native]);
+}
+
+#[cfg(not(simd_x86))]
+pub trait ArrowSignedNumericType: ArrowNumericType
+where
+    Self::Native: Neg<Output = Self::Native>,
+{
+}
+
+macro_rules! make_signed_numeric_type {
+    ($impl_ty:ty, $simd_ty:ident) => {
+        #[cfg(simd_x86)]
+        impl ArrowSignedNumericType for $impl_ty {
+            type SignedSimd = $simd_ty;
+
+            #[inline]
+            fn load_signed(slice: &[Self::Native]) -> Self::SignedSimd {
+                unsafe { Self::SignedSimd::from_slice_unaligned_unchecked(slice) }
+            }
+
+            #[inline]
+            fn signed_unary_op<F: Fn(Self::SignedSimd) -> Self::SignedSimd>(
+                a: Self::SignedSimd,
+                op: F,
+            ) -> Self::SignedSimd {
+                op(a)
+            }
+
+            #[inline]
+            fn write_signed(simd_result: Self::SignedSimd, slice: &mut [Self::Native]) {
+                unsafe { simd_result.write_to_slice_unaligned_unchecked(slice) };
+            }
+        }
+
+        #[cfg(not(simd_x86))]
+        impl ArrowSignedNumericType for $impl_ty {}
+    };
+}
+
+make_signed_numeric_type!(Int8Type, i8x64);
+make_signed_numeric_type!(Int16Type, i16x32);
+make_signed_numeric_type!(Int32Type, i32x16);
+make_signed_numeric_type!(Int64Type, i64x8);
+make_signed_numeric_type!(Float32Type, f32x16);
+make_signed_numeric_type!(Float64Type, f64x8);
 
 /// A subtype of primitive type that represents temporal values.
 pub trait ArrowTemporalType: ArrowPrimitiveType {}
@@ -778,7 +954,8 @@ impl<T: ArrowNativeType> ToByteSlice for T {
 
 impl DataType {
     /// Parse a data type from a JSON representation
-    fn from(json: &Value) -> Result<DataType> {
+    pub(crate) fn from(json: &Value) -> Result<DataType> {
+        let default_field = Field::new("", DataType::Boolean, true);
         match *json {
             Value::Object(ref map) => match map.get("name") {
                 Some(s) if s == "null" => Ok(DataType::Null),
@@ -796,6 +973,23 @@ impl DataType {
                             "Expecting a byteWidth for fixedsizebinary".to_string(),
                         ))
                     }
+                }
+                Some(s) if s == "decimal" => {
+                    // return a list with any type as its child isn't defined in the map
+                    let precision = match map.get("precision") {
+                        Some(p) => Ok(p.as_u64().unwrap() as usize),
+                        None => Err(ArrowError::ParseError(
+                            "Expecting a precision for decimal".to_string(),
+                        )),
+                    };
+                    let scale = match map.get("scale") {
+                        Some(s) => Ok(s.as_u64().unwrap() as usize),
+                        _ => Err(ArrowError::ParseError(
+                            "Expecting a scale for decimal".to_string(),
+                        )),
+                    };
+
+                    Ok(DataType::Decimal(precision?, scale?))
                 }
                 Some(s) if s == "floatingpoint" => match map.get("precision") {
                     Some(p) if p == "HALF" => Ok(DataType::Float16),
@@ -817,7 +1011,7 @@ impl DataType {
                     };
                     let tz = match map.get("timezone") {
                         None => Ok(None),
-                        Some(VString(tz)) => Ok(Some(Arc::new(tz.to_string()))),
+                        Some(VString(tz)) => Ok(Some(tz.clone())),
                         _ => Err(ArrowError::ParseError(
                             "timezone must be a string".to_string(),
                         )),
@@ -912,17 +1106,17 @@ impl DataType {
                 },
                 Some(s) if s == "list" => {
                     // return a list with any type as its child isn't defined in the map
-                    Ok(DataType::List(Box::new(DataType::Boolean)))
+                    Ok(DataType::List(Box::new(default_field)))
                 }
                 Some(s) if s == "largelist" => {
                     // return a largelist with any type as its child isn't defined in the map
-                    Ok(DataType::LargeList(Box::new(DataType::Boolean)))
+                    Ok(DataType::LargeList(Box::new(default_field)))
                 }
                 Some(s) if s == "fixedsizelist" => {
                     // return a list with any type as its child isn't defined in the map
                     if let Some(Value::Number(size)) = map.get("listSize") {
                         Ok(DataType::FixedSizeList(
-                            Box::new(DataType::Boolean),
+                            Box::new(default_field),
                             size.as_i64().unwrap() as i32,
                         ))
                     } else {
@@ -1026,6 +1220,52 @@ impl DataType {
                 TimeUnit::Nanosecond => "NANOSECOND",
             }}),
             DataType::Dictionary(_, _) => json!({ "name": "dictionary"}),
+            DataType::Decimal(precision, scale) => {
+                json!({"name": "decimal", "precision": precision, "scale": scale})
+            }
+        }
+    }
+
+    /// Returns true if this type is numeric: (UInt*, Unit*, or Float*)
+    pub fn is_numeric(t: &DataType) -> bool {
+        use DataType::*;
+        matches!(
+            t,
+            UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Int8
+                | Int16
+                | Int32
+                | Int64
+                | Float32
+                | Float64
+        )
+    }
+
+    /// Compares the datatype with another, ignoring nested field names
+    /// and metadata
+    pub(crate) fn equals_datatype(&self, other: &DataType) -> bool {
+        match (&self, other) {
+            (DataType::List(a), DataType::List(b))
+            | (DataType::LargeList(a), DataType::LargeList(b)) => {
+                a.is_nullable() == b.is_nullable()
+                    && a.data_type().equals_datatype(b.data_type())
+            }
+            (DataType::FixedSizeList(a, a_size), DataType::FixedSizeList(b, b_size)) => {
+                a_size == b_size
+                    && a.is_nullable() == b.is_nullable()
+                    && a.data_type().equals_datatype(b.data_type())
+            }
+            (DataType::Struct(a), DataType::Struct(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| {
+                        a.is_nullable() == b.is_nullable()
+                            && a.data_type().equals_datatype(b.data_type())
+                    })
+            }
+            _ => self == other,
         }
     }
 }
@@ -1060,18 +1300,39 @@ impl Field {
     }
 
     /// Returns an immutable reference to the `Field`'s name
-    pub fn name(&self) -> &String {
+    #[inline]
+    pub const fn name(&self) -> &String {
         &self.name
     }
 
     /// Returns an immutable reference to the `Field`'s  data-type
-    pub fn data_type(&self) -> &DataType {
+    #[inline]
+    pub const fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
     /// Indicates whether this `Field` supports null values
-    pub fn is_nullable(&self) -> bool {
+    #[inline]
+    pub const fn is_nullable(&self) -> bool {
         self.nullable
+    }
+
+    /// Returns the dictionary ID, if this is a dictionary type
+    #[inline]
+    pub const fn dict_id(&self) -> Option<i64> {
+        match self.data_type {
+            DataType::Dictionary(_, _) => Some(self.dict_id),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this `Field`'s dictionary is ordered, if this is a dictionary type
+    #[inline]
+    pub const fn dict_is_ordered(&self) -> Option<bool> {
+        match self.data_type {
+            DataType::Dictionary(_, _) => Some(self.dict_is_ordered),
+            _ => None,
+        }
     }
 
     /// Parse a `Field` definition from a JSON representation
@@ -1114,18 +1375,16 @@ impl Field {
                                 ));
                             }
                             match data_type {
-                                    DataType::List(_) => DataType::List(Box::new(
-                                        Self::from(&values[0])?.data_type,
-                                    )),
-                                    DataType::LargeList(_) => DataType::LargeList(Box::new(
-                                        Self::from(&values[0])?.data_type,
-                                    )),
-                                    DataType::FixedSizeList(_, int) => {
-                                        DataType::FixedSizeList(
-                                            Box::new(Self::from(&values[0])?.data_type),
-                                            int,
-                                        )
+                                    DataType::List(_) => {
+                                        DataType::List(Box::new(Self::from(&values[0])?))
                                     }
+                                    DataType::LargeList(_) => {
+                                        DataType::LargeList(Box::new(Self::from(&values[0])?))
+                                    }
+                                    DataType::FixedSizeList(_, int) => DataType::FixedSizeList(
+                                        Box::new(Self::from(&values[0])?),
+                                        int,
+                                    ),
                                     _ => unreachable!(
                                         "Data type should be a list, largelist or fixedsizelist"
                                     ),
@@ -1214,18 +1473,9 @@ impl Field {
     pub fn to_json(&self) -> Value {
         let children: Vec<Value> = match self.data_type() {
             DataType::Struct(fields) => fields.iter().map(|f| f.to_json()).collect(),
-            DataType::List(dtype) => {
-                let item = Field::new("item", *dtype.clone(), self.nullable);
-                vec![item.to_json()]
-            }
-            DataType::LargeList(dtype) => {
-                let item = Field::new("item", *dtype.clone(), self.nullable);
-                vec![item.to_json()]
-            }
-            DataType::FixedSizeList(dtype, _) => {
-                let item = Field::new("item", *dtype.clone(), self.nullable);
-                vec![item.to_json()]
-            }
+            DataType::List(field) => vec![field.to_json()],
+            DataType::LargeList(field) => vec![field.to_json()],
+            DataType::FixedSizeList(field, _) => vec![field.to_json()],
             _ => vec![],
         };
         match self.data_type() {
@@ -1346,7 +1596,8 @@ impl Field {
             | DataType::FixedSizeList(_, _)
             | DataType::FixedSizeBinary(_)
             | DataType::Utf8
-            | DataType::LargeUtf8 => {
+            | DataType::LargeUtf8
+            | DataType::Decimal(_, _) => {
                 if self.data_type != from.data_type {
                     return Err(ArrowError::SchemaError(
                         "Fail to merge schema Field due to conflicting datatype"
@@ -1377,7 +1628,7 @@ impl fmt::Display for Field {
 pub struct Schema {
     pub(crate) fields: Vec<Field>,
     /// A map of key-value pairs containing additional meta data.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub(crate) metadata: HashMap<String, String>,
 }
 
@@ -1423,7 +1674,8 @@ impl Schema {
     ///
     /// let schema = Schema::new_with_metadata(vec![field_a, field_b], metadata);
     /// ```
-    pub fn new_with_metadata(
+    #[inline]
+    pub const fn new_with_metadata(
         fields: Vec<Field>,
         metadata: HashMap<String, String>,
     ) -> Self {
@@ -1478,7 +1730,7 @@ impl Schema {
                     }
                 }
             }
-            // merge fileds
+            // merge fields
             for field in &schema.fields {
                 let mut new_field = true;
                 for merged_field in &mut merged.fields {
@@ -1499,7 +1751,8 @@ impl Schema {
     }
 
     /// Returns an immutable reference of the vector of `Field` instances
-    pub fn fields(&self) -> &Vec<Field> {
+    #[inline]
+    pub const fn fields(&self) -> &Vec<Field> {
         &self.fields
     }
 
@@ -1512,6 +1765,15 @@ impl Schema {
     /// Returns an immutable reference of a specific `Field` instance selected by name
     pub fn field_with_name(&self, name: &str) -> Result<&Field> {
         Ok(&self.fields[self.index_of(name)?])
+    }
+
+    /// Returns a vector of immutable references to all `Field` instances selected by
+    /// the dictionary ID they use
+    pub fn fields_with_dict_id(&self, dict_id: i64) -> Vec<&Field> {
+        self.fields
+            .iter()
+            .filter(|f| f.dict_id() == Some(dict_id))
+            .collect()
     }
 
     /// Find the index of the column with the given name
@@ -1530,7 +1792,8 @@ impl Schema {
     }
 
     /// Returns an immutable reference to the Map of custom metadata key-value pairs.
-    pub fn metadata(&self) -> &HashMap<String, String> {
+    #[inline]
+    pub const fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
     }
 
@@ -1581,9 +1844,24 @@ impl Schema {
     }
 
     /// Parse a `metadata` definition from a JSON representation
+    /// The JSON can either be an Object or an Array of Objects
     fn from_metadata(json: &Value) -> Result<HashMap<String, String>> {
-        if let Value::Object(md) = json {
-            md.iter()
+        match json {
+            Value::Array(_) => {
+                let mut hashmap = HashMap::new();
+                let values: Vec<MetadataKeyValue> = serde_json::from_value(json.clone())
+                    .map_err(|_| {
+                        ArrowError::JsonError(
+                            "Unable to parse object into key-value pair".to_string(),
+                        )
+                    })?;
+                for meta in values {
+                    hashmap.insert(meta.key.clone(), meta.value);
+                }
+                Ok(hashmap)
+            }
+            Value::Object(md) => md
+                .iter()
                 .map(|(k, v)| {
                     if let Value::String(v) = v {
                         Ok((k.to_string(), v.to_string()))
@@ -1593,11 +1871,10 @@ impl Schema {
                         ))
                     }
                 })
-                .collect::<Result<_>>()
-        } else {
-            Err(ArrowError::ParseError(
+                .collect::<Result<_>>(),
+            _ => Err(ArrowError::ParseError(
                 "`metadata` field must be an object".to_string(),
-            ))
+            )),
         }
     }
 }
@@ -1618,10 +1895,14 @@ impl fmt::Display for Schema {
 /// A reference-counted reference to a [`Schema`](crate::datatypes::Schema).
 pub type SchemaRef = Arc<Schema>;
 
+#[derive(Deserialize)]
+struct MetadataKeyValue {
+    key: String,
+    value: String,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
     use serde_json::Number;
     use serde_json::Value::{Bool, Number as VNumber};
     use std::f32::NAN;
@@ -1827,17 +2108,14 @@ mod tests {
                 Field::new("c15", DataType::Timestamp(TimeUnit::Second, None), false),
                 Field::new(
                     "c16",
-                    DataType::Timestamp(
-                        TimeUnit::Millisecond,
-                        Some(Arc::new("UTC".to_string())),
-                    ),
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".to_string())),
                     false,
                 ),
                 Field::new(
                     "c17",
                     DataType::Timestamp(
                         TimeUnit::Microsecond,
-                        Some(Arc::new("Africa/Johannesburg".to_string())),
+                        Some("Africa/Johannesburg".to_string()),
                     ),
                     false,
                 ),
@@ -1848,17 +2126,30 @@ mod tests {
                 ),
                 Field::new("c19", DataType::Interval(IntervalUnit::DayTime), false),
                 Field::new("c20", DataType::Interval(IntervalUnit::YearMonth), false),
-                Field::new("c21", DataType::List(Box::new(DataType::Boolean)), false),
+                Field::new(
+                    "c21",
+                    DataType::List(Box::new(Field::new("item", DataType::Boolean, true))),
+                    false,
+                ),
                 Field::new(
                     "c22",
-                    DataType::FixedSizeList(Box::new(DataType::Boolean), 5),
+                    DataType::FixedSizeList(
+                        Box::new(Field::new("bools", DataType::Boolean, false)),
+                        5,
+                    ),
                     false,
                 ),
                 Field::new(
                     "c23",
-                    DataType::List(Box::new(DataType::List(Box::new(DataType::Struct(
-                        vec![],
-                    ))))),
+                    DataType::List(Box::new(Field::new(
+                        "inner_list",
+                        DataType::List(Box::new(Field::new(
+                            "struct",
+                            DataType::Struct(vec![]),
+                            true,
+                        ))),
+                        false,
+                    ))),
                     true,
                 ),
                 Field::new(
@@ -1889,9 +2180,15 @@ mod tests {
                 Field::new("c33", DataType::LargeUtf8, true),
                 Field::new(
                     "c34",
-                    DataType::LargeList(Box::new(DataType::LargeList(Box::new(
-                        DataType::Struct(vec![]),
-                    )))),
+                    DataType::LargeList(Box::new(Field::new(
+                        "inner_large_list",
+                        DataType::LargeList(Box::new(Field::new(
+                            "struct",
+                            DataType::Struct(vec![]),
+                            false,
+                        ))),
+                        true,
+                    ))),
                     true,
                 ),
             ],
@@ -2097,7 +2394,7 @@ mod tests {
                         "children": [
                             {
                                 "name": "item",
-                                "nullable": false,
+                                "nullable": true,
                                 "type": {
                                     "name": "bool"
                                 },
@@ -2114,7 +2411,7 @@ mod tests {
                         },
                         "children": [
                             {
-                                "name": "item",
+                                "name": "bools",
                                 "nullable": false,
                                 "type": {
                                     "name": "bool"
@@ -2131,14 +2428,14 @@ mod tests {
                         },
                         "children": [
                             {
-                                "name": "item",
-                                "nullable": true,
+                                "name": "inner_list",
+                                "nullable": false,
                                 "type": {
                                     "name": "list"
                                 },
                                 "children": [
                                     {
-                                        "name": "item",
+                                        "name": "struct",
                                         "nullable": true,
                                         "type": {
                                             "name": "struct"
@@ -2271,15 +2568,15 @@ mod tests {
                         },
                         "children": [
                             {
-                                "name": "item",
+                                "name": "inner_large_list",
                                 "nullable": true,
                                 "type": {
                                     "name": "largelist"
                                 },
                                 "children": [
                                     {
-                                        "name": "item",
-                                        "nullable": true,
+                                        "name": "struct",
+                                        "nullable": false,
                                         "type": {
                                             "name": "struct"
                                         },
@@ -2346,7 +2643,8 @@ mod tests {
         last_name: Utf8, \
         address: Struct([\
         Field { name: \"street\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false }, \
-        Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false }])")
+        Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false }]), \
+        interests: Dictionary(Int32, Utf8)")
     }
 
     #[test]
@@ -2354,18 +2652,29 @@ mod tests {
         let schema = person_schema();
 
         // test schema accessors
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 4);
 
         // test field accessors
         let first_name = &schema.fields()[0];
         assert_eq!(first_name.name(), "first_name");
         assert_eq!(first_name.data_type(), &DataType::Utf8);
         assert_eq!(first_name.is_nullable(), false);
+        assert_eq!(first_name.dict_id(), None);
+        assert_eq!(first_name.dict_is_ordered(), None);
+
+        let interests = &schema.fields()[3];
+        assert_eq!(interests.name(), "interests");
+        assert_eq!(
+            interests.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        assert_eq!(interests.dict_id(), Some(123));
+        assert_eq!(interests.dict_is_ordered(), Some(true));
     }
 
     #[test]
     #[should_panic(
-        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\"]"
+        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\", \\\"interests\\\"]"
     )]
     fn schema_index_of() {
         let schema = person_schema();
@@ -2376,7 +2685,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\"]"
+        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\", \\\"interests\\\"]"
     )]
     fn schema_field_with_name() {
         let schema = person_schema();
@@ -2389,6 +2698,20 @@ mod tests {
             "last_name"
         );
         schema.field_with_name("nickname").unwrap();
+    }
+
+    #[test]
+    fn schema_field_with_dict_id() {
+        let schema = person_schema();
+
+        let fields_dict_123: Vec<_> = schema
+            .fields_with_dict_id(123)
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(fields_dict_123, vec!["interests"]);
+
+        assert!(schema.fields_with_dict_id(456).is_empty());
     }
 
     #[test]
@@ -2434,7 +2757,7 @@ mod tests {
         assert_eq!(Some(VNumber(Number::from(1))), 1u32.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1u64.into_json_value());
         assert_eq!(
-            Some(VNumber(Number::from_f64(0.01 as f64).unwrap())),
+            Some(VNumber(Number::from_f64(0.01f64).unwrap())),
             0.01.into_json_value()
         );
         assert_eq!(
@@ -2456,12 +2779,19 @@ mod tests {
                 ]),
                 false,
             ),
+            Field::new_dict(
+                "interests",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+                123,
+                true,
+            ),
         ])
     }
 
     #[test]
     fn test_schema_merge() -> Result<()> {
-        let merged = Schema::try_merge(&vec![
+        let merged = Schema::try_merge(&[
             Schema::new(vec![
                 Field::new("first_name", DataType::Utf8, false),
                 Field::new("last_name", DataType::Utf8, false),
@@ -2520,7 +2850,7 @@ mod tests {
 
         // support merge union fields
         assert_eq!(
-            Schema::try_merge(&vec![
+            Schema::try_merge(&[
                 Schema::new(vec![Field::new(
                     "c1",
                     DataType::Union(vec![
@@ -2550,17 +2880,17 @@ mod tests {
         );
 
         // incompatible field should throw error
-        assert!(Schema::try_merge(&vec![
+        assert!(Schema::try_merge(&[
             Schema::new(vec![
                 Field::new("first_name", DataType::Utf8, false),
                 Field::new("last_name", DataType::Utf8, false),
             ]),
-            Schema::new(vec![Field::new("last_name", DataType::Int64, false),]),
+            Schema::new(vec![Field::new("last_name", DataType::Int64, false),])
         ])
         .is_err());
 
         // incompatible metadata should throw error
-        assert!(Schema::try_merge(&vec![
+        assert!(Schema::try_merge(&[
             Schema::new_with_metadata(
                 vec![Field::new("first_name", DataType::Utf8, false)],
                 [("foo".to_string(), "bar".to_string()),]
@@ -2574,10 +2904,98 @@ mod tests {
                     .iter()
                     .cloned()
                     .collect::<HashMap<String, String>>()
-            ),
+            )
         ])
         .is_err());
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, simd_x86))]
+mod arrow_numeric_type_tests {
+    use crate::datatypes::{
+        ArrowNumericType, Float32Type, Float64Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type,
+    };
+    use packed_simd::*;
+    use FromCast;
+
+    /// calculate the expected mask by iterating over all bits
+    macro_rules! expected_mask {
+        ($T:ty, $MASK:expr) => {{
+            let mask = $MASK;
+            // simd width of all types is currently 64 bytes -> 512 bits
+            let lanes = 64 / std::mem::size_of::<$T>();
+            // translate each set bit into a value of all ones (-1) of the correct type
+            (0..lanes)
+                .map(|i| (if (mask & (1 << i)) != 0 { -1 } else { 0 }))
+                .collect::<Vec<$T>>()
+        }};
+    }
+
+    #[test]
+    fn test_mask_f64() {
+        let mask = 0b10101010;
+        let actual = Float64Type::mask_from_u64(mask);
+        let expected = expected_mask!(i64, mask);
+        let expected = m64x8::from_cast(i64x8::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_mask_u64() {
+        let mask = 0b01010101;
+        let actual = Int64Type::mask_from_u64(mask);
+        let expected = expected_mask!(i64, mask);
+        let expected = m64x8::from_cast(i64x8::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_mask_f32() {
+        let mask = 0b10101010_10101010;
+        let actual = Float32Type::mask_from_u64(mask);
+        let expected = expected_mask!(i32, mask);
+        let expected =
+            m32x16::from_cast(i32x16::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_mask_i32() {
+        let mask = 0b01010101_01010101;
+        let actual = Int32Type::mask_from_u64(mask);
+        let expected = expected_mask!(i32, mask);
+        let expected =
+            m32x16::from_cast(i32x16::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_mask_u16() {
+        let mask = 0b01010101_01010101_10101010_10101010;
+        let actual = UInt16Type::mask_from_u64(mask);
+        let expected = expected_mask!(i16, mask);
+        dbg!(&expected);
+        let expected =
+            m16x32::from_cast(i16x32::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_mask_i8() {
+        let mask =
+            0b01010101_01010101_10101010_10101010_01010101_01010101_10101010_10101010;
+        let actual = Int8Type::mask_from_u64(mask);
+        let expected = expected_mask!(i8, mask);
+        let expected = m8x64::from_cast(i8x64::from_slice_unaligned(expected.as_slice()));
+
+        assert_eq!(expected, actual);
     }
 }

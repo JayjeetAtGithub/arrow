@@ -39,12 +39,8 @@ impl Bitmap {
         } else {
             num_bytes + 64 - r
         };
-        let mut v = Vec::with_capacity(len);
-        for _ in 0..len {
-            v.push(255); // 1 is not null
-        }
         Bitmap {
-            bits: Buffer::from(&v[..]),
+            bits: Buffer::from(&vec![0xFF; len]),
         }
     }
 
@@ -58,7 +54,7 @@ impl Bitmap {
 
     pub fn is_set(&self, i: usize) -> bool {
         assert!(i < (self.bits.len() << 3));
-        unsafe { bit_util::get_bit_raw(self.bits.raw_data(), i) }
+        unsafe { bit_util::get_bit_raw(self.bits.as_ptr(), i) }
     }
 
     pub fn buffer_ref(&self) -> &Buffer {
@@ -111,7 +107,7 @@ impl PartialEq for Bitmap {
         if self_len != other_len {
             return false;
         }
-        self.bits.data()[..self_len] == other.bits.data()[..self_len]
+        self.bits.as_slice()[..self_len] == other.bits.as_slice()[..self_len]
     }
 }
 

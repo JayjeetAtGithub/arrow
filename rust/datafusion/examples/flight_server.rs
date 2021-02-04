@@ -21,9 +21,9 @@ use futures::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use datafusion::datasource::parquet::ParquetTable;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
+use datafusion::{datasource::parquet::ParquetTable, physical_plan::collect};
 
 use arrow_flight::{
     flight_service_server::FlightService, flight_service_server::FlightServiceServer,
@@ -34,10 +34,6 @@ use arrow_flight::{
 #[derive(Clone)]
 pub struct FlightServiceImpl {}
 
-/**
- * Example Flight Server wrapping DataFusion that supports looking up schema information for
- * Parquet files and executing SQL queries against Parquet files.
- */
 #[tonic::async_trait]
 impl FlightService for FlightServiceImpl {
     type HandshakeStream = Pin<
@@ -68,9 +64,15 @@ impl FlightService for FlightServiceImpl {
     ) -> Result<Response<SchemaResult>, Status> {
         let request = request.into_inner();
 
-        let table = ParquetTable::try_new(&request.path[0]).unwrap();
+        let table = ParquetTable::try_new(&request.path[0], num_cpus::get()).unwrap();
 
-        Ok(Response::new(SchemaResult::from(table.schema().as_ref())))
+        let options = arrow::ipc::writer::IpcWriteOptions::default();
+        let schema_result = arrow_flight::utils::flight_schema_from_arrow_schema(
+            table.schema().as_ref(),
+            &options,
+        );
+
+        Ok(Response::new(schema_result))
     }
 
     async fn do_get(
@@ -85,8 +87,7 @@ impl FlightService for FlightServiceImpl {
                 // create local execution context
                 let mut ctx = ExecutionContext::new();
 
-                let testdata = std::env::var("PARQUET_TEST_DATA")
-                    .expect("PARQUET_TEST_DATA not defined");
+                let testdata = arrow::util::test_util::parquet_test_data();
 
                 // register parquet file with the execution context
                 ctx.register_parquet(
@@ -103,19 +104,33 @@ impl FlightService for FlightServiceImpl {
                     .map_err(|e| to_tonic_err(&e))?;
 
                 // execute the query
-                let results = ctx.collect(plan.clone()).map_err(|e| to_tonic_err(&e))?;
+                let results =
+                    collect(plan.clone()).await.map_err(|e| to_tonic_err(&e))?;
                 if results.is_empty() {
                     return Err(Status::internal("There were no results from ticket"));
                 }
 
                 // add an initial FlightData message that sends schema
+                let options = arrow::ipc::writer::IpcWriteOptions::default();
                 let schema = plan.schema();
+                let schema_flight_data =
+                    arrow_flight::utils::flight_data_from_arrow_schema(
+                        schema.as_ref(),
+                        &options,
+                    );
+
                 let mut flights: Vec<Result<FlightData, Status>> =
-                    vec![Ok(FlightData::from(schema.as_ref()))];
+                    vec![Ok(schema_flight_data)];
 
                 let mut batches: Vec<Result<FlightData, Status>> = results
                     .iter()
-                    .map(|batch| Ok(FlightData::from(batch)))
+                    .flat_map(|batch| {
+                        let flight_data =
+                            arrow_flight::utils::flight_data_from_arrow_batch(
+                                batch, &options,
+                            );
+                        flight_data.into_iter().map(Ok)
+                    })
                     .collect();
 
                 // append batch vector to schema vector, so that the first message sent is the schema
@@ -179,10 +194,13 @@ impl FlightService for FlightServiceImpl {
     }
 }
 
-fn to_tonic_err(e: &datafusion::error::ExecutionError) -> Status {
+fn to_tonic_err(e: &datafusion::error::DataFusionError) -> Status {
     Status::internal(format!("{:?}", e))
 }
 
+/// This example shows how to wrap DataFusion with `FlightService` to support looking up schema information for
+/// Parquet files and executing SQL queries against them on a remote server.
+/// This example is run along-side the example `flight_client`.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "0.0.0.0:50051".parse()?;

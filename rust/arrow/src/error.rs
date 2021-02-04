@@ -35,6 +35,8 @@ pub enum ArrowError {
     IoError(String),
     InvalidArgumentError(String),
     ParquetError(String),
+    /// Error during import or export to/from the C Data Interface
+    CDataInterface(String),
     DictionaryKeyOverflowError,
 }
 
@@ -58,7 +60,7 @@ impl From<csv_crate::Error> for ArrowError {
         match error.kind() {
             csv_crate::ErrorKind::Io(error) => ArrowError::CsvError(error.to_string()),
             csv_crate::ErrorKind::Utf8 { pos: _, err } => ArrowError::CsvError(format!(
-                "Encountered UTF-8 error while reading CSV file: {:?}",
+                "Encountered UTF-8 error while reading CSV file: {}",
                 err.to_string()
             )),
             csv_crate::ErrorKind::UnequalLengths {
@@ -79,6 +81,12 @@ impl From<::std::string::FromUtf8Error> for ArrowError {
     }
 }
 
+impl From<serde_json::Error> for ArrowError {
+    fn from(error: serde_json::Error) -> Self {
+        ArrowError::JsonError(error.to_string())
+    }
+}
+
 impl Display for ArrowError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -96,6 +104,9 @@ impl Display for ArrowError {
             }
             ArrowError::ParquetError(desc) => {
                 write!(f, "Parquet argument error: {}", desc)
+            }
+            ArrowError::CDataInterface(desc) => {
+                write!(f, "C Data interface error: {}", desc)
             }
             ArrowError::DictionaryKeyOverflowError => {
                 write!(f, "Dictionary key bigger than the key type")

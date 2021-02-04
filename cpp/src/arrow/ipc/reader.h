@@ -25,28 +25,16 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/io/type_fwd.h"
 #include "arrow/ipc/message.h"
 #include "arrow/ipc/options.h"
 #include "arrow/record_batch.h"
 #include "arrow/result.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
 namespace arrow {
-
-class Buffer;
-class Schema;
-class Status;
-class Tensor;
-class SparseTensor;
-
-namespace io {
-
-class InputStream;
-class RandomAccessFile;
-
-}  // namespace io
-
 namespace ipc {
 
 class DictionaryMemo;
@@ -54,7 +42,23 @@ struct IpcPayload;
 
 using RecordBatchReader = ::arrow::RecordBatchReader;
 
-/// \class RecordBatchStreamReader
+struct ReadStats {
+  /// Number of IPC messages read.
+  int64_t num_messages = 0;
+  /// Number of record batches read.
+  int64_t num_record_batches = 0;
+  /// Number of dictionary batches read.
+  ///
+  /// Note: num_dictionary_batches >= num_dictionary_deltas + num_replaced_dictionaries
+  int64_t num_dictionary_batches = 0;
+
+  /// Number of dictionary deltas read.
+  int64_t num_dictionary_deltas = 0;
+  /// Number of replaced dictionaries (i.e. where a dictionary batch replaces
+  /// an existing dictionary with an unrelated new dictionary).
+  int64_t num_replaced_dictionaries = 0;
+};
+
 /// \brief Synchronous batch stream reader that reads from io::InputStream
 ///
 /// This class reads the schema (plus any dictionaries) as the first messages
@@ -68,7 +72,7 @@ class ARROW_EXPORT RecordBatchStreamReader : public RecordBatchReader {
   /// \param[in] message_reader a MessageReader implementation
   /// \param[in] options any IPC reading options (optional)
   /// \return the created batch reader
-  static Result<std::shared_ptr<RecordBatchReader>> Open(
+  static Result<std::shared_ptr<RecordBatchStreamReader>> Open(
       std::unique_ptr<MessageReader> message_reader,
       const IpcReadOptions& options = IpcReadOptions::Defaults());
 
@@ -78,7 +82,7 @@ class ARROW_EXPORT RecordBatchStreamReader : public RecordBatchReader {
   /// lifetime of stream reader
   /// \param[in] options any IPC reading options (optional)
   /// \return the created batch reader
-  static Result<std::shared_ptr<RecordBatchReader>> Open(
+  static Result<std::shared_ptr<RecordBatchStreamReader>> Open(
       io::InputStream* stream,
       const IpcReadOptions& options = IpcReadOptions::Defaults());
 
@@ -86,9 +90,12 @@ class ARROW_EXPORT RecordBatchStreamReader : public RecordBatchReader {
   /// \param[in] stream the input stream
   /// \param[in] options any IPC reading options (optional)
   /// \return the created batch reader
-  static Result<std::shared_ptr<RecordBatchReader>> Open(
+  static Result<std::shared_ptr<RecordBatchStreamReader>> Open(
       const std::shared_ptr<io::InputStream>& stream,
       const IpcReadOptions& options = IpcReadOptions::Defaults());
+
+  /// \brief Return current read statistics
+  virtual ReadStats stats() const = 0;
 };
 
 /// \brief Reads the record batch file format
@@ -159,9 +166,11 @@ class ARROW_EXPORT RecordBatchFileReader {
   /// \param[in] i the index of the record batch to return
   /// \return the read batch
   virtual Result<std::shared_ptr<RecordBatch>> ReadRecordBatch(int i) = 0;
+
+  /// \brief Return current read statistics
+  virtual ReadStats stats() const = 0;
 };
 
-/// \class Listener
 /// \brief A general listener class to receive events.
 ///
 /// You must implement callback methods for interested events.
@@ -204,7 +213,6 @@ class ARROW_EXPORT Listener {
   virtual Status OnSchemaDecoded(std::shared_ptr<Schema> schema);
 };
 
-/// \class CollectListener
 /// \brief Collect schema and record batches decoded by StreamDecoder.
 ///
 /// This API is EXPERIMENTAL.
@@ -238,7 +246,6 @@ class ARROW_EXPORT CollectListener : public Listener {
   std::vector<std::shared_ptr<RecordBatch>> record_batches_;
 };
 
-/// \class StreamDecoder
 /// \brief Push style stream decoder that receives data from user.
 ///
 /// This class decodes the Apache Arrow IPC streaming format data.
@@ -256,7 +263,7 @@ class ARROW_EXPORT StreamDecoder {
   /// Listener::OnRecordBatchDecoded() to receive decoded record batches
   /// \param[in] options any IPC reading options (optional)
   StreamDecoder(std::shared_ptr<Listener> listener,
-                const IpcReadOptions& options = IpcReadOptions::Defaults());
+                IpcReadOptions options = IpcReadOptions::Defaults());
 
   virtual ~StreamDecoder();
 
@@ -332,7 +339,7 @@ class ARROW_EXPORT StreamDecoder {
   ///   memcpy(buffer->mutable_data() + current_buffer_size,
   ///          small_chunk,
   ///          small_chunk_size);
-  ///   if (buffer->size() < decoder.next_requied_size()) {
+  ///   if (buffer->size() < decoder.next_required_size()) {
   ///     continue;
   ///   }
   ///   std::shared_ptr<arrow::Buffer> chunk(buffer.release());
@@ -348,6 +355,9 @@ class ARROW_EXPORT StreamDecoder {
   /// \return the number of bytes needed to advance the state of the
   /// decoder
   int64_t next_required_size() const;
+
+  /// \brief Return current read statistics
+  ReadStats stats() const;
 
  private:
   class StreamDecoderImpl;

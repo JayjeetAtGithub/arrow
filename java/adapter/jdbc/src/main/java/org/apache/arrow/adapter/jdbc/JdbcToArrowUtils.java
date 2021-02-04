@@ -53,6 +53,7 @@ import org.apache.arrow.adapter.jdbc.consumer.NullConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.SmallIntConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.TimeConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.TimestampConsumer;
+import org.apache.arrow.adapter.jdbc.consumer.TimestampTZConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.TinyIntConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.VarCharConsumer;
 import org.apache.arrow.memory.RootAllocator;
@@ -69,6 +70,7 @@ import org.apache.arrow.vector.NullVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeMilliVector;
 import org.apache.arrow.vector.TimeStampMilliTZVector;
+import org.apache.arrow.vector.TimeStampMilliVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -251,7 +253,7 @@ public class JdbcToArrowUtils {
       case Types.DECIMAL:
         int precision = fieldInfo.getPrecision();
         int scale = fieldInfo.getScale();
-        return new ArrowType.Decimal(precision, scale);
+        return new ArrowType.Decimal(precision, scale, 128);
       case Types.REAL:
       case Types.FLOAT:
         return new ArrowType.FloatingPoint(SINGLE);
@@ -417,7 +419,11 @@ public class JdbcToArrowUtils {
       case Types.TIME:
         return TimeConsumer.createConsumer((TimeMilliVector) vector, columnIndex, nullable, calendar);
       case Types.TIMESTAMP:
-        return TimestampConsumer.createConsumer((TimeStampMilliTZVector) vector, columnIndex, nullable, calendar);
+        if (config.getCalendar() == null) {
+          return TimestampConsumer.createConsumer((TimeStampMilliVector) vector, columnIndex, nullable);
+        } else {
+          return TimestampTZConsumer.createConsumer((TimeStampMilliTZVector) vector, columnIndex, nullable, calendar);
+        }
       case Types.BINARY:
       case Types.VARBINARY:
       case Types.LONGVARBINARY:

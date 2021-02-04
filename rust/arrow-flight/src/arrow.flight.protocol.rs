@@ -498,8 +498,9 @@ pub mod flight_service_server {
     #[async_trait]
     pub trait FlightService: Send + Sync + 'static {
         #[doc = "Server streaming response type for the Handshake method."]
-        type HandshakeStream: Stream<Item = Result<super::HandshakeResponse, tonic::Status>>
-            + Send
+        type HandshakeStream: Stream<
+            Item = Result<super::HandshakeResponse, tonic::Status>,
+        > + Send
             + Sync
             + 'static;
         #[doc = ""]
@@ -632,7 +633,6 @@ pub mod flight_service_server {
     #[doc = " accessed using the Arrow Flight Protocol. Additionally, a flight service"]
     #[doc = " can expose a set of actions that are available."]
     #[derive(Debug)]
-    #[doc(hidden)]
     pub struct FlightServiceServer<T: FlightService> {
         inner: _Inner<T>,
     }
@@ -687,7 +687,7 @@ pub mod flight_service_server {
                             >,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.handshake(request).await };
+                            let fut = async move { (*inner).handshake(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -725,7 +725,7 @@ pub mod flight_service_server {
                             request: tonic::Request<super::Criteria>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.list_flights(request).await };
+                            let fut = async move { (*inner).list_flights(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -760,7 +760,8 @@ pub mod flight_service_server {
                             request: tonic::Request<super::FlightDescriptor>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.get_flight_info(request).await };
+                            let fut =
+                                async move { (*inner).get_flight_info(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -795,7 +796,7 @@ pub mod flight_service_server {
                             request: tonic::Request<super::FlightDescriptor>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.get_schema(request).await };
+                            let fut = async move { (*inner).get_schema(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -833,7 +834,7 @@ pub mod flight_service_server {
                             request: tonic::Request<super::Ticket>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.do_get(request).await };
+                            let fut = async move { (*inner).do_get(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -871,7 +872,7 @@ pub mod flight_service_server {
                             request: tonic::Request<tonic::Streaming<super::FlightData>>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.do_put(request).await };
+                            let fut = async move { (*inner).do_put(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -909,7 +910,7 @@ pub mod flight_service_server {
                             request: tonic::Request<tonic::Streaming<super::FlightData>>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.do_exchange(request).await };
+                            let fut = async move { (*inner).do_exchange(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -947,7 +948,7 @@ pub mod flight_service_server {
                             request: tonic::Request<super::Action>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.do_action(request).await };
+                            let fut = async move { (*inner).do_action(request).await };
                             Box::pin(fut)
                         }
                     }
@@ -985,7 +986,7 @@ pub mod flight_service_server {
                             request: tonic::Request<super::Empty>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            let fut = async move { inner.list_actions(request).await };
+                            let fut = async move { (*inner).list_actions(request).await };
                             Box::pin(fut)
                         }
                     }

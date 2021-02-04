@@ -18,7 +18,7 @@
 //! Contains implementation of record assembly and converting Parquet types into
 //! [`Row`](crate::record::api::Row)s.
 
-use std::{collections::HashMap, fmt, rc::Rc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::basic::{LogicalType, Repetition};
 use crate::errors::{ParquetError, Result};
@@ -159,7 +159,7 @@ impl TreeBuilder {
                     if Reader::is_element_type(&repeated_field) {
                         // Support for backward compatible lists
                         let reader = self.reader_tree(
-                            repeated_field.clone(),
+                            repeated_field,
                             &mut path,
                             curr_def_level,
                             curr_rep_level,
@@ -277,7 +277,7 @@ impl TreeBuilder {
                     path.pop();
 
                     let reader = self.reader_tree(
-                        Rc::new(required_field),
+                        Arc::new(required_field),
                         &mut path,
                         curr_def_level,
                         curr_rep_level,
@@ -507,8 +507,8 @@ impl Reader {
             Reader::PrimitiveReader(ref field, _) => field.name(),
             Reader::OptionReader(_, ref reader) => reader.field_name(),
             Reader::GroupReader(ref opt, ..) => match opt {
-                &Some(ref field) => field.name(),
-                &None => panic!("Field is None for group reader"),
+                Some(ref field) => field.name(),
+                None => panic!("Field is None for group reader"),
             },
             Reader::RepeatedReader(ref field, ..) => field.name(),
             Reader::KeyValueReader(ref field, ..) => field.name(),
@@ -521,8 +521,8 @@ impl Reader {
             Reader::PrimitiveReader(ref field, _) => field.get_basic_info().repetition(),
             Reader::OptionReader(_, ref reader) => reader.repetition(),
             Reader::GroupReader(ref opt, ..) => match opt {
-                &Some(ref field) => field.get_basic_info().repetition(),
-                &None => panic!("Field is None for group reader"),
+                Some(ref field) => field.get_basic_info().repetition(),
+                None => panic!("Field is None for group reader"),
             },
             Reader::RepeatedReader(ref field, ..) => field.get_basic_info().repetition(),
             Reader::KeyValueReader(ref field, ..) => field.get_basic_info().repetition(),
@@ -658,7 +658,7 @@ impl<'a> RowIter<'a> {
             file_reader,
             tree_builder,
             num_row_groups,
-            row_iter: row_iter,
+            row_iter,
             current_row_group: 0,
         }
     }
@@ -737,7 +737,7 @@ impl<'a> RowIter<'a> {
                 if !root_schema.check_contains(&projection) {
                     return Err(general_err!("Root schema does not contain projection"));
                 }
-                Ok(Rc::new(SchemaDescriptor::new(Rc::new(projection))))
+                Ok(Arc::new(SchemaDescriptor::new(Arc::new(projection))))
             }
             None => Ok(root_descr),
         }

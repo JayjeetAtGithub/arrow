@@ -19,6 +19,7 @@
 
 #include <limits>
 
+#include "arrow/array/builder_time.h"
 #include "arrow/compute/kernels/common.h"
 #include "arrow/compute/kernels/scalar_cast_internal.h"
 #include "arrow/util/bitmap_reader.h"
@@ -41,7 +42,7 @@ template <typename in_type, typename out_type>
 void ShiftTime(KernelContext* ctx, const util::DivideOrMultiply factor_op,
                const int64_t factor, const ArrayData& input, ArrayData* output) {
   const CastOptions& options = checked_cast<const CastState&>(*ctx->state()).options;
-  const in_type* in_data = input.GetValues<in_type>(1);
+  auto in_data = input.GetValues<in_type>(1);
   auto out_data = output->GetMutableValues<out_type>(1);
 
   if (factor == 1) {

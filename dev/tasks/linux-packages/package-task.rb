@@ -54,7 +54,7 @@ class PackageTask
       @rpm_version = @version
       @rpm_release = "1"
     end
-    @deb_release = "1"
+    @deb_release = ENV["DEB_RELEASE"] || "1"
   end
 
   def define
@@ -231,8 +231,6 @@ class PackageTask
     # Disable arm64 targets by default for now
     # because they require some setups on host.
     [
-      "debian-stretch",
-      # "debian-stretch-arm64",
       "debian-buster",
       # "debian-stretch-arm64",
       "ubuntu-xenial",
@@ -241,6 +239,8 @@ class PackageTask
       # "ubuntu-bionic-arm64",
       "ubuntu-focal",
       # "ubuntu-focal-arm64",
+      "ubuntu-groovy",
+      # "ubuntu-groovy-arm64",
     ]
   end
 
@@ -256,14 +256,46 @@ class PackageTask
     "apt"
   end
 
+  def apt_prepare_debian_dir(tmp_dir, target)
+    source_debian_dir = nil
+    specific_debian_dir = "debian.#{target}"
+    distribution, code_name, _architecture = target.split("-", 3)
+    platform = [distribution, code_name].join("-")
+    platform_debian_dir = "debian.#{platform}"
+    if File.exist?(specific_debian_dir)
+      source_debian_dir = specific_debian_dir
+    elsif File.exist?(platform_debian_dir)
+      source_debian_dir = platform_debian_dir
+    else
+      source_debian_dir = "debian"
+    end
+
+    prepared_debian_dir = "#{tmp_dir}/debian.#{target}"
+    cp_r(source_debian_dir, prepared_debian_dir)
+    control_in_path = "#{prepared_debian_dir}/control.in"
+    if File.exist?(control_in_path)
+      control_in = File.read(control_in_path)
+      rm_f(control_in_path)
+      File.open("#{prepared_debian_dir}/control", "w") do |control|
+        prepared_control = apt_prepare_debian_control(control_in, target)
+        control.print(prepared_control)
+      end
+    end
+  end
+
+  def apt_prepare_debian_control(control_in, target)
+    message = "#{__method__} must be defined to use debian/control.in"
+    raise NotImplementedError, message
+  end
+
   def apt_build
     tmp_dir = "#{apt_dir}/tmp"
     rm_rf(tmp_dir)
     mkdir_p(tmp_dir)
     cp(deb_archive_name,
        File.join(tmp_dir, deb_archive_name))
-    Dir.glob("debian*") do |debian_dir|
-      cp_r(debian_dir, "#{tmp_dir}/#{debian_dir}")
+    apt_targets.each do |target|
+      apt_prepare_debian_dir(tmp_dir, target)
     end
 
     env_sh = "#{apt_dir}/env.sh"
@@ -336,7 +368,6 @@ VERSION=#{@deb_upstream_version}
     # Disable aarch64 targets by default for now
     # because they require some setups on host.
     [
-      "centos-6",
       "centos-7",
       # "centos-7-aarch64",
       "centos-8",
