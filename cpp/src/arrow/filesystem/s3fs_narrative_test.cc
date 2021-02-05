@@ -43,7 +43,7 @@ DEFINE_string(access_key, "", "S3 access key");
 DEFINE_string(secret_key, "", "S3 secret key");
 
 DEFINE_string(bucket, "", "bucket name");
-DEFINE_string(region, arrow::fs::kS3DefaultRegion, "AWS region");
+DEFINE_string(region, "", "AWS region");
 DEFINE_string(endpoint, "", "Endpoint override (e.g. '127.0.0.1:9000')");
 DEFINE_string(scheme, "https", "Connection scheme");
 
@@ -138,6 +138,7 @@ void TestBucket(int argc, char** argv) {
   select.allow_not_found = false;
   ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
   ASSERT_EQ(infos.size(), 2);
+  SortInfos(&infos);
   AssertFileInfo(infos[0], "Dir1/File2", FileType::File, 11);
   AssertFileInfo(infos[1], "Dir1/Subdir", FileType::Directory);
 
@@ -145,6 +146,7 @@ void TestBucket(int argc, char** argv) {
   select.recursive = true;
   ASSERT_OK_AND_ASSIGN(infos, fs->GetFileInfo(select));
   ASSERT_EQ(infos.size(), 2);
+  SortInfos(&infos);
   AssertFileInfo(infos[0], "Dir2/Subdir", FileType::Directory);
   AssertFileInfo(infos[1], "Dir2/Subdir/File3", FileType::File, 10);
 
@@ -200,6 +202,10 @@ void TestMain(int argc, char** argv) {
                           ? S3LogLevel::Debug
                           : (FLAGS_verbose ? S3LogLevel::Warn : S3LogLevel::Fatal);
   ASSERT_OK(InitializeS3(options));
+
+  if (FLAGS_region.empty()) {
+    ASSERT_OK_AND_ASSIGN(FLAGS_region, ResolveBucketRegion(FLAGS_bucket));
+  }
 
   if (FLAGS_clear) {
     ClearBucket(argc, argv);

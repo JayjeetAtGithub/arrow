@@ -9,7 +9,16 @@ class arrow::MemoryPool
 }
 \section{Methods}{
 
-
-TODO
+\itemize{
+\item \code{backend_name}: one of "jemalloc", "mimalloc", or "system". Alternative
+memory allocators are optionally enabled at build time. Windows builds
+generally have \code{mimalloc}, and most others have both \code{jemalloc} (used by
+default) and \code{mimalloc}. To change memory allocators at runtime, set the
+environment variable \code{ARROW_DEFAULT_MEMORY_POOL} to one of those strings
+prior to loading the \code{arrow} library.
+\item \code{bytes_allocated}
+\item \code{max_memory}
+}
 }
 
+\keyword{internal}

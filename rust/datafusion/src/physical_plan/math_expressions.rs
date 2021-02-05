@@ -23,7 +23,7 @@ use arrow::array::{make_array, Array, ArrayData, ArrayRef, Float32Array, Float64
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, ToByteSlice};
 
-use crate::error::{ExecutionError, Result};
+use crate::error::{DataFusionError, Result};
 
 macro_rules! compute_op {
     ($ARRAY:expr, $FUNC:ident, $TYPE:ident) => {{
@@ -49,7 +49,7 @@ macro_rules! downcast_compute_op {
         let n = $ARRAY.as_any().downcast_ref::<$TYPE>();
         match n {
             Some(array) => compute_op!(array, $FUNC, $TYPE),
-            _ => Err(ExecutionError::General(format!(
+            _ => Err(DataFusionError::Internal(format!(
                 "Invalid data type for {}",
                 $NAME
             ))),
@@ -62,7 +62,7 @@ macro_rules! unary_primitive_array_op {
         match ($ARRAY).data_type() {
             DataType::Float32 => downcast_compute_op!($ARRAY, $NAME, $FUNC, Float32Array),
             DataType::Float64 => downcast_compute_op!($ARRAY, $NAME, $FUNC, Float64Array),
-            other => Err(ExecutionError::General(format!(
+            other => Err(DataFusionError::Internal(format!(
                 "Unsupported data type {:?} for function {}",
                 other, $NAME,
             ))),

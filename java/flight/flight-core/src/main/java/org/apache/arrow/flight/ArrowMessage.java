@@ -35,6 +35,8 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
+import org.apache.arrow.vector.ipc.message.ArrowBodyCompression;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
@@ -124,6 +126,7 @@ class ArrowMessage implements AutoCloseable {
   private final MessageMetadataResult message;
   private final ArrowBuf appMetadata;
   private final List<ArrowBuf> bufs;
+  private final ArrowBodyCompression bodyCompression;
 
   public ArrowMessage(FlightDescriptor descriptor, Schema schema, IpcOption option) {
     this.writeOption = option;
@@ -133,6 +136,7 @@ class ArrowMessage implements AutoCloseable {
     bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.bodyCompression = NoCompressionCodec.DEFAULT_BODY_COMPRESSION;
   }
 
   /**
@@ -147,6 +151,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.copyOf(batch.getBuffers());
     this.descriptor = null;
     this.appMetadata = appMetadata;
+    this.bodyCompression = batch.getBodyCompression();
   }
 
   public ArrowMessage(ArrowDictionaryBatch batch, IpcOption option) {
@@ -159,6 +164,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.copyOf(batch.getDictionary().getBuffers());
     this.descriptor = null;
     this.appMetadata = null;
+    this.bodyCompression = batch.getDictionary().getBodyCompression();
   }
 
   /**
@@ -172,6 +178,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = null;
     this.appMetadata = appMetadata;
+    this.bodyCompression = NoCompressionCodec.DEFAULT_BODY_COMPRESSION;
   }
 
   public ArrowMessage(FlightDescriptor descriptor) {
@@ -181,6 +188,7 @@ class ArrowMessage implements AutoCloseable {
     this.bufs = ImmutableList.of();
     this.descriptor = descriptor;
     this.appMetadata = null;
+    this.bodyCompression = NoCompressionCodec.DEFAULT_BODY_COMPRESSION;
   }
 
   private ArrowMessage(FlightDescriptor descriptor, MessageMetadataResult message, ArrowBuf appMetadata,
@@ -194,6 +202,7 @@ class ArrowMessage implements AutoCloseable {
     this.descriptor = descriptor;
     this.appMetadata = appMetadata;
     this.bufs = buf == null ? ImmutableList.of() : ImmutableList.of(buf);
+    this.bodyCompression = NoCompressionCodec.DEFAULT_BODY_COMPRESSION;
   }
 
   public MessageMetadataResult asSchemaMessage() {
@@ -288,7 +297,34 @@ class ArrowMessage implements AutoCloseable {
             // ignore unknown fields.
         }
       }
-
+      // Protobuf implementations can omit empty fields, such as body; for some message types, like RecordBatch,
+      // this will fail later as we still expect an empty buffer. In those cases only, fill in an empty buffer here -
+      // in other cases, like Schema, having an unexpected empty buffer will also cause failures.
+      // We don't fill in defaults for fields like header, for which there is no reasonable default, or for appMetadata
+      // or descriptor, which are intended to be empty in some cases.
+      if (header != null) {
+        switch (HeaderType.getHeader(header.headerType())) {
+          case SCHEMA:
+            // Ignore 0-length buffers in case a Protobuf implementation wrote it out
+            if (body != null && body.capacity() == 0) {
+              body.close();
+              body = null;
+            }
+            break;
+          case DICTIONARY_BATCH:
+          case RECORD_BATCH:
+            // A Protobuf implementation can skip 0-length bodies, so ensure we fill it in here
+            if (body == null) {
+              body = allocator.getEmpty();
+            }
+            break;
+          case NONE:
+          case TENSOR:
+          default:
+            // Do nothing
+            break;
+        }
+      }
       return new ArrowMessage(descriptor, header, appMetadata, body);
     } catch (Exception ioe) {
       throw new RuntimeException(ioe);

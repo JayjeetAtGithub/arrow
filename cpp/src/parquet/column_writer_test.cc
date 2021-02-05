@@ -26,6 +26,7 @@
 
 #include "parquet/column_reader.h"
 #include "parquet/column_writer.h"
+#include "parquet/file_writer.h"
 #include "parquet/metadata.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
@@ -63,8 +64,6 @@ const int64_t DICTIONARY_PAGE_SIZE = 1024 * 1024;
 template <typename TestType>
 class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
  public:
-  typedef typename TestType::c_type T;
-
   void SetUp() {
     this->SetupValuesOut(SMALL_SIZE);
     writer_properties_ = default_writer_properties();
@@ -488,15 +487,13 @@ TYPED_TEST(TestPrimitiveWriter, RequiredPlainWithStatsAndGzipCompression) {
 
 #ifdef ARROW_WITH_LZ4
 TYPED_TEST(TestPrimitiveWriter, RequiredPlainWithLz4Compression) {
-  ASSERT_THROW(this->TestRequiredWithSettings(Encoding::PLAIN, Compression::LZ4, false,
-                                              false, LARGE_SIZE),
-               ParquetException);
+  this->TestRequiredWithSettings(Encoding::PLAIN, Compression::LZ4, false, false,
+                                 LARGE_SIZE);
 }
 
 TYPED_TEST(TestPrimitiveWriter, RequiredPlainWithStatsAndLz4Compression) {
-  ASSERT_THROW(this->TestRequiredWithSettings(Encoding::PLAIN, Compression::LZ4, false,
-                                              true, LARGE_SIZE),
-               ParquetException);
+  this->TestRequiredWithSettings(Encoding::PLAIN, Compression::LZ4, false, true,
+                                 LARGE_SIZE);
 }
 #endif
 
@@ -614,6 +611,35 @@ TYPED_TEST(TestPrimitiveWriter, DictionaryFallbackVersion1_0) {
 
 TYPED_TEST(TestPrimitiveWriter, DictionaryFallbackVersion2_0) {
   this->TestDictionaryFallbackEncoding(ParquetVersion::PARQUET_2_0);
+}
+
+TEST(TestWriter, NullValuesBuffer) {
+  std::shared_ptr<::arrow::io::BufferOutputStream> sink = CreateOutputStream();
+
+  const auto item_node = schema::PrimitiveNode::Make(
+      "item", Repetition::REQUIRED, LogicalType::Int(32, true), Type::INT32);
+  const auto list_node =
+      schema::GroupNode::Make("list", Repetition::REPEATED, {item_node});
+  const auto column_node = schema::GroupNode::Make(
+      "array_of_ints_column", Repetition::OPTIONAL, {list_node}, LogicalType::List());
+  const auto schema_node =
+      schema::GroupNode::Make("schema", Repetition::REQUIRED, {column_node});
+
+  auto file_writer = ParquetFileWriter::Open(
+      sink, std::dynamic_pointer_cast<schema::GroupNode>(schema_node));
+  auto group_writer = file_writer->AppendRowGroup();
+  auto column_writer = group_writer->NextColumn();
+  auto typed_writer = dynamic_cast<Int32Writer*>(column_writer);
+
+  const int64_t num_values = 1;
+  const int16_t def_levels[] = {0};
+  const int16_t rep_levels[] = {0};
+  const uint8_t valid_bits[] = {0};
+  const int64_t valid_bits_offset = 0;
+  const int32_t* values = nullptr;
+
+  typed_writer->WriteBatchSpaced(num_values, def_levels, rep_levels, valid_bits,
+                                 valid_bits_offset, values);
 }
 
 // PARQUET-719
