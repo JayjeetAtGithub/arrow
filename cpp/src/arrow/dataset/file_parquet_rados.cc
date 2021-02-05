@@ -60,8 +60,10 @@ class RadosParquetScanTask : public ScanTask {
       return Status::ExecutionError(s.message());
     }
 
+    /// print the table
     std::shared_ptr<Table> table;
     ARROW_RETURN_NOT_OK(deserialize_table_from_bufferlist(&table, *out));
+
 
     /// just reading from a parquet file in a local fs.
     /*

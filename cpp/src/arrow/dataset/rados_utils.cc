@@ -174,7 +174,12 @@ Status SerializeTableToBufferlist(std::shared_ptr<Table>& table,
 
 Status deserialize_table_from_bufferlist(std::shared_ptr<Table>* table,
                                          librados::bufferlist& bl) {
-  io::BufferReader reader((uint8_t*)bl.c_str(), bl.length());
+  char* buff = new char[bl.length()];
+  librados::bufferlist::iterator itr = bl.begin();
+
+  itr.copy(bl.length(), buff);
+
+  io::BufferReader reader((uint8_t*)buff, bl.length());
   ARROW_ASSIGN_OR_RAISE(auto record_batch_reader,
                         ipc::RecordBatchStreamReader::Open(&reader));
   ARROW_ASSIGN_OR_RAISE(auto table_,
