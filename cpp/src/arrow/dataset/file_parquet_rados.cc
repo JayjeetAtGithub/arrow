@@ -43,7 +43,6 @@ class RadosParquetScanTask : public ScanTask {
         doa_(std::move(doa)) {}
 
   Result<RecordBatchIterator> Execute() override {
-    /*
     std::shared_ptr<librados::bufferlist> in = std::make_shared<librados::bufferlist>();
     std::shared_ptr<librados::bufferlist> out = std::make_shared<librados::bufferlist>();
 
@@ -58,8 +57,12 @@ class RadosParquetScanTask : public ScanTask {
     if (!s.ok()) {
       return Status::ExecutionError(s.message());
     }
-    */
 
+    std::shared_ptr<Table> table;
+    ARROW_RETURN_NOT_OK(deserialize_table_from_bufferlist(&table, *out));
+
+    /// just reading from a parquet file in a local fs.
+    /*
     std::shared_ptr<arrow::io::ReadableFile> infile;
     PARQUET_ASSIGN_OR_THROW(
         infile,
@@ -69,9 +72,12 @@ class RadosParquetScanTask : public ScanTask {
     std::unique_ptr<parquet::arrow::FileReader> reader;
     PARQUET_THROW_NOT_OK(
         parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
+    
     std::shared_ptr<arrow::Table> table;
-    PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
+    PARQUET_THROW_NOT_OK(reader->ReadTable(&table)); 
+    */
 
+    // we need a table...we dont care where it comes from...
     auto table_reader = std::make_shared<TableBatchReader>(*table);
     RecordBatchVector batches;
     table_reader->ReadAll(&batches);

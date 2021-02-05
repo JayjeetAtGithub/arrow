@@ -172,5 +172,17 @@ Status SerializeTableToBufferlist(std::shared_ptr<Table>& table,
   return Status::OK();
 }
 
+Status deserialize_table_from_bufferlist(std::shared_ptr<Table>* table,
+                                         librados::bufferlist& bl) {
+  io::BufferReader reader((uint8_t*)bl.c_str(), bl.length());
+  ARROW_ASSIGN_OR_RAISE(auto record_batch_reader,
+                        ipc::RecordBatchStreamReader::Open(&reader));
+  ARROW_ASSIGN_OR_RAISE(auto table_,
+                        Table::FromRecordBatchReader(record_batch_reader.get()));
+  *table = table_;
+  return Status::OK();
+}
+
+
 }  // namespace dataset
 }  // namespace arrow

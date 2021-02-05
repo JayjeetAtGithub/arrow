@@ -59,5 +59,8 @@ ARROW_DS_EXPORT Status DeserializeScanRequestFromBufferlist(
 ARROW_DS_EXPORT Status SerializeTableToBufferlist(
     std::shared_ptr<Table>& table, std::shared_ptr<librados::bufferlist>& bl);
 
+ARROW_DS_EXPORT Status deserialize_table_from_bufferlist(std::shared_ptr<Table>* table,
+                                         librados::bufferlist& bl)
+
 }  // namespace dataset
 }  // namespace arrow
