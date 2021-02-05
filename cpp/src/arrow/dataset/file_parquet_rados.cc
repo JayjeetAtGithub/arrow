@@ -30,6 +30,8 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/exception.h>
 
+#include <iostream>
+
 namespace arrow {
 namespace dataset {
 
@@ -76,6 +78,8 @@ class RadosParquetScanTask : public ScanTask {
     std::shared_ptr<arrow::Table> table;
     PARQUET_THROW_NOT_OK(reader->ReadTable(&table)); 
     */
+
+    std::cerr << table->ToString() << "\n";
 
     // we need a table...we dont care where it comes from...
     auto table_reader = std::make_shared<TableBatchReader>(*table);
