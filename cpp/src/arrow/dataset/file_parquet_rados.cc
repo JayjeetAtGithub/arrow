@@ -26,7 +26,9 @@
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
 #include "arrow/filesystem/util_internal.h"
-
+#include <parquet/arrow/reader.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/exception.h>
 
 namespace arrow {
 namespace dataset {
@@ -41,6 +43,7 @@ class RadosParquetScanTask : public ScanTask {
         doa_(std::move(doa)) {}
 
   Result<RecordBatchIterator> Execute() override {
+    /*
     std::shared_ptr<librados::bufferlist> in = std::make_shared<librados::bufferlist>();
     std::shared_ptr<librados::bufferlist> out = std::make_shared<librados::bufferlist>();
 
@@ -55,12 +58,23 @@ class RadosParquetScanTask : public ScanTask {
     if (!s.ok()) {
       return Status::ExecutionError(s.message());
     }
+    */
+
+    std::shared_ptr<arrow::io::ReadableFile> infile;
+    PARQUET_ASSIGN_OR_THROW(
+        infile,
+        arrow::io::ReadableFile::Open(source_.path(),
+                                      arrow::default_memory_pool()));
+
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    PARQUET_THROW_NOT_OK(
+        parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
+    std::shared_ptr<arrow::Table> table;
+    PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
+
+    auto table_reader = std::make_shared<TableBatchReader>(*table);
     RecordBatchVector batches;
-    auto buffer = std::make_shared<Buffer>((uint8_t*)out->c_str(), out->length());
-    auto buffer_reader = std::make_shared<io::BufferReader>(buffer);
-    ARROW_ASSIGN_OR_RAISE(auto rb_reader,
-                          arrow::ipc::RecordBatchStreamReader::Open(buffer_reader));
-    rb_reader->ReadAll(&batches);
+    table_reader->ReadAll(&batches);
     return MakeVectorIterator(batches);
   }
 
