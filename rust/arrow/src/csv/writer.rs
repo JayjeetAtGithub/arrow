@@ -48,7 +48,7 @@
 //!     Some(-556132.25),
 //! ]);
 //! let c3 = PrimitiveArray::<UInt32Type>::from(vec![3, 2, 1]);
-//! let c4 = PrimitiveArray::<BooleanType>::from(vec![Some(true), Some(false), None]);
+//! let c4 = BooleanArray::from(vec![Some(true), Some(false), None]);
 //!
 //! let batch = RecordBatch::try_new(
 //!     Arc::new(schema),
@@ -69,11 +69,10 @@ use csv as csv_crate;
 
 use std::io::Write;
 
-use crate::array::*;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use crate::record_batch::RecordBatch;
-
+use crate::{array::*, util::serialization::lexical_to_string};
 const DEFAULT_DATE_FORMAT: &str = "%F";
 const DEFAULT_TIME_FORMAT: &str = "%T";
 const DEFAULT_TIMESTAMP_FORMAT: &str = "%FT%H:%M:%S.%9f";
@@ -81,10 +80,10 @@ const DEFAULT_TIMESTAMP_FORMAT: &str = "%FT%H:%M:%S.%9f";
 fn write_primitive_value<T>(array: &ArrayRef, i: usize) -> String
 where
     T: ArrowNumericType,
-    T::Native: std::string::ToString,
+    T::Native: lexical_core::ToLexical,
 {
     let c = array.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
-    c.value(i).to_string()
+    lexical_to_string(c.value(i))
 }
 
 /// A CSV writer
@@ -124,14 +123,18 @@ impl<W: Write> Writer<W> {
     }
 
     /// Convert a record to a string vector
-    fn convert(&self, batch: &RecordBatch, row_index: usize) -> Result<Vec<String>> {
+    fn convert(
+        &self,
+        batch: &RecordBatch,
+        row_index: usize,
+        buffer: &mut [String],
+    ) -> Result<()> {
         // TODO: it'd be more efficient if we could create `record: Vec<&[u8]>
-        let mut record: Vec<String> = Vec::with_capacity(batch.num_columns());
-        for col_index in 0..batch.num_columns() {
+        for (col_index, item) in buffer.iter_mut().enumerate() {
             let col = batch.column(col_index);
             if col.is_null(row_index) {
                 // write an empty value
-                record.push(String::from(""));
+                *item = "".to_string();
                 continue;
             }
             let string = match col.data_type() {
@@ -153,14 +156,14 @@ impl<W: Write> Writer<W> {
                     let c = col.as_any().downcast_ref::<StringArray>().unwrap();
                     c.value(row_index).to_owned()
                 }
-                DataType::Date32(DateUnit::Day) => {
+                DataType::Date32 => {
                     let c = col.as_any().downcast_ref::<Date32Array>().unwrap();
                     c.value_as_date(row_index)
                         .unwrap()
                         .format(&self.date_format)
                         .to_string()
                 }
-                DataType::Date64(DateUnit::Millisecond) => {
+                DataType::Date64 => {
                     let c = col.as_any().downcast_ref::<Date64Array>().unwrap();
                     c.value_as_date(row_index)
                         .unwrap()
@@ -243,10 +246,9 @@ impl<W: Write> Writer<W> {
                     )));
                 }
             };
-
-            record.push(string);
+            *item = string;
         }
-        Ok(record)
+        Ok(())
     }
 
     /// Write a vector of record batches to a writable object
@@ -265,9 +267,11 @@ impl<W: Write> Writer<W> {
             self.beginning = false;
         }
 
+        let mut buffer = vec!["".to_string(); batch.num_columns()];
+
         for row_index in 0..batch.num_rows() {
-            let record = self.convert(batch, row_index)?;
-            self.writer.write_record(&record[..])?;
+            self.convert(batch, row_index, &mut buffer)?;
+            self.writer.write_record(&buffer)?;
         }
         self.writer.flush()?;
 
@@ -415,7 +419,7 @@ mod tests {
             Some(-556132.25),
         ]);
         let c3 = PrimitiveArray::<UInt32Type>::from(vec![3, 2, 1]);
-        let c4 = PrimitiveArray::<BooleanType>::from(vec![Some(true), Some(false), None]);
+        let c4 = BooleanArray::from(vec![Some(true), Some(false), None]);
         let c5 = TimestampMillisecondArray::from_opt_vec(
             vec![None, Some(1555584887378), Some(1555555555555)],
             None,
@@ -482,7 +486,7 @@ sed do eiusmod tempor,-556132.25,1,,2019-04-18T02:45:55.555000000,23:46:03
             Some(-556132.25),
         ]);
         let c3 = PrimitiveArray::<UInt32Type>::from(vec![3, 2, 1]);
-        let c4 = PrimitiveArray::<BooleanType>::from(vec![Some(true), Some(false), None]);
+        let c4 = BooleanArray::from(vec![Some(true), Some(false), None]);
         let c6 = Time32SecondArray::from(vec![1234, 24680, 85563]);
 
         let batch = RecordBatch::try_new(
@@ -543,7 +547,7 @@ sed do eiusmod tempor,-556132.25,1,,2019-04-18T02:45:55.555000000,23:46:03
             Some(-556132.25),
         ]);
         let c3 = PrimitiveArray::<UInt32Type>::from(vec![3, 2, 1]);
-        let c4 = PrimitiveArray::<BooleanType>::from(vec![Some(true), Some(false), None]);
+        let c4 = BooleanArray::from(vec![Some(true), Some(false), None]);
         let c5 = TimestampMillisecondArray::from_opt_vec(
             vec![None, Some(1555584887378), Some(1555555555555)],
             None,

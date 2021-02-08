@@ -57,8 +57,8 @@ TEST(Arity, Basics) {
 }
 
 TEST(ScalarFunction, Basics) {
-  ScalarFunction func("scalar_test", Arity::Binary());
-  ScalarFunction varargs_func("varargs_test", Arity::VarArgs(1));
+  ScalarFunction func("scalar_test", Arity::Binary(), /*doc=*/nullptr);
+  ScalarFunction varargs_func("varargs_test", Arity::VarArgs(1), /*doc=*/nullptr);
 
   ASSERT_EQ("scalar_test", func.name());
   ASSERT_EQ(2, func.arity().num_args);
@@ -72,8 +72,8 @@ TEST(ScalarFunction, Basics) {
 }
 
 TEST(VectorFunction, Basics) {
-  VectorFunction func("vector_test", Arity::Binary());
-  VectorFunction varargs_func("varargs_test", Arity::VarArgs(1));
+  VectorFunction func("vector_test", Arity::Binary(), /*doc=*/nullptr);
+  VectorFunction varargs_func("varargs_test", Arity::VarArgs(1), /*doc=*/nullptr);
 
   ASSERT_EQ("vector_test", func.name());
   ASSERT_EQ(2, func.arity().num_args);
@@ -126,7 +126,7 @@ void CheckAddDispatch(FunctionType* func) {
   KernelType invalid_kernel({boolean()}, boolean(), ExecNYI);
   ASSERT_RAISES(Invalid, func->AddKernel(invalid_kernel));
 
-  ASSERT_OK_AND_ASSIGN(const KernelType* kernel, func->DispatchExact({int32(), int32()}));
+  ASSERT_OK_AND_ASSIGN(const Kernel* kernel, func->DispatchExact({int32(), int32()}));
   KernelSignature expected_sig(in_types1, out_type1);
   ASSERT_TRUE(kernel->signature->Equals(expected_sig));
 
@@ -139,15 +139,15 @@ void CheckAddDispatch(FunctionType* func) {
 }
 
 TEST(ScalarVectorFunction, DispatchExact) {
-  ScalarFunction func1("scalar_test", Arity::Binary());
-  VectorFunction func2("vector_test", Arity::Binary());
+  ScalarFunction func1("scalar_test", Arity::Binary(), /*doc=*/nullptr);
+  VectorFunction func2("vector_test", Arity::Binary(), /*doc=*/nullptr);
 
   CheckAddDispatch(&func1);
   CheckAddDispatch(&func2);
 }
 
 TEST(ArrayFunction, VarArgs) {
-  ScalarFunction va_func("va_test", Arity::VarArgs(1));
+  ScalarFunction va_func("va_test", Arity::VarArgs(1), /*doc=*/nullptr);
 
   std::vector<InputType> va_args = {int8()};
 
@@ -164,7 +164,7 @@ TEST(ArrayFunction, VarArgs) {
   ASSERT_RAISES(Invalid, va_func.AddKernel(non_va_kernel));
 
   std::vector<ValueDescr> args = {ValueDescr::Scalar(int8()), int8(), int8()};
-  ASSERT_OK_AND_ASSIGN(const ScalarKernel* kernel, va_func.DispatchExact(args));
+  ASSERT_OK_AND_ASSIGN(const Kernel* kernel, va_func.DispatchExact(args));
   ASSERT_TRUE(kernel->signature->MatchesInputs(args));
 
   // No dispatch possible because args incompatible
@@ -173,7 +173,7 @@ TEST(ArrayFunction, VarArgs) {
 }
 
 TEST(ScalarAggregateFunction, Basics) {
-  ScalarAggregateFunction func("agg_test", Arity::Unary());
+  ScalarAggregateFunction func("agg_test", Arity::Unary(), /*doc=*/nullptr);
 
   ASSERT_EQ("agg_test", func.name());
   ASSERT_EQ(1, func.arity().num_args);
@@ -190,7 +190,7 @@ void NoopMerge(KernelContext*, const KernelState&, KernelState*) {}
 void NoopFinalize(KernelContext*, Datum*) {}
 
 TEST(ScalarAggregateFunction, DispatchExact) {
-  ScalarAggregateFunction func("agg_test", Arity::Unary());
+  ScalarAggregateFunction func("agg_test", Arity::Unary(), /*doc=*/nullptr);
 
   std::vector<InputType> in_args = {ValueDescr::Array(int8())};
   ScalarAggregateKernel kernel(std::move(in_args), int64(), NoopInit, NoopConsume,
@@ -215,8 +215,7 @@ TEST(ScalarAggregateFunction, DispatchExact) {
   ASSERT_RAISES(Invalid, func.AddKernel(kernel));
 
   std::vector<ValueDescr> dispatch_args = {ValueDescr::Array(int8())};
-  ASSERT_OK_AND_ASSIGN(const ScalarAggregateKernel* selected_kernel,
-                       func.DispatchExact(dispatch_args));
+  ASSERT_OK_AND_ASSIGN(const Kernel* selected_kernel, func.DispatchExact(dispatch_args));
   ASSERT_EQ(func.kernels()[0], selected_kernel);
   ASSERT_TRUE(selected_kernel->signature->MatchesInputs(dispatch_args));
 

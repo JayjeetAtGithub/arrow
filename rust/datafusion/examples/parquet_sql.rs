@@ -22,12 +22,12 @@ use datafusion::prelude::*;
 
 /// This example demonstrates executing a simple query against an Arrow data source (Parquet) and
 /// fetching results
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // create local execution context
     let mut ctx = ExecutionContext::new();
 
-    let testdata =
-        std::env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::parquet_test_data();
 
     // register parquet file with the execution context
     ctx.register_parquet(
@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         FROM alltypes_plain \
         WHERE id > 1 AND tinyint_col < double_col",
     )?;
-    let results = df.collect()?;
+    let results = df.collect().await?;
 
     // print the results
     pretty::print_batches(&results)?;

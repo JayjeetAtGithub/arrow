@@ -22,11 +22,12 @@ use datafusion::prelude::*;
 
 /// This example demonstrates executing a simple query against an Arrow data source (CSV) and
 /// fetching results
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // create local execution context
     let mut ctx = ExecutionContext::new();
 
-    let testdata = std::env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::arrow_test_data();
 
     // register csv file with the execution context
     ctx.register_csv(
@@ -42,7 +43,7 @@ fn main() -> Result<()> {
         WHERE c11 > 0.1 AND c11 < 0.9 \
         GROUP BY c1",
     )?;
-    let results = df.collect()?;
+    let results = df.collect().await?;
 
     // print the results
     pretty::print_batches(&results)?;

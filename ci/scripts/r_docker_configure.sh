@@ -39,6 +39,37 @@ if [ "$RHUB_PLATFORM" = "linux-x86_64-fedora-clang" ]; then
   rm -rf $(${R_BIN} RHOME)/etc/Makeconf.bak
 fi
 
+# Special hacking to try to reproduce quirks on centos using non-default build
+# tooling.
+if [[ "$DEVTOOLSET_VERSION" -gt 0 ]]; then
+  if [ "`which dnf`" ]; then
+    dnf install -y centos-release-scl
+    dnf install -y "devtoolset-$DEVTOOLSET_VERSION"
+  else
+    yum install -y centos-release-scl
+    yum install -y "devtoolset-$DEVTOOLSET_VERSION"
+  fi
+fi
+
+# Install openssl for S3 support
+if [ "$ARROW_S3" == "ON" ] || [ "$ARROW_R_DEV" == "TRUE" ]; then
+  if [ "`which dnf`" ]; then
+    dnf install -y libcurl-devel openssl-devel
+  elif [ "`which yum`" ]; then
+    yum install -y libcurl-devel openssl-devel
+  elif [ "`which zypper`" ]; then
+    zypper install -y libcurl-devel libopenssl-devel
+  else
+    apt-get update
+    apt-get install -y libcurl4-openssl-dev libssl-dev
+  fi
+
+  # The Dockerfile should have put this file here
+  if [ -f "/arrow/ci/scripts/install_minio.sh" ] && [ "`which wget`" ]; then
+    /arrow/ci/scripts/install_minio.sh amd64 linux latest /usr/local
+  fi
+fi
+
 # Workaround for html help install failure; see https://github.com/r-lib/devtools/issues/2084#issuecomment-530912786
 Rscript -e 'x <- file.path(R.home("doc"), "html"); if (!file.exists(x)) {dir.create(x, recursive=TRUE); file.copy(system.file("html/R.css", package="stats"), x)}'
 

@@ -334,6 +334,88 @@ TYPED_TEST(TestStringKernels, MatchSubstring) {
                    &options_double_char_2);
 }
 
+TYPED_TEST(TestStringKernels, SplitBasics) {
+  SplitPatternOptions options{" "};
+  // basics
+  this->CheckUnary("split_pattern", R"(["foo bar", "foo"])", list(this->type()),
+                   R"([["foo", "bar"], ["foo"]])", &options);
+  this->CheckUnary("split_pattern", R"(["foo bar", "foo", null])", list(this->type()),
+                   R"([["foo", "bar"], ["foo"], null])", &options);
+  // edgy cases
+  this->CheckUnary("split_pattern", R"(["f  o o "])", list(this->type()),
+                   R"([["f", "", "o", "o", ""]])", &options);
+  this->CheckUnary("split_pattern", "[]", list(this->type()), "[]", &options);
+  // longer patterns
+  SplitPatternOptions options_long{"---"};
+  this->CheckUnary("split_pattern", R"(["-foo---bar--", "---foo---b"])",
+                   list(this->type()), R"([["-foo", "bar--"], ["", "foo", "b"]])",
+                   &options_long);
+  SplitPatternOptions options_long_reverse{"---", -1, /*reverse=*/true};
+  this->CheckUnary("split_pattern", R"(["-foo---bar--", "---foo---b"])",
+                   list(this->type()), R"([["-foo", "bar--"], ["", "foo", "b"]])",
+                   &options_long_reverse);
+}
+
+TYPED_TEST(TestStringKernels, SplitMax) {
+  SplitPatternOptions options{"---", 2};
+  SplitPatternOptions options_reverse{"---", 2, /*reverse=*/true};
+  this->CheckUnary("split_pattern", R"(["foo---bar", "foo", "foo---bar------ar"])",
+                   list(this->type()),
+                   R"([["foo", "bar"], ["foo"], ["foo", "bar", "---ar"]])", &options);
+  this->CheckUnary(
+      "split_pattern", R"(["foo---bar", "foo", "foo---bar------ar"])", list(this->type()),
+      R"([["foo", "bar"], ["foo"], ["foo---bar", "", "ar"]])", &options_reverse);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceAscii) {
+  SplitOptions options;
+  SplitOptions options_max{1};
+  // basics
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar", "ba"]])",
+                   &options);
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar \tba"]])",
+                   &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceAsciiReverse) {
+  SplitOptions options{-1, /*reverse=*/true};
+  SplitOptions options_max{1, /*reverse=*/true};
+  // basics
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar", "ba"]])",
+                   &options);
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo  bar", "ba"]])",
+                   &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceUTF8) {
+  SplitOptions options;
+  SplitOptions options_max{1};
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar", "ba"]])", &options);
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar \tba"]])", &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceUTF8Reverse) {
+  SplitOptions options{-1, /*reverse=*/true};
+  SplitOptions options_max{1, /*reverse=*/true};
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar", "ba"]])", &options);
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   "[[\"foo\", \"bar\"], [\"foo\xe2\x80\x88  bar\", \"ba\"]]",
+                   &options_max);
+}
+
 TYPED_TEST(TestStringKernels, Strptime) {
   std::string input1 = R"(["5/1/2020", null, "12/11/1900"])";
   std::string output1 = R"(["2020-05-01", null, "1900-12-11"])";
@@ -344,6 +426,66 @@ TYPED_TEST(TestStringKernels, Strptime) {
 TYPED_TEST(TestStringKernels, StrptimeDoesNotProvideDefaultOptions) {
   auto input = ArrayFromJSON(this->type(), R"(["2020-05-01", null, "1900-12-11"])");
   ASSERT_RAISES(Invalid, CallFunction("strptime", {input}));
+}
+
+#ifdef ARROW_WITH_UTF8PROC
+
+TYPED_TEST(TestStringKernels, TrimWhitespaceUTF8) {
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_trim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"foo bar\"]");
+  this->CheckUnary("utf8_rtrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(),
+                   "[\" \\tfoo\", null, \"bar\", \" \xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("utf8_ltrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar  \", \"foo bar \"]");
+}
+
+TYPED_TEST(TestStringKernels, TrimUTF8) {
+  TrimOptions options{"ȺA"};
+  this->CheckUnary("utf8_trim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"fooȺAȺbar\"]", &options);
+  this->CheckUnary("utf8_ltrim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"fooȺAȺ\", null, \"barȺAȺ\", \"fooȺAȺbarA\"]",
+                   &options);
+  this->CheckUnary("utf8_rtrim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"ȺȺfoo\", null, \"bar\", \"ȺAȺfooȺAȺbar\"]",
+                   &options);
+
+  TrimOptions options_invalid{"ɑa\xFFɑ"};
+  auto input = ArrayFromJSON(this->type(), "[\"foo\"]");
+  EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr("Invalid UTF8"),
+                                  CallFunction("utf8_trim", {input}, &options_invalid));
+}
+#endif
+
+TYPED_TEST(TestStringKernels, TrimWhitespaceAscii) {
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("ascii_trim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"\xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("ascii_rtrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(),
+                   "[\" \\tfoo\", null, \"bar\", \" \xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("ascii_ltrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar  \", \"\xe2\x80\x88 foo bar \"]");
+}
+
+TYPED_TEST(TestStringKernels, TrimAscii) {
+  TrimOptions options{"BA"};
+  this->CheckUnary("ascii_trim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"fooBABbar\"]", &options);
+  this->CheckUnary("ascii_ltrim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"fooBAB\", null, \"barBAB\", \"fooBABbarA\"]",
+                   &options);
+  this->CheckUnary("ascii_rtrim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"BBfoo\", null, \"bar\", \"BABfooBABbar\"]",
+                   &options);
 }
 
 #ifdef ARROW_WITH_UTF8PROC

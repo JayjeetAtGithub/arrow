@@ -44,6 +44,10 @@ bool Scalar::Equals(const Scalar& other, const EqualOptions& options) const {
   return ScalarEquals(*this, other, options);
 }
 
+bool Scalar::ApproxEquals(const Scalar& other, const EqualOptions& options) const {
+  return ScalarApproxEquals(*this, other, options);
+}
+
 struct ScalarHashImpl {
   static std::hash<std::string> string_hash;
 
@@ -67,6 +71,14 @@ struct ScalarHashImpl {
 
   Status Visit(const Decimal128Scalar& s) {
     return StdHash(s.value.low_bits()) & StdHash(s.value.high_bits());
+  }
+
+  Status Visit(const Decimal256Scalar& s) {
+    Status status = Status::OK();
+    for (uint64_t elem : s.value.little_endian_array()) {
+      status &= StdHash(elem);
+    }
+    return status;
   }
 
   Status Visit(const BaseListScalar& s) { return ArrayHash(*s.value); }
@@ -171,6 +183,20 @@ FixedSizeListScalar::FixedSizeListScalar(std::shared_ptr<Array> value,
 FixedSizeListScalar::FixedSizeListScalar(std::shared_ptr<Array> value)
     : BaseListScalar(
           value, fixed_size_list(value->type(), static_cast<int32_t>(value->length()))) {}
+
+Result<std::shared_ptr<StructScalar>> StructScalar::Make(
+    ScalarVector values, std::vector<std::string> field_names) {
+  if (values.size() != field_names.size()) {
+    return Status::Invalid("Mismatching number of field names and child scalars");
+  }
+
+  FieldVector fields(field_names.size());
+  for (size_t i = 0; i < fields.size(); ++i) {
+    fields[i] = arrow::field(std::move(field_names[i]), values[i]->type);
+  }
+
+  return std::make_shared<StructScalar>(std::move(values), struct_(std::move(fields)));
+}
 
 Result<std::shared_ptr<Scalar>> StructScalar::field(FieldRef ref) const {
   ARROW_ASSIGN_OR_RAISE(auto path, ref.FindOne(*type));
@@ -327,7 +353,7 @@ struct ScalarParseImpl {
     return MakeScalar(std::move(type_), std::forward<Arg>(arg)).Value(&out_);
   }
 
-  Status FinishWithBuffer() { return Finish(Buffer::FromString(s_.to_string())); }
+  Status FinishWithBuffer() { return Finish(Buffer::FromString(std::string(s_))); }
 
   Result<std::shared_ptr<Scalar>> Finish() && {
     RETURN_NOT_OK(VisitTypeInline(*type_, this));
@@ -366,8 +392,9 @@ std::shared_ptr<Buffer> FormatToBuffer(Formatter&& formatter, const ScalarType& 
   if (!from.is_valid) {
     return Buffer::FromString("null");
   }
-  return formatter(
-      from.value, [&](util::string_view v) { return Buffer::FromString(v.to_string()); });
+  return formatter(from.value, [&](util::string_view v) {
+    return Buffer::FromString(std::string(v));
+  });
 }
 
 // error fallback

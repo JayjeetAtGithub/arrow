@@ -211,6 +211,10 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
 
   define_option(ARROW_DATASET "Build the Arrow Dataset Modules" OFF)
 
+  define_option(ARROW_RADOS "Build the Arrow Rados Dataset Modules" OFF)
+
+  define_option(ARROW_CLS "Build the Arrow Ceph Object Classes" OFF)
+
   define_option(ARROW_FILESYSTEM "Build the Arrow Filesystem Layer" OFF)
 
   define_option(ARROW_FLIGHT
@@ -255,6 +259,8 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
   define_option(ARROW_S3 "Build Arrow with S3 support (requires the AWS SDK for C++)" OFF)
 
   define_option(ARROW_TENSORFLOW "Build Arrow with TensorFlow support enabled" OFF)
+
+  define_option(ARROW_TESTING "Build the Arrow testing libraries" OFF)
 
   #----------------------------------------------------------------------
   set_option_category("Thirdparty toolchain")
@@ -316,6 +322,9 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
   define_option(ARROW_LZ4_USE_SHARED "Rely on lz4 shared libraries where relevant"
                 ${ARROW_DEPENDENCY_USE_SHARED})
 
+  define_option(ARROW_OPENSSL_USE_SHARED "Rely on OpenSSL shared libraries where relevant"
+                ${ARROW_DEPENDENCY_USE_SHARED})
+
   define_option(ARROW_PROTOBUF_USE_SHARED
                 "Rely on Protocol Buffers shared libraries where relevant"
                 ${ARROW_DEPENDENCY_USE_SHARED})
@@ -356,8 +365,14 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
   define_option(ARROW_WITH_ZLIB "Build with zlib compression" OFF)
   define_option(ARROW_WITH_ZSTD "Build with zstd compression" OFF)
 
-  define_option(ARROW_WITH_UTF8PROC
-                "Build with support for Unicode properties using the utf8proc library" ON)
+  define_option(
+    ARROW_WITH_UTF8PROC
+    "Build with support for Unicode properties using the utf8proc library;(only used if ARROW_COMPUTE is ON)"
+    ON)
+  define_option(
+    ARROW_WITH_RE2
+    "Build with support for regular expressions using the re2 library;(only used if ARROW_COMPUTE or ARROW_GANDIVA is ON)"
+    ON)
 
   #----------------------------------------------------------------------
   if(MSVC_TOOLCHAIN)
@@ -451,12 +466,10 @@ macro(validate_config)
       set(possible_values ${${name}_OPTION_POSSIBLE_VALUES})
       set(value "${${name}}")
       if(possible_values)
-        if(NOT CMAKE_VERSION VERSION_LESS "3.3")
-          if(NOT "${value}" IN_LIST possible_values)
-            message(
-              FATAL_ERROR "Configuration option ${name} got invalid value '${value}'. "
-                          "Allowed values: ${${name}_OPTION_ENUM}.")
-          endif()
+        if(NOT "${value}" IN_LIST possible_values)
+          message(
+            FATAL_ERROR "Configuration option ${name} got invalid value '${value}'. "
+                        "Allowed values: ${${name}_OPTION_ENUM}.")
         endif()
       endif()
     endforeach()
