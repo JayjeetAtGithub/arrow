@@ -20,142 +20,74 @@
 //! Example:
 //!
 //! ```
-//! use std::sync::Arc;
 //! use arrow::array::{ArrayRef, StringArray};
 //! use arrow::compute::concat;
 //!
-//! let arr = concat(&vec![
-//!     Arc::new(StringArray::from(vec!["hello", "world"])) as ArrayRef,
-//!     Arc::new(StringArray::from(vec!["!"])) as ArrayRef,
+//! let arr = concat(&[
+//!     &StringArray::from(vec!["hello", "world"]),
+//!     &StringArray::from(vec!["!"]),
 //! ]).unwrap();
 //! assert_eq!(arr.len(), 3);
 //! ```
 
+use std::sync::Arc;
+
 use crate::array::*;
-use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 
-use TimeUnit::*;
-
-/// Concatenate multiple `ArrayRef` with the same type.
-///
-/// Returns a new ArrayRef.
-pub fn concat(array_list: &[ArrayRef]) -> Result<ArrayRef> {
-    if array_list.is_empty() {
+/// Concatenate multiple [Array] of the same type into a single [ArrayRef].
+pub fn concat(arrays: &[&Array]) -> Result<ArrayRef> {
+    if arrays.is_empty() {
         return Err(ArrowError::ComputeError(
             "concat requires input of at least one array".to_string(),
         ));
     }
-    let array_data_list = &array_list
+
+    if arrays
         .iter()
-        .map(|a| a.data_ref().clone())
-        .collect::<Vec<ArrayDataRef>>();
-
-    match array_data_list[0].data_type() {
-        DataType::Utf8 => {
-            let mut builder = StringArray::builder(0);
-            builder.append_data(array_data_list)?;
-            Ok(ArrayBuilder::finish(&mut builder))
-        }
-        DataType::Boolean => {
-            let mut builder = PrimitiveArray::<BooleanType>::builder(0);
-            builder.append_data(array_data_list)?;
-            Ok(ArrayBuilder::finish(&mut builder))
-        }
-        DataType::Int8 => concat_primitive::<Int8Type>(array_data_list),
-        DataType::Int16 => concat_primitive::<Int16Type>(array_data_list),
-        DataType::Int32 => concat_primitive::<Int32Type>(array_data_list),
-        DataType::Int64 => concat_primitive::<Int64Type>(array_data_list),
-        DataType::UInt8 => concat_primitive::<UInt8Type>(array_data_list),
-        DataType::UInt16 => concat_primitive::<UInt16Type>(array_data_list),
-        DataType::UInt32 => concat_primitive::<UInt32Type>(array_data_list),
-        DataType::UInt64 => concat_primitive::<UInt64Type>(array_data_list),
-        DataType::Float32 => concat_primitive::<Float32Type>(array_data_list),
-        DataType::Float64 => concat_primitive::<Float64Type>(array_data_list),
-        DataType::Date32(_) => concat_primitive::<Date32Type>(array_data_list),
-        DataType::Date64(_) => concat_primitive::<Date64Type>(array_data_list),
-        DataType::Time32(Second) => concat_primitive::<Time32SecondType>(array_data_list),
-        DataType::Time32(Millisecond) => {
-            concat_primitive::<Time32MillisecondType>(array_data_list)
-        }
-        DataType::Time64(Microsecond) => {
-            concat_primitive::<Time64MicrosecondType>(array_data_list)
-        }
-        DataType::Time64(Nanosecond) => {
-            concat_primitive::<Time64NanosecondType>(array_data_list)
-        }
-        DataType::Timestamp(Second, _) => {
-            concat_primitive::<TimestampSecondType>(array_data_list)
-        }
-        DataType::Timestamp(Millisecond, _) => {
-            concat_primitive::<TimestampMillisecondType>(array_data_list)
-        }
-        DataType::Timestamp(Microsecond, _) => {
-            concat_primitive::<TimestampMicrosecondType>(array_data_list)
-        }
-        DataType::Timestamp(Nanosecond, _) => {
-            concat_primitive::<TimestampNanosecondType>(array_data_list)
-        }
-        DataType::Interval(IntervalUnit::YearMonth) => {
-            concat_primitive::<IntervalYearMonthType>(array_data_list)
-        }
-        DataType::Interval(IntervalUnit::DayTime) => {
-            concat_primitive::<IntervalDayTimeType>(array_data_list)
-        }
-        DataType::Duration(TimeUnit::Second) => {
-            concat_primitive::<DurationSecondType>(array_data_list)
-        }
-        DataType::Duration(TimeUnit::Millisecond) => {
-            concat_primitive::<DurationMillisecondType>(array_data_list)
-        }
-        DataType::Duration(TimeUnit::Microsecond) => {
-            concat_primitive::<DurationMicrosecondType>(array_data_list)
-        }
-        DataType::Duration(TimeUnit::Nanosecond) => {
-            concat_primitive::<DurationNanosecondType>(array_data_list)
-        }
-        t => Err(ArrowError::ComputeError(format!(
-            "Concat not supported for data type {:?}",
-            t
-        ))),
+        .any(|array| array.data_type() != arrays[0].data_type())
+    {
+        return Err(ArrowError::InvalidArgumentError(
+            "It is not possible to concatenate arrays of different data types."
+                .to_string(),
+        ));
     }
-}
 
-#[inline]
-fn concat_primitive<T>(array_data_list: &[ArrayDataRef]) -> Result<ArrayRef>
-where
-    T: ArrowNumericType,
-{
-    let mut builder = PrimitiveArray::<T>::builder(0);
-    builder.append_data(array_data_list)?;
-    Ok(ArrayBuilder::finish(&mut builder))
+    let lengths = arrays.iter().map(|array| array.len()).collect::<Vec<_>>();
+    let capacity = lengths.iter().sum();
+
+    let arrays = arrays
+        .iter()
+        .map(|a| a.data_ref().as_ref())
+        .collect::<Vec<_>>();
+
+    let mut mutable = MutableArrayData::new(arrays, false, capacity);
+
+    for (i, len) in lengths.iter().enumerate() {
+        mutable.extend(i, 0, *len)
+    }
+
+    Ok(make_array(Arc::new(mutable.freeze())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datatypes::*;
     use std::sync::Arc;
 
     #[test]
     fn test_concat_empty_vec() -> Result<()> {
-        let re = concat(&vec![]);
+        let re = concat(&[]);
         assert!(re.is_err());
         Ok(())
     }
 
     #[test]
     fn test_concat_incompatible_datatypes() -> Result<()> {
-        let re = concat(&vec![
-            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
-                Some(-1),
-                Some(2),
-                None,
-            ])) as ArrayRef,
-            Arc::new(StringArray::from(vec![
-                Some("hello"),
-                Some("bar"),
-                Some("world"),
-            ])) as ArrayRef,
+        let re = concat(&[
+            &PrimitiveArray::<Int64Type>::from(vec![Some(-1), Some(2), None]),
+            &StringArray::from(vec![Some("hello"), Some("bar"), Some("world")]),
         ]);
         assert!(re.is_err());
         Ok(())
@@ -163,15 +95,10 @@ mod tests {
 
     #[test]
     fn test_concat_string_arrays() -> Result<()> {
-        let arr = concat(&vec![
-            Arc::new(StringArray::from(vec![Some("hello"), Some("world")])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["1", "2", "3", "4", "6"])).slice(1, 3),
-            Arc::new(StringArray::from(vec![
-                Some("foo"),
-                Some("bar"),
-                None,
-                Some("baz"),
-            ])) as ArrayRef,
+        let arr = concat(&[
+            &StringArray::from(vec!["hello", "world"]),
+            &StringArray::from(vec!["2", "3", "4"]),
+            &StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]),
         ])?;
 
         let expected_output = Arc::new(StringArray::from(vec![
@@ -186,37 +113,28 @@ mod tests {
             Some("baz"),
         ])) as ArrayRef;
 
-        assert!(
-            arr.equals(&(*expected_output)),
-            "expect {:#?} to be: {:#?}",
-            arr,
-            &expected_output
-        );
+        assert_eq!(&arr, &expected_output);
 
         Ok(())
     }
 
     #[test]
     fn test_concat_primitive_arrays() -> Result<()> {
-        let arr = concat(&vec![
-            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+        let arr = concat(&[
+            &PrimitiveArray::<Int64Type>::from(vec![
                 Some(-1),
                 Some(-1),
                 Some(2),
                 None,
                 None,
-            ])) as ArrayRef,
-            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+            ]),
+            &PrimitiveArray::<Int64Type>::from(vec![
                 Some(101),
                 Some(102),
                 Some(103),
                 None,
-            ])) as ArrayRef,
-            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
-                Some(256),
-                Some(512),
-                Some(1024),
-            ])) as ArrayRef,
+            ]),
+            &PrimitiveArray::<Int64Type>::from(vec![Some(256), Some(512), Some(1024)]),
         ])?;
 
         let expected_output = Arc::new(PrimitiveArray::<Int64Type>::from(vec![
@@ -234,36 +152,60 @@ mod tests {
             Some(1024),
         ])) as ArrayRef;
 
-        assert!(
-            arr.equals(&(*expected_output)),
-            "expect {:#?} to be: {:#?}",
-            arr,
-            &expected_output
-        );
+        assert_eq!(&arr, &expected_output);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concat_primitive_array_slices() -> Result<()> {
+        let input_1 = PrimitiveArray::<Int64Type>::from(vec![
+            Some(-1),
+            Some(-1),
+            Some(2),
+            None,
+            None,
+        ])
+        .slice(1, 3);
+
+        let input_2 = PrimitiveArray::<Int64Type>::from(vec![
+            Some(101),
+            Some(102),
+            Some(103),
+            None,
+        ])
+        .slice(1, 3);
+        let arr = concat(&[input_1.as_ref(), input_2.as_ref()])?;
+
+        let expected_output = Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+            Some(-1),
+            Some(2),
+            None,
+            Some(102),
+            Some(103),
+            None,
+        ])) as ArrayRef;
+
+        assert_eq!(&arr, &expected_output);
 
         Ok(())
     }
 
     #[test]
     fn test_concat_boolean_primitive_arrays() -> Result<()> {
-        let arr = concat(&vec![
-            Arc::new(PrimitiveArray::<BooleanType>::from(vec![
+        let arr = concat(&[
+            &BooleanArray::from(vec![
                 Some(true),
                 Some(true),
                 Some(false),
                 None,
                 None,
                 Some(false),
-            ])) as ArrayRef,
-            Arc::new(PrimitiveArray::<BooleanType>::from(vec![
-                None,
-                Some(false),
-                Some(true),
-                Some(false),
-            ])) as ArrayRef,
+            ]),
+            &BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]),
         ])?;
 
-        let expected_output = Arc::new(PrimitiveArray::<BooleanType>::from(vec![
+        let expected_output = Arc::new(BooleanArray::from(vec![
             Some(true),
             Some(true),
             Some(false),
@@ -276,12 +218,175 @@ mod tests {
             Some(false),
         ])) as ArrayRef;
 
-        assert!(
-            arr.equals(&(*expected_output)),
-            "expect {:#?} to be: {:#?}",
-            arr,
-            &expected_output
-        );
+        assert_eq!(&arr, &expected_output);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concat_primitive_list_arrays() -> Result<()> {
+        fn populate_list1(
+            b: &mut ListBuilder<PrimitiveBuilder<Int64Type>>,
+        ) -> Result<()> {
+            b.values().append_value(-1)?;
+            b.values().append_value(-1)?;
+            b.values().append_value(2)?;
+            b.values().append_null()?;
+            b.values().append_null()?;
+            b.append(true)?;
+            b.append(true)?;
+            b.append(false)?;
+            b.values().append_value(10)?;
+            b.append(true)?;
+            Ok(())
+        }
+
+        fn populate_list2(
+            b: &mut ListBuilder<PrimitiveBuilder<Int64Type>>,
+        ) -> Result<()> {
+            b.append(false)?;
+            b.values().append_value(100)?;
+            b.values().append_null()?;
+            b.values().append_value(101)?;
+            b.append(true)?;
+            b.values().append_value(102)?;
+            b.append(true)?;
+            Ok(())
+        }
+
+        fn populate_list3(
+            b: &mut ListBuilder<PrimitiveBuilder<Int64Type>>,
+        ) -> Result<()> {
+            b.values().append_value(1000)?;
+            b.values().append_value(1001)?;
+            b.append(true)?;
+            Ok(())
+        }
+
+        let mut builder_in1 = ListBuilder::new(PrimitiveArray::<Int64Type>::builder(0));
+        let mut builder_in2 = ListBuilder::new(PrimitiveArray::<Int64Type>::builder(0));
+        let mut builder_in3 = ListBuilder::new(PrimitiveArray::<Int64Type>::builder(0));
+        populate_list1(&mut builder_in1)?;
+        populate_list2(&mut builder_in2)?;
+        populate_list3(&mut builder_in3)?;
+
+        let mut builder_expected =
+            ListBuilder::new(PrimitiveArray::<Int64Type>::builder(0));
+        populate_list1(&mut builder_expected)?;
+        populate_list2(&mut builder_expected)?;
+        populate_list3(&mut builder_expected)?;
+
+        let array_result = concat(&[
+            &builder_in1.finish(),
+            &builder_in2.finish(),
+            &builder_in3.finish(),
+        ])?;
+
+        let array_expected = Arc::new(builder_expected.finish()) as ArrayRef;
+
+        assert_eq!(&array_result, &array_expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concat_struct_arrays() -> Result<()> {
+        let field = Field::new("field", DataType::Int64, true);
+        let input_primitive_1: ArrayRef =
+            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(-1),
+                Some(-1),
+                Some(2),
+                None,
+                None,
+            ]));
+        let input_struct_1 = StructArray::from(vec![(field.clone(), input_primitive_1)]);
+
+        let input_primitive_2: ArrayRef =
+            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(101),
+                Some(102),
+                Some(103),
+                None,
+            ]));
+        let input_struct_2 = StructArray::from(vec![(field.clone(), input_primitive_2)]);
+
+        let input_primitive_3: ArrayRef =
+            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(256),
+                Some(512),
+                Some(1024),
+            ]));
+        let input_struct_3 = StructArray::from(vec![(field, input_primitive_3)]);
+
+        let arr = concat(&[&input_struct_1, &input_struct_2, &input_struct_3])?;
+
+        let expected_primitive_output = Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+            Some(-1),
+            Some(-1),
+            Some(2),
+            None,
+            None,
+            Some(101),
+            Some(102),
+            Some(103),
+            None,
+            Some(256),
+            Some(512),
+            Some(1024),
+        ])) as ArrayRef;
+
+        let actual_primitive = arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0);
+        assert_eq!(actual_primitive, &expected_primitive_output);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concat_struct_array_slices() -> Result<()> {
+        let field = Field::new("field", DataType::Int64, true);
+        let input_primitive_1: ArrayRef =
+            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(-1),
+                Some(-1),
+                Some(2),
+                None,
+                None,
+            ]));
+        let input_struct_1 = StructArray::from(vec![(field.clone(), input_primitive_1)]);
+
+        let input_primitive_2: ArrayRef =
+            Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(101),
+                Some(102),
+                Some(103),
+                None,
+            ]));
+        let input_struct_2 = StructArray::from(vec![(field, input_primitive_2)]);
+
+        let arr = concat(&[
+            input_struct_1.slice(1, 3).as_ref(),
+            input_struct_2.slice(1, 2).as_ref(),
+        ])?;
+
+        let expected_primitive_output = Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+            Some(-1),
+            Some(2),
+            None,
+            Some(102),
+            Some(103),
+        ])) as ArrayRef;
+
+        let actual_primitive = arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0);
+        assert_eq!(actual_primitive, &expected_primitive_output);
 
         Ok(())
     }

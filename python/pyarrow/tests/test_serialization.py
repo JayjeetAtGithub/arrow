@@ -21,6 +21,7 @@ import pytest
 import collections
 import datetime
 import os
+import pathlib
 import pickle
 import subprocess
 import string
@@ -50,6 +51,11 @@ try:
     import sparse
 except ImportError:
     sparse = None
+
+
+# ignore all serialization deprecation warnings in this file, we test that the
+# warnings are actually raised in test_serialization_deprecated.py
+pytestmark = pytest.mark.filterwarnings("ignore:'pyarrow:FutureWarning")
 
 
 def assert_equal(obj1, obj2):
@@ -233,7 +239,8 @@ CUSTOM_OBJECTS = [Exception("Test object."), CustomError(), Point(11, y=22),
 
 
 def make_serialization_context():
-    context = pa.default_serialization_context()
+    with pytest.warns(FutureWarning):
+        context = pa.default_serialization_context()
 
     context.register_type(Foo, "Foo")
     context.register_type(Bar, "Bar")
@@ -1136,10 +1143,8 @@ def test_set_pickle():
     assert deserialized == b'custom serialization 2'
 
 
-@pytest.mark.skipif(sys.version_info < (3, 6), reason="need Python 3.6")
 def test_path_objects(tmpdir):
     # Test compatibility with PEP 519 path-like objects
-    import pathlib
     p = pathlib.Path(tmpdir) / 'zzz.bin'
     obj = 1234
     pa.serialize_to(obj, p)

@@ -29,9 +29,8 @@
 #include "rapidjson/reader.h"
 
 #include "arrow/array.h"
+#include "arrow/array/builder_binary.h"
 #include "arrow/buffer_builder.h"
-#include "arrow/builder.h"
-#include "arrow/memory_pool.h"
 #include "arrow/type.h"
 #include "arrow/util/bitset_stack.h"
 #include "arrow/util/logging.h"
@@ -155,10 +154,11 @@ struct BuilderPtr {
 
   bool operator!() const { return *this == null; }
 
+  // The static BuilderPtr for null type data
   static const BuilderPtr null;
 };
 
-const BuilderPtr BuilderPtr::null(Kind::kNull, 0, false);
+const BuilderPtr BuilderPtr::null(Kind::kNull, 0, true);
 
 template <>
 class RawArrayBuilder<Kind::kBoolean> {
@@ -372,7 +372,7 @@ class RawArrayBuilder<Kind::kObject> {
       std::shared_ptr<Array> field_values;
       RETURN_NOT_OK(finish_child(field_builders_[i], &field_values));
       child_data[i] = field_values->data();
-      fields[i] = field(field_names[i].to_string(), field_values->type(),
+      fields[i] = field(std::string(field_names[i]), field_values->type(),
                         field_builders_[i].nullable, Kind::Tag(field_builders_[i].kind));
     }
 

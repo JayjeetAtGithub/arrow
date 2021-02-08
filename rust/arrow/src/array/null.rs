@@ -52,6 +52,12 @@ impl NullArray {
         let array_data = ArrayData::builder(DataType::Null).len(length).build();
         NullArray::from(array_data)
     }
+
+    /// Create a new null array of the specified length and type
+    pub fn new_with_type(length: usize, data_type: DataType) -> Self {
+        let array_data = ArrayData::builder(data_type).len(length).build();
+        NullArray::from(array_data)
+    }
 }
 
 impl Array for NullArray {
@@ -113,7 +119,7 @@ impl From<ArrayDataRef> for NullArray {
 
 impl fmt::Debug for NullArray {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "NullArray")
+        write!(f, "NullArray({})", self.len())
     }
 }
 
@@ -145,5 +151,20 @@ mod tests {
         assert_eq!(array2.len(), 16);
         assert_eq!(array2.null_count(), 16);
         assert_eq!(array2.offset(), 8);
+    }
+
+    #[test]
+    fn test_null_array_new_with_type() {
+        let length = 10;
+        let data_type = DataType::Int8;
+        let array = NullArray::new_with_type(length, data_type.clone());
+        assert_eq!(array.len(), length);
+        assert_eq!(array.data_type(), &data_type);
+    }
+
+    #[test]
+    fn test_debug_null_array() {
+        let array = NullArray::new(1024 * 1024);
+        assert_eq!(format!("{:?}", array), "NullArray(1048576)");
     }
 }

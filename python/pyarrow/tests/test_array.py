@@ -386,6 +386,10 @@ def test_array_getitem():
         with pytest.raises(IndexError):
             arr[idx]
 
+    # check that numpy scalars are supported
+    for idx in range(-len(arr), len(arr)):
+        assert arr[np.int32(idx)].as_py() == lst[idx]
+
 
 def test_array_slice():
     arr = pa.array(range(10))
@@ -403,6 +407,8 @@ def test_array_slice():
 
     # Slice past end of array
     assert len(arr.slice(len(arr))) == 0
+    assert len(arr.slice(len(arr) + 2)) == 0
+    assert len(arr.slice(len(arr) + 2, 100)) == 0
 
     with pytest.raises(IndexError):
         arr.slice(-1)
@@ -1277,7 +1283,7 @@ def test_decimal_to_int_non_integer():
 
     for case in non_integer_cases:
         # test safe casting raises
-        msg_regexp = 'Rescaling decimal value would cause data loss'
+        msg_regexp = 'Rescaling Decimal128 value would cause data loss'
         with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
             _check_cast_case(case)
 
@@ -1296,8 +1302,8 @@ def test_decimal_to_decimal():
     )
     assert result.equals(expected)
 
-    with pytest.raises(pa.ArrowInvalid,
-                       match='Rescaling decimal value would cause data loss'):
+    msg_regexp = 'Rescaling Decimal128 value would cause data loss'
+    with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
         result = arr.cast(pa.decimal128(9, 1))
 
     result = arr.cast(pa.decimal128(9, 1), safe=False)
@@ -2140,12 +2146,12 @@ def test_buffers_nested():
     assert bytearray(null_bitmap)[0] == 0b00000101
     # The child buffers: 'a'
     null_bitmap = buffers[1].to_pybytes()
-    assert bytearray(null_bitmap)[0] == 0b00000001
+    assert bytearray(null_bitmap)[0] == 0b00000011
     values = buffers[2].to_pybytes()
     assert struct.unpack('bxx', values) == (42,)
     # The child buffers: 'b'
     null_bitmap = buffers[3].to_pybytes()
-    assert bytearray(null_bitmap)[0] == 0b00000100
+    assert bytearray(null_bitmap)[0] == 0b00000110
     values = buffers[4].to_pybytes()
     assert struct.unpack('4xh', values) == (43,)
 
@@ -2513,9 +2519,20 @@ def test_numpy_binary_overflow_to_chunked():
 
 @pytest.mark.large_memory
 def test_list_child_overflow_to_chunked():
-    vals = [['x' * 1024]] * ((2 << 20) + 1)
-    with pytest.raises(ValueError, match="overflowed"):
-        pa.array(vals)
+    kilobyte_string = 'x' * 1024
+    two_mega = 2**21
+
+    vals = [[kilobyte_string]] * (two_mega - 1)
+    arr = pa.array(vals)
+    assert isinstance(arr, pa.Array)
+    assert len(arr) == two_mega - 1
+
+    vals = [[kilobyte_string]] * two_mega
+    arr = pa.array(vals)
+    assert isinstance(arr, pa.ChunkedArray)
+    assert len(arr) == two_mega
+    assert len(arr.chunk(0)) == two_mega - 1
+    assert len(arr.chunk(1)) == 1
 
 
 def test_infer_type_masked():
@@ -2543,6 +2560,32 @@ def test_array_masked():
     arr = pa.array(np.array([4, None, 4, 3.], dtype="O"),
                    mask=np.array([False, True, False, True]))
     assert arr.type == pa.int64()
+
+
+def test_array_invalid_mask_raises():
+    # ARROW-10742
+    cases = [
+        ([1, 2], np.array([False, False], dtype="O"),
+         pa.ArrowInvalid, "must be boolean dtype"),
+
+        ([1, 2], np.array([[False], [False]]),
+         pa.ArrowInvalid, "must be 1D array"),
+
+        ([1, 2, 3], np.array([False, False]),
+         pa.ArrowInvalid, "different length"),
+
+        (np.array([1, 2]), np.array([False, False], dtype="O"),
+         TypeError, "must be boolean dtype"),
+
+        (np.array([1, 2]), np.array([[False], [False]]),
+         ValueError, "must be 1D array"),
+
+        (np.array([1, 2, 3]), np.array([False, False]),
+         ValueError, "different length"),
+    ]
+    for obj, mask, ex, msg in cases:
+        with pytest.raises(ex, match=msg):
+            pa.array(obj, mask=mask)
 
 
 def test_array_from_large_pyints():

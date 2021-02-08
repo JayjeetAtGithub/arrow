@@ -23,7 +23,8 @@ from pyarrow.includes.libarrow cimport (CChunkedArray, CSchema, CStatus,
                                         CTable, CMemoryPool, CBuffer,
                                         CKeyValueMetadata,
                                         CRandomAccessFile, COutputStream,
-                                        TimeUnit)
+                                        TimeUnit, CRecordBatchReader)
+from pyarrow.lib cimport _Weakrefable
 
 
 cdef extern from "parquet/api/schema.h" namespace "parquet::schema" nogil:
@@ -240,6 +241,7 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         int64_t distinct_count() const
         int64_t num_values() const
         bint HasMinMax()
+        c_bool Equals(const CStatistics&) const
         void Reset()
         c_string EncodeMin()
         c_string EncodeMax()
@@ -288,6 +290,7 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         shared_ptr[CStatistics] statistics() const
         ParquetCompression compression() const
         const vector[ParquetEncoding]& encodings() const
+        c_bool Equals(const CColumnChunkMetaData&) const
 
         int64_t has_dictionary_page() const
         int64_t dictionary_page_offset() const
@@ -297,12 +300,14 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         int64_t total_uncompressed_size() const
 
     cdef cppclass CRowGroupMetaData" parquet::RowGroupMetaData":
+        c_bool Equals(const CRowGroupMetaData&) const
         int num_columns()
         int64_t num_rows()
         int64_t total_byte_size()
         unique_ptr[CColumnChunkMetaData] ColumnChunk(int i) const
 
     cdef cppclass CFileMetaData" parquet::FileMetaData":
+        c_bool Equals(const CFileMetaData&) const
         uint32_t size()
         int num_columns()
         int64_t num_rows()
@@ -335,7 +340,7 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         ArrowReaderProperties()
         void set_read_dictionary(int column_index, c_bool read_dict)
         c_bool read_dictionary()
-        void set_batch_size()
+        void set_batch_size(int64_t batch_size)
         int64_t batch_size()
 
     ArrowReaderProperties default_arrow_reader_properties()
@@ -402,6 +407,12 @@ cdef extern from "parquet/arrow/reader.h" namespace "parquet::arrow" nogil:
                               const vector[int]& column_indices,
                               shared_ptr[CTable]* out)
 
+        CStatus GetRecordBatchReader(const vector[int]& row_group_indices,
+                                     const vector[int]& column_indices,
+                                     unique_ptr[CRecordBatchReader]* out)
+        CStatus GetRecordBatchReader(const vector[int]& row_group_indices,
+                                     unique_ptr[CRecordBatchReader]* out)
+
         CStatus ReadTable(shared_ptr[CTable]* out)
         CStatus ReadTable(const vector[int]& column_indices,
                           shared_ptr[CTable]* out)
@@ -412,6 +423,8 @@ cdef extern from "parquet/arrow/reader.h" namespace "parquet::arrow" nogil:
         const ParquetFileReader* parquet_reader()
 
         void set_use_threads(c_bool use_threads)
+
+        void set_batch_size(int64_t batch_size)
 
     cdef cppclass FileReaderBuilder:
         FileReaderBuilder()
@@ -489,3 +502,46 @@ cdef shared_ptr[ArrowWriterProperties] _create_arrow_writer_properties(
     coerce_timestamps=*,
     allow_truncated_timestamps=*,
     writer_engine_version=*) except *
+
+cdef class ParquetSchema(_Weakrefable):
+    cdef:
+        FileMetaData parent  # the FileMetaData owning the SchemaDescriptor
+        const SchemaDescriptor* schema
+
+cdef class FileMetaData(_Weakrefable):
+    cdef:
+        shared_ptr[CFileMetaData] sp_metadata
+        CFileMetaData* _metadata
+        ParquetSchema _schema
+
+    cdef inline init(self, const shared_ptr[CFileMetaData]& metadata):
+        self.sp_metadata = metadata
+        self._metadata = metadata.get()
+
+cdef class RowGroupMetaData(_Weakrefable):
+    cdef:
+        int index  # for pickling support
+        unique_ptr[CRowGroupMetaData] up_metadata
+        CRowGroupMetaData* metadata
+        FileMetaData parent
+
+cdef class ColumnChunkMetaData(_Weakrefable):
+    cdef:
+        unique_ptr[CColumnChunkMetaData] up_metadata
+        CColumnChunkMetaData* metadata
+        RowGroupMetaData parent
+
+    cdef inline init(self, RowGroupMetaData parent, int i):
+        self.up_metadata = parent.metadata.ColumnChunk(i)
+        self.metadata = self.up_metadata.get()
+        self.parent = parent
+
+cdef class Statistics(_Weakrefable):
+    cdef:
+        shared_ptr[CStatistics] statistics
+        ColumnChunkMetaData parent
+
+    cdef inline init(self, const shared_ptr[CStatistics]& statistics,
+                     ColumnChunkMetaData parent):
+        self.statistics = statistics
+        self.parent = parent

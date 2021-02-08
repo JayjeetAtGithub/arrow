@@ -83,18 +83,19 @@ class ApacheArrowPackageTask < PackageTask
     end
   end
 
-  def detect_llvm_version
-    detect_env("LLVM")
+  def apt_arm64_cuda_available_target?(target)
+    # ubuntu-20.10 has navidia-cuda-toolkit but not libcuda1.
+    # ubuntu-21.04 may support this.
+    false
   end
 
-  def docker_image(os, architecture)
-    "#{super}-llvm-#{detect_llvm_version}"
-  end
-
-  def docker_build_options(os, architecture)
-    [
-      "--build-arg", "LLVM=#{detect_llvm_version}",
-    ]
+  def apt_prepare_debian_control(control_in, target)
+    if apt_arm64_cuda_available_target?(target)
+      cuda_architecture = "any"
+    else
+      cuda_architecture = "i386 amd64"
+    end
+    control_in.gsub(/@CUDA_ARCHITECTURE@/, cuda_architecture)
   end
 end
 

@@ -44,17 +44,8 @@
 #include "arrow/util/ubsan.h"
 
 #define XXH_INLINE_ALL
-#define XXH_PRIVATE_API
-#define XXH_NAMESPACE arrow_hashing_
 
 #include "arrow/vendored/xxhash.h"  // IWYU pragma: keep
-
-// ARROW-9415: See https://github.com/Cyan4973/xxHash/pull/426. altivec.h on
-// gcc leaks the "bool" define which causes a compilation failure on Power9
-// architecture.
-#if XXH_VECTOR == XXH_VSX  // altivec
-#undef bool
-#endif
 
 namespace arrow {
 namespace internal {
@@ -699,7 +690,8 @@ class BinaryMemoTable : public MemoTable {
     DCHECK_LE(start, size());
 
     const builder_offset_type* offsets = binary_builder_.offsets_data();
-    const builder_offset_type delta = offsets[start];
+    const builder_offset_type delta =
+        start < binary_builder_.length() ? offsets[start] : 0;
     for (int32_t i = start; i < size(); ++i) {
       const builder_offset_type adjusted_offset = offsets[i] - delta;
       Offset cast_offset = static_cast<Offset>(adjusted_offset);
@@ -848,6 +840,11 @@ struct HashTraits<T, enable_if_t<has_c_type<T>::value && !is_8bit_int<T>::value>
 template <typename T>
 struct HashTraits<T, enable_if_t<has_string_view<T>::value &&
                                  !std::is_base_of<LargeBinaryType, T>::value>> {
+  using MemoTableType = BinaryMemoTable<BinaryBuilder>;
+};
+
+template <typename T>
+struct HashTraits<T, enable_if_decimal<T>> {
   using MemoTableType = BinaryMemoTable<BinaryBuilder>;
 };
 

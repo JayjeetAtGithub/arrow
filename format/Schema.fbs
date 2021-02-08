@@ -110,10 +110,11 @@ table FixedSizeList {
 /// not enforced.
 ///
 /// Map
+/// ```text
 ///   - child[0] entries: Struct
 ///     - child[0] key: K
 ///     - child[1] value: V
-///
+/// ```
 /// Neither the "entries" field nor the "key" field may be nullable.
 ///
 /// The metadata is structured so that Arrow systems without special handling
@@ -129,7 +130,7 @@ enum UnionMode:short { Sparse, Dense }
 /// A union is a complex type with children in Field
 /// By default ids in the type vector refer to the offsets in the children
 /// optionally typeIds provides an indirection between the child offset and the type id
-/// for each child typeIds[offset] is the id used in the type vector
+/// for each child `typeIds[offset]` is the id used in the type vector
 table Union {
   mode: UnionMode;
   typeIds: [ int ]; // optional, describes typeid of each child.
@@ -173,8 +174,8 @@ table Bool {
 }
 
 /// Exact decimal value represented as an integer value in two's
-/// complement. Currently only 128-bit (16-byte) integers are used but this may
-/// be expanded in the future. The representation uses the endianness indicated
+/// complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
+/// are used. The representation uses the endianness indicated
 /// in the Schema.
 table Decimal {
   /// Total number of decimal digits
@@ -183,10 +184,8 @@ table Decimal {
   /// Number of digits after the decimal point "."
   scale: int;
 
-  /// Number of bits per value. The only accepted width right now is 128 but
-  /// this field exists for forward compatibility so that other bit widths may
-  /// be supported in future format versions. We use bitWidth for consistency
-  /// with Int::bitWidth.
+  /// Number of bits per value. The only accepted widths are 128 and 256.
+  /// We use bitWidth for consistency with Int::bitWidth.
   bitWidth: int = 128;
 }
 

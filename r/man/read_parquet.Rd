@@ -8,12 +8,13 @@ read_parquet(
   file,
   col_select = NULL,
   as_data_frame = TRUE,
-  props = ParquetReaderProperties$create(),
+  props = ParquetArrowReaderProperties$create(),
   ...
 )
 }
 \arguments{
-\item{file}{A character file name or URI, \code{raw} vector, or an Arrow input stream.
+\item{file}{A character file name or URI, \code{raw} vector, an Arrow input stream,
+or a \code{FileSystem} with path (\code{SubTreeFileSystem}).
 If a file name or URI, an Arrow \link{InputStream} will be opened and
 closed when finished. If an input stream is provided, it will be left
 open.}
@@ -26,7 +27,7 @@ of columns, as used in \code{dplyr::select()}.}
 \item{as_data_frame}{Should the function return a \code{data.frame} (default) or
 an Arrow \link{Table}?}
 
-\item{props}{\link{ParquetReaderProperties}}
+\item{props}{\link{ParquetArrowReaderProperties}}
 
 \item{...}{Additional arguments passed to \code{ParquetFileReader$create()}}
 }
