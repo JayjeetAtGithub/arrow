@@ -44,7 +44,7 @@ class RandomAccessObject : public arrow::io::RandomAccessFile {
 
   arrow::Status Init() {
     uint64_t size;
-    int e = cls_cxx_stat(hctx_, &size, NULL);
+    int e = cluster_->ioCtx->stat(oid_, &size);
     if (e == 0) {
       content_length_ = size;
       return arrow::Status::OK();

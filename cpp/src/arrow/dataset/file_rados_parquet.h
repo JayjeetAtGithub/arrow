@@ -114,7 +114,7 @@ class ARROW_DS_EXPORT DirectObjectAccess {
 
   Status Exec(const std::string& path, const std::string& fn, ceph::bufferlist& in,
               ceph::bufferlist& out) {
-    auto oid = ConvertFileNameToObjectID(path);
+    ARROW_ASSIGN_OR_RAISE(auto oid, ConvertFileNameToObjectID(path));
 
     if (cluster_->ioCtx->read(oid.c_str(), out, 0, 0)) {
       return Status::ExecutionError("librados::read returned non-zero exit code.");
