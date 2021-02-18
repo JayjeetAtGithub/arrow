@@ -111,9 +111,8 @@ class ARROW_DS_EXPORT DirectObjectAccess {
     ss << std::hex << inode;
     std::string oid(ss.str() + ".00000000");
 
-    if (cluster_->ioCtx->exec(oid.c_str(), cluster_->cls_name.c_str(), fn.c_str(), in,
-                              out)) {
-      return Status::ExecutionError("librados::exec returned non-zero exit code.");
+    if (cluster_->ioCtx->read(oid.c_str(), out, 0, 0)) {
+      return Status::ExecutionError("librados::read returned non-zero exit code.");
     }
 
     return Status::OK();
