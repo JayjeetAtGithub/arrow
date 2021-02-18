@@ -18,6 +18,7 @@
 
 #include "arrow/api.h"
 #include "arrow/dataset/dataset_internal.h"
+#include "arrow/dataset/file_parquet.h"
 #include "arrow/dataset/expression.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/filesystem/filesystem.h"
@@ -27,6 +28,9 @@
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
 #include "arrow/io/api.h"
+#include "parquet/api/reader.h"
+#include "parquet/arrow/reader.h"
+#include "parquet/file_reader.h"
 
 namespace arrow {
 namespace dataset {
@@ -77,7 +81,7 @@ class RandomAccessObject : public arrow::io::RandomAccessFile {
 
     if (nbytes > 0) {
       ceph::bufferlist* bl = new ceph::bufferlist();
-      cluster_->ioCtx->read(oid_.c_str(), bl, nbytes, position);
+      cluster_->ioCtx->read(oid_.c_str(), *bl, nbytes, position);
       return std::make_shared<arrow::Buffer>((uint8_t*)bl->c_str(), bl->length());
     }
     return std::make_shared<arrow::Buffer>("");
@@ -139,7 +143,7 @@ class RadosParquetScanTask : public ScanTask {
 
   Result<RecordBatchIterator> Execute() override {
 
-    auto oid = doa_->ConvertFileNameToObjectID(source_.path());
+    ARROW_ASSIGN_OR_RAISE(auto oid, doa_->ConvertFileNameToObjectID(source_.path()));
 
     auto file = std::make_shared<RandomAccessObject>(oid, doa_->cluster());
     ARROW_RETURN_NOT_OK(file->Init());

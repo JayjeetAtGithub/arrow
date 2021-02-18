@@ -99,7 +99,7 @@ class ARROW_DS_EXPORT DirectObjectAccess {
   explicit DirectObjectAccess(const std::shared_ptr<RadosCluster>& cluster)
       : cluster_(std::move(cluster)) {}
 
-  std::string ConvertFileNameToObjectID(const std::string& path) {
+  Result<std::string> ConvertFileNameToObjectID(const std::string& path) {
     struct stat dir_st;
     if (stat(path.c_str(), &dir_st) < 0)
       return Status::ExecutionError("stat returned non-zero exit code.");
