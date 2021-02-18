@@ -99,8 +99,7 @@ class ARROW_DS_EXPORT DirectObjectAccess {
   explicit DirectObjectAccess(const std::shared_ptr<RadosCluster>& cluster)
       : cluster_(std::move(cluster)) {}
 
-  Status Exec(const std::string& path, const std::string& fn, ceph::bufferlist& in,
-              ceph::bufferlist& out) {
+  std::string ConvertFileNameToObjectID(const std::string& path) {
     struct stat dir_st;
     if (stat(path.c_str(), &dir_st) < 0)
       return Status::ExecutionError("stat returned non-zero exit code.");
@@ -110,6 +109,12 @@ class ARROW_DS_EXPORT DirectObjectAccess {
     std::stringstream ss;
     ss << std::hex << inode;
     std::string oid(ss.str() + ".00000000");
+    return oid;
+  }
+
+  Status Exec(const std::string& path, const std::string& fn, ceph::bufferlist& in,
+              ceph::bufferlist& out) {
+    auto oid = ConvertFileNameToObjectID(path);
 
     if (cluster_->ioCtx->read(oid.c_str(), out, 0, 0)) {
       return Status::ExecutionError("librados::read returned non-zero exit code.");
@@ -117,6 +122,8 @@ class ARROW_DS_EXPORT DirectObjectAccess {
 
     return Status::OK();
   }
+
+  std::shared_ptr<RadosCluster> cluster() { return cluster_; }
 
  protected:
   std::shared_ptr<RadosCluster> cluster_;

@@ -26,9 +26,107 @@
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
+#include "arrow/io/api.h"
 
 namespace arrow {
 namespace dataset {
+
+class RandomAccessObject : public arrow::io::RandomAccessFile {
+ public:
+  explicit RandomAccessObject(std::string oid, 
+                              std::shared_ptr<RadosCluster> cluster)
+    : oid_(oid),
+      cluster_(std::move(cluster)) {}
+
+  arrow::Status Init() {
+    uint64_t size;
+    int e = cls_cxx_stat(hctx_, &size, NULL);
+    if (e == 0) {
+      content_length_ = size;
+      return arrow::Status::OK();
+    } else {
+      return arrow::Status::ExecutionError("cls_cxx_stat returned non-zero exit code.");
+    }
+  }
+
+  arrow::Status CheckClosed() const {
+    if (closed_) {
+      return arrow::Status::Invalid("Operation on closed stream");
+    }
+    return arrow::Status::OK();
+  }
+
+  arrow::Status CheckPosition(int64_t position, const char* action) const {
+    if (position < 0) {
+      return arrow::Status::Invalid("Cannot ", action, " from negative position");
+    }
+    if (position > content_length_) {
+      return arrow::Status::IOError("Cannot ", action, " past end of file");
+    }
+    return arrow::Status::OK();
+  }
+
+  arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) { return 0; }
+
+  arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) {
+    RETURN_NOT_OK(CheckClosed());
+    RETURN_NOT_OK(CheckPosition(position, "read"));
+
+    // No need to allocate more than the remaining number of bytes
+    nbytes = std::min(nbytes, content_length_ - position);
+
+    if (nbytes > 0) {
+      ceph::bufferlist* bl = new ceph::bufferlist();
+      cluster_->ioCtx->read(oid_.c_str(), bl, nbytes, position);
+      return std::make_shared<arrow::Buffer>((uint8_t*)bl->c_str(), bl->length());
+    }
+    return std::make_shared<arrow::Buffer>("");
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) {
+    ARROW_ASSIGN_OR_RAISE(auto buffer, ReadAt(pos_, nbytes));
+    pos_ += buffer->size();
+    return std::move(buffer);
+  }
+
+  arrow::Result<int64_t> Read(int64_t nbytes, void* out) {
+    ARROW_ASSIGN_OR_RAISE(int64_t bytes_read, ReadAt(pos_, nbytes, out));
+    pos_ += bytes_read;
+    return bytes_read;
+  }
+
+  arrow::Result<int64_t> GetSize() {
+    RETURN_NOT_OK(CheckClosed());
+    return content_length_;
+  }
+
+  arrow::Status Seek(int64_t position) {
+    RETURN_NOT_OK(CheckClosed());
+    RETURN_NOT_OK(CheckPosition(position, "seek"));
+
+    pos_ = position;
+    return arrow::Status::OK();
+  }
+
+  arrow::Result<int64_t> Tell() const {
+    RETURN_NOT_OK(CheckClosed());
+    return pos_;
+  }
+
+  arrow::Status Close() {
+    closed_ = true;
+    return arrow::Status::OK();
+  }
+
+  bool closed() const { return closed_; }
+
+ protected:
+  std::string oid_;
+  std::shared_ptr<RadosCluster> cluster_;
+  bool closed_ = false;
+  int64_t pos_ = 0;
+  int64_t content_length_ = -1;
+};
 
 class RadosParquetScanTask : public ScanTask {
  public:
@@ -40,24 +138,29 @@ class RadosParquetScanTask : public ScanTask {
         doa_(std::move(doa)) {}
 
   Result<RecordBatchIterator> Execute() override {
-    ceph::bufferlist* in = new ceph::bufferlist();
-    ceph::bufferlist* out = new ceph::bufferlist();
 
-    ARROW_RETURN_NOT_OK(SerializeScanRequestToBufferlist(
-        options_->filter, options_->partition_expression, options_->projector.schema(),
-        options_->dataset_schema, *in));
+    auto oid = doa_->ConvertFileNameToObjectID(source_.path());
 
-    Status s = doa_->Exec(source_.path(), "scan", *in, *out);
-    if (!s.ok()) {
-      return Status::ExecutionError(s.message());
-    }
+    auto file = std::make_shared<RandomAccessObject>(oid, doa_->cluster());
+    ARROW_RETURN_NOT_OK(file->Init());
+    arrow::dataset::FileSource source(file);
+    auto format = std::make_shared<arrow::dataset::ParquetFileFormat>();
+    ARROW_ASSIGN_OR_RAISE(auto fragment,
+                          format->MakeFragment(source, options_->partition_expression));
+    auto ctx = std::make_shared<arrow::dataset::ScanContext>();
+    auto builder =
+        std::make_shared<arrow::dataset::ScannerBuilder>(options_->dataset_schema, fragment, ctx);
+    ARROW_RETURN_NOT_OK(builder->Filter(options_->filter));
+    ARROW_RETURN_NOT_OK(builder->Project( options_->projector.schema()->field_names()));
 
+    ARROW_ASSIGN_OR_RAISE(auto scanner, builder->Finish());
+    ARROW_ASSIGN_OR_RAISE(auto table, scanner->ToTable());
+
+    ARROW_RETURN_NOT_OK(file->Close());
+
+    auto table_reader = std::make_shared<arrow::TableBatchReader>(*table);
     RecordBatchVector batches;
-    auto buffer = std::make_shared<Buffer>((uint8_t*)out->c_str(), out->length());
-    auto buffer_reader = std::make_shared<io::BufferReader>(buffer);
-    ARROW_ASSIGN_OR_RAISE(auto rb_reader,
-                          arrow::ipc::RecordBatchStreamReader::Open(buffer_reader));
-    rb_reader->ReadAll(&batches);
+    table_reader->ReadAll(&batches);
     return MakeVectorIterator(batches);
   }
 
