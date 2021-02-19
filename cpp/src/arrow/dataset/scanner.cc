@@ -221,9 +221,9 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&](RecordBatchIterator batch_it) {
-      ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
-      state->Emplace(std::move(local), id);
+    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&](...) {
+      // ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
+      // state->Emplace(std::move(local), id);
       return Status::OK();
     });
   }
