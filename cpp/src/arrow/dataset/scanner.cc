@@ -217,7 +217,7 @@ static Result<std::shared_ptr<TableAssemblyState>> AsyncScanner(Iterator<std::sh
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&], (const Result<RecordBatchIterator> &it) {
+    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&] (const Result<RecordBatchIterator> &it) {
       return Status::OK();
     });
   }
