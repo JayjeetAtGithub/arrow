@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#define BOOST_THREAD_PROVIDES_FUTURE
+#define BOOST_THREAD_PROVIDES_FUTURE_CONTINUATION
 #include "arrow/dataset/scanner.h"
 
 #include <algorithm>
