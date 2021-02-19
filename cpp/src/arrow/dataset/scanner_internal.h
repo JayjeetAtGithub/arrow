@@ -114,7 +114,7 @@ inline Result<ScanTaskIterator> GetScanTaskIterator(
              context](std::shared_ptr<Fragment> fragment) -> Result<ScanTaskIterator> {
     ARROW_ASSIGN_OR_RAISE(auto scan_task_it, fragment->Scan(options, context));
 
-    if (options->bypass_fap_scantask) {
+    if (fragment->format()->type_name() == "rados-parquet") {
       ARROW_LOG(INFO) << "bypassing FilterAndProject ScanTask\n";
       return std::move(scan_task_it);
     }
