@@ -206,8 +206,7 @@ struct TableAssemblyState {
 
 Result<std::shared_ptr<Table>> Scanner::ToTable() {
   ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
-  auto task_group = scan_context_->TaskGroup();
-
+  ARROW_ASSIGN_OR_RAISE(auto pool, ThreadPool::Make(48));
   /// Wraps the state in a shared_ptr to ensure that failing ScanTasks don't
   /// invalidate concurrently running tasks when Finish() early returns
   /// and the mutex/batches fail out of scope.
@@ -218,17 +217,14 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    task_group->Append([state, id, scan_task] {
-      ARROW_ASSIGN_OR_RAISE(auto batch_it, scan_task->Execute());
+    pool->Submit(scan_task->Execute).Then([&state, &id](const RecordBatchIterator& batch_it) {
       ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
       state->Emplace(std::move(local), id);
       return Status::OK();
     });
   }
 
-  // Wait for all tasks to complete, or the first error.
-  RETURN_NOT_OK(task_group->Finish());
-
+  pool->Shutdown();
   return Table::FromRecordBatches(scan_options_->schema(),
                                   FlattenRecordBatchVector(std::move(state->batches)));
 }
