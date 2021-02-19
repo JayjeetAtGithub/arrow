@@ -116,7 +116,10 @@ class ARROW_DS_EXPORT DirectObjectAccess {
               ceph::bufferlist& out) {
     ARROW_ASSIGN_OR_RAISE(auto oid, ConvertFileNameToObjectID(path));
 
-    if (cluster_->ioCtx->exec(oid.c_str(), cluster_->cls_name.c_str(), fn.c_str(), in,
+    librados::IoCtx *io_ctx = new librados::IoCtx;
+    cluster_->rados->ioctx_create(cluster_->data_pool.c_str(), *io_ctx)
+
+    if (io_ctx->exec(oid.c_str(), cluster_->cls_name.c_str(), fn.c_str(), in,
                               out)) {
       return Status::ExecutionError("librados::exec returned non-zero exit code.");
     }
