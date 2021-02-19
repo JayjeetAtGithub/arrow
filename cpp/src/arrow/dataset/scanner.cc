@@ -204,6 +204,10 @@ struct TableAssemblyState {
   }
 };
 
+Result<RecordBatchIterator> ScanTaskExecuteWrapper(std::shared_ptr<ScanTask> task) {
+  return task->Execute();
+}
+
 Result<std::shared_ptr<Table>> Scanner::ToTable() {
   ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
   ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(48));
@@ -217,7 +221,7 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    pool->Submit(scan_task->Execute).Then([&state, &id](RecordBatchIterator batch_it) {
+    pool->Submit(ScanTaskExecuteWrapper, scan_task).Then([&state, &id](RecordBatchIterator batch_it) {
       ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
       state->Emplace(std::move(local), id);
       return Status::OK();
