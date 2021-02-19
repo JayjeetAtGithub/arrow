@@ -208,7 +208,7 @@ RecordBatchIterator ScanTaskExecuteWrapper(std::shared_ptr<ScanTask> task) {
   return task->Execute().ValueOrDie();
 }
 
-Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
+static Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
   return Status::OK();
 }
 
