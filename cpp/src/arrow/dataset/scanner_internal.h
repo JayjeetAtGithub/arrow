@@ -83,6 +83,8 @@ class FilterAndProjectScanTask : public ScanTask {
     ARROW_ASSIGN_OR_RAISE(Expression simplified_filter,
                           SimplifyWithGuarantee(filter_, partition_));
 
+    ARROW_LOG(INFO) << "In FilterAndProjectScanTask\n";
+
     RecordBatchIterator filter_it =
         FilterRecordBatch(std::move(it), simplified_filter, context_->pool);
 
@@ -104,12 +106,17 @@ class FilterAndProjectScanTask : public ScanTask {
 inline Result<ScanTaskIterator> GetScanTaskIterator(
     FragmentIterator fragments, std::shared_ptr<ScanOptions> options,
     std::shared_ptr<ScanContext> context) {
+  
+  
   // Fragment -> ScanTaskIterator
   auto fn = [options,
              context](std::shared_ptr<Fragment> fragment) -> Result<ScanTaskIterator> {
     ARROW_ASSIGN_OR_RAISE(auto scan_task_it, fragment->Scan(options, context));
 
-    if (options->bypass_fap_scantask) return std::move(scan_task_it);
+    if (options->bypass_fap_scantask) {
+      ARROW_LOG(INFO) << "bypassing FilterAndProject ScanTask\n";
+      return std::move(scan_task_it);
+    }
 
     auto partition = fragment->partition_expression();
     // Apply the filter and/or projection to incoming RecordBatches by
