@@ -216,18 +216,26 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
   /// and the mutex/batches fail out of scope.
   auto state = std::make_shared<TableAssemblyState>();
   size_t scan_task_id = 0;
+  std::vector<boost::futures> futures;
   for (auto maybe_scan_task : scan_task_it) {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
     auto id = scan_task_id++;
 
-    boost::async([&] () {
+    auto f_ = boost::async([&] () {
       auto batch_it = scan_task->Execute().ValueOrDie();
       return batch_it;
     }).then([&] (boost::future<RecordBatchIterator> f) {
       auto batch_it = f.get();
       auto local = batch_it.ToVector().ValueOrDie();
       state->Emplace(std::move(local), id);
+      return 0;
     });
+
+    futures.append(f_);
+  }
+
+  for (auto &future : futures) {
+    future.get();
   }
 
   // Wait for all tasks to complete, or the first error.

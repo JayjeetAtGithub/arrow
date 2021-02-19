@@ -84,8 +84,6 @@ class FilterAndProjectScanTask : public ScanTask {
     ARROW_ASSIGN_OR_RAISE(Expression simplified_filter,
                           SimplifyWithGuarantee(filter_, partition_));
 
-    ARROW_LOG(INFO) << "In FilterAndProjectScanTask\n";
-
     RecordBatchIterator filter_it =
         FilterRecordBatch(std::move(it), simplified_filter, context_->pool);
 
@@ -115,7 +113,6 @@ inline Result<ScanTaskIterator> GetScanTaskIterator(
     ARROW_ASSIGN_OR_RAISE(auto scan_task_it, fragment->Scan(options, context));
 
     if (context->client_side) {
-      ARROW_LOG(INFO) << "bypassing FilterAndProject ScanTask\n";
       return std::move(scan_task_it);
     }
 
