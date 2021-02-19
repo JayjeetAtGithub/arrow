@@ -218,11 +218,11 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     auto id = scan_task_id++;
 
     boost::async([&] () {
-      ARROW_ASSIGN_OR_RAISE(auto batch_it, scan_task->Execute());
+      auto batch_it = scan_task->Execute().ValueOrDie();
       return batch_it;
-    }).then([&], boost::future<RecordBatchIterator> f {
+    }).then([&] (future<RecordBatchIterator> f) {
       auto batch_it = f.get();
-      ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
+      auto local = batch_it.ToVector().ValueOrDie();
       state->Emplace(std::move(local), id);
     });
   }
