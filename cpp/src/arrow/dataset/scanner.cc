@@ -212,7 +212,7 @@ static Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
   return Status::OK();
 }
 
-static std::shared_ptr<TableAssemblyState> AsyncScanner(Iterator<std::shared_ptr<ScanTask>> scan_task_it) {
+static Result<std::shared_ptr<TableAssemblyState>> AsyncScanner(Iterator<std::shared_ptr<ScanTask>> scan_task_it) {
   ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(48));
   auto state = std::make_shared<TableAssemblyState>();
 
@@ -229,7 +229,7 @@ static std::shared_ptr<TableAssemblyState> AsyncScanner(Iterator<std::shared_ptr
 
 Result<std::shared_ptr<Table>> Scanner::ToTable() {
   ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
-  auto state = AsyncScanner(scan_task_it);
+  ARROW_ASSIGN_OR_RAISE(auto state, AsyncScanner(scan_task_it));
   return Table::FromRecordBatches(scan_options_->schema(),
                                   FlattenRecordBatchVector(std::move(state->batches)));
 }
