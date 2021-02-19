@@ -221,7 +221,7 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     boost::async([&] () {
       auto batch_it = scan_task->Execute().ValueOrDie();
       return batch_it;
-    }).then([&] (std::future<RecordBatchIterator> f) {
+    }).then([&] (boost::future<RecordBatchIterator> f) {
       auto batch_it = f.get();
       auto local = batch_it.ToVector().ValueOrDie();
       state->Emplace(std::move(local), id);
