@@ -46,6 +46,9 @@ struct ARROW_DS_EXPORT ScanContext {
   /// Indicate if the Scanner should make use of a ThreadPool.
   bool use_threads = false;
 
+  /// Indicate whether client side scan
+  bool client_side = true;
+
   /// Return a threaded or serial TaskGroup according to use_threads.
   std::shared_ptr<internal::TaskGroup> TaskGroup() const;
 };
@@ -234,6 +237,8 @@ class ARROW_DS_EXPORT ScannerBuilder {
   /// \brief Indicate if the Scanner should make use of the available
   ///        ThreadPool found in ScanContext;
   Status UseThreads(bool use_threads = true);
+
+  Status UseClientSide(bool client_side = true);
 
   /// \brief Set the maximum number of rows per RecordBatch.
   ///

@@ -138,6 +138,11 @@ Status ScannerBuilder::UseThreads(bool use_threads) {
   return Status::OK();
 }
 
+Status ScannerBuilder::UseClientSide(bool client_side) {
+  scan_context_->client_side = client_side;
+  return Status::OK();
+}
+
 Status ScannerBuilder::BatchSize(int64_t batch_size) {
   if (batch_size <= 0) {
     return Status::Invalid("BatchSize must be greater than 0, got ", batch_size);
