@@ -216,7 +216,7 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
   /// and the mutex/batches fail out of scope.
   auto state = std::make_shared<TableAssemblyState>();
   size_t scan_task_id = 0;
-  std::vector<boost::future> futures;
+  std::vector<boost::future<int>> futures;
   for (auto maybe_scan_task : scan_task_it) {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
     auto id = scan_task_id++;
