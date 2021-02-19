@@ -117,7 +117,7 @@ class ARROW_DS_EXPORT DirectObjectAccess {
     ARROW_ASSIGN_OR_RAISE(auto oid, ConvertFileNameToObjectID(path));
 
     IoCtxInterface* io_ctx = new IoCtxWrapper();
-    cluster_->rados->ioctx_create(cluster_->data_pool.c_str(), io_ctx)
+    cluster_->rados->ioctx_create(cluster_->data_pool.c_str(), io_ctx);
 
     if (io_ctx->exec(oid.c_str(), cluster_->cls_name.c_str(), fn.c_str(), in,
                               out)) {
