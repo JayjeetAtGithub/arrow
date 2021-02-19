@@ -212,12 +212,8 @@ Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
   return Status::OK();
 }
 
-Result<std::shared_ptr<Table>> Scanner::ToTable() {
-  ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
+static std::shared_ptr<TableAssemblyState> AsyncScanner(Iterator<std::shared_ptr<ScanTask>> scan_task_it) {
   ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(48));
-  /// Wraps the state in a shared_ptr to ensure that failing ScanTasks don't
-  /// invalidate concurrently running tasks when Finish() early returns
-  /// and the mutex/batches fail out of scope.
   auto state = std::make_shared<TableAssemblyState>();
 
   size_t scan_task_id = 0;
@@ -229,6 +225,11 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
   }
 
   pool->Shutdown();
+}
+
+Result<std::shared_ptr<Table>> Scanner::ToTable() {
+  ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
+  auto state = AsyncScanner(scan_task_it);
   return Table::FromRecordBatches(scan_options_->schema(),
                                   FlattenRecordBatchVector(std::move(state->batches)));
 }
