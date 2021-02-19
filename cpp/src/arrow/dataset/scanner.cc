@@ -204,12 +204,8 @@ struct TableAssemblyState {
   }
 };
 
-RecordBatchIterator ScanTaskExecuteWrapper(std::shared_ptr<ScanTask> task) {
+Result<RecordBatchIterator> ScanTaskExecuteWrapper(std::shared_ptr<ScanTask> task) {
   return task->Execute().ValueOrDie();
-}
-
-static Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
-  return Status::OK();
 }
 
 static Result<std::shared_ptr<TableAssemblyState>> AsyncScanner(Iterator<std::shared_ptr<ScanTask>> scan_task_it) {
@@ -221,7 +217,9 @@ static Result<std::shared_ptr<TableAssemblyState>> AsyncScanner(Iterator<std::sh
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&], Callback);
+    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&], (const Result<RecordBatchIterator> &it) {
+      return Status::OK();
+    });
   }
 
   pool->Shutdown();
