@@ -208,6 +208,10 @@ RecordBatchIterator ScanTaskExecuteWrapper(std::shared_ptr<ScanTask> task) {
   return task->Execute().ValueOrDie();
 }
 
+Status Callback(Iterator<std::shared_ptr<RecordBatch>> batch_it) {
+  return Status::OK();
+}
+
 Result<std::shared_ptr<Table>> Scanner::ToTable() {
   ARROW_ASSIGN_OR_RAISE(auto scan_task_it, Scan());
   ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(48));
@@ -221,11 +225,7 @@ Result<std::shared_ptr<Table>> Scanner::ToTable() {
     ARROW_ASSIGN_OR_RAISE(auto scan_task, maybe_scan_task);
 
     auto id = scan_task_id++;
-    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&](const RecordBatchIterator batch_it) {
-      // ARROW_ASSIGN_OR_RAISE(auto local, batch_it.ToVector());
-      // state->Emplace(std::move(local), id);
-      return Status::OK();
-    });
+    (void)DeferNotOk(pool->Submit(ScanTaskExecuteWrapper, scan_task)).Then([&], Callback);
   }
 
   pool->Shutdown();
