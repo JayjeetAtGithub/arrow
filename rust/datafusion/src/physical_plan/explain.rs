@@ -17,19 +17,20 @@
 
 //! Defines the EXPLAIN operator
 
-use crate::error::{ExecutionError, Result};
+use std::any::Any;
+use std::sync::Arc;
+
+use crate::error::{DataFusionError, Result};
 use crate::{
     logical_plan::StringifiedPlan,
-    physical_plan::{common::RecordBatchIterator, ExecutionPlan},
+    physical_plan::{common::SizedRecordBatchStream, ExecutionPlan},
 };
-use arrow::{
-    array::StringArray,
-    datatypes::SchemaRef,
-    record_batch::{RecordBatch, RecordBatchReader},
-};
+use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use crate::physical_plan::Partitioning;
-use std::sync::{Arc, Mutex};
+
+use super::SendableRecordBatchStream;
+use async_trait::async_trait;
 
 /// Explain execution plan operator. This operator contains the string
 /// values of the various plans it has when it is created, and passes
@@ -38,7 +39,6 @@ use std::sync::{Arc, Mutex};
 pub struct ExplainExec {
     /// The schema that this exec plan node outputs
     schema: SchemaRef,
-
     /// The strings to be printed
     stringified_plans: Vec<StringifiedPlan>,
 }
@@ -51,9 +51,20 @@ impl ExplainExec {
             stringified_plans,
         }
     }
+
+    /// The strings to be printed
+    pub fn stringified_plans(&self) -> &[StringifiedPlan] {
+        &self.stringified_plans
+    }
 }
 
+#[async_trait]
 impl ExecutionPlan for ExplainExec {
+    /// Return a reference to Any that can be used for downcasting
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -75,25 +86,23 @@ impl ExecutionPlan for ExplainExec {
         if children.is_empty() {
             Ok(Arc::new(self.clone()))
         } else {
-            Err(ExecutionError::General(format!(
+            Err(DataFusionError::Internal(format!(
                 "Children cannot be replaced in {:?}",
                 self
             )))
         }
     }
-    fn execute(
-        &self,
-        partition: usize,
-    ) -> Result<Arc<Mutex<dyn RecordBatchReader + Send + Sync>>> {
+
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
         if 0 != partition {
-            return Err(ExecutionError::General(format!(
+            return Err(DataFusionError::Internal(format!(
                 "ExplainExec invalid partition {}",
                 partition
             )));
         }
 
-        let mut type_builder = StringArray::builder(self.stringified_plans.len());
-        let mut plan_builder = StringArray::builder(self.stringified_plans.len());
+        let mut type_builder = StringBuilder::new(self.stringified_plans.len());
+        let mut plan_builder = StringBuilder::new(self.stringified_plans.len());
 
         for p in &self.stringified_plans {
             type_builder.append_value(&String::from(&p.plan_type))?;
@@ -108,9 +117,9 @@ impl ExecutionPlan for ExplainExec {
             ],
         )?;
 
-        Ok(Arc::new(Mutex::new(RecordBatchIterator::new(
+        Ok(Box::pin(SizedRecordBatchStream::new(
             self.schema.clone(),
             vec![Arc::new(record_batch)],
-        ))))
+        )))
     }
 }

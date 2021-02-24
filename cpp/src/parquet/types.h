@@ -27,6 +27,7 @@
 #include "arrow/util/string_view.h"
 
 #include "parquet/platform.h"
+#include "parquet/type_fwd.h"
 
 namespace arrow {
 namespace util {
@@ -464,15 +465,6 @@ struct Encoding {
 PARQUET_EXPORT
 bool IsCodecSupported(Compression::type codec);
 
-namespace internal {
-
-// ARROW-9424: Separate functions for reading and writing so we can disable LZ4
-// on writing
-std::unique_ptr<Codec> GetReadCodec(Compression::type codec);
-std::unique_ptr<Codec> GetWriteCodec(Compression::type codec, int compression_level);
-
-}  // namespace internal
-
 PARQUET_EXPORT
 std::unique_ptr<Codec> GetCodec(Compression::type codec);
 
@@ -712,10 +704,4 @@ PARQUET_EXPORT SortOrder::type GetSortOrder(ConvertedType::type converted,
 PARQUET_EXPORT SortOrder::type GetSortOrder(
     const std::shared_ptr<const LogicalType>& logical_type, Type::type primitive);
 
-namespace internal {
-
-PARQUET_EXPORT
-int32_t DecimalSize(int32_t precision);
-
-}  // namespace internal
 }  // namespace parquet

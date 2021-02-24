@@ -34,6 +34,7 @@ import org.apache.arrow.flatbuf.RecordBatch;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.WriteChannel;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -61,10 +62,10 @@ public class MessageSerializer {
   public static final int IPC_CONTINUATION_TOKEN = -1;
 
   /**
-   * Convert an array of 4 bytes to a little endian i32 value.
+   * Convert an array of 4 bytes in little-endian to an native-endian i32 value.
    *
-   * @param bytes byte array with minimum length of 4
-   * @return converted little endian 32-bit integer
+   * @param bytes byte array with minimum length of 4 in little-endian
+   * @return converted an native-endian 32-bit integer
    */
   public static int bytesToInt(byte[] bytes) {
     return ((bytes[3] & 255) << 24) +
@@ -74,7 +75,7 @@ public class MessageSerializer {
   }
 
   /**
-   * Convert an integer to a 4 byte array.
+   * Convert an integer to a little endian 4 byte array.
    *
    * @param value integer value input
    * @param bytes existing byte array with minimum length of 4 to contain the conversion output
@@ -87,7 +88,7 @@ public class MessageSerializer {
   }
 
   /**
-   * Convert a long to a 8 byte array.
+   * Convert a long to a little-endian 8 byte array.
    *
    * @param value long value input
    * @param bytes existing byte array with minimum length of 8 to contain the conversion output
@@ -425,11 +426,16 @@ public class MessageSerializer {
       ArrowBuf vectorBuffer = body.slice(bufferFB.offset(), bufferFB.length());
       buffers.add(vectorBuffer);
     }
+
+    ArrowBodyCompression bodyCompression = recordBatchFB.compression() == null ?
+        NoCompressionCodec.DEFAULT_BODY_COMPRESSION
+        : new ArrowBodyCompression(recordBatchFB.compression().codec(), recordBatchFB.compression().method());
+
     if ((int) recordBatchFB.length() != recordBatchFB.length()) {
       throw new IOException("Cannot currently deserialize record batches with more than INT_MAX records.");
     }
     ArrowRecordBatch arrowRecordBatch =
-        new ArrowRecordBatch(checkedCastToInt(recordBatchFB.length()), nodes, buffers);
+        new ArrowRecordBatch(checkedCastToInt(recordBatchFB.length()), nodes, buffers, bodyCompression);
     body.getReferenceManager().release();
     return arrowRecordBatch;
   }

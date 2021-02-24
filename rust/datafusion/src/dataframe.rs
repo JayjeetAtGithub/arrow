@@ -19,9 +19,12 @@
 
 use crate::arrow::record_batch::RecordBatch;
 use crate::error::Result;
-use crate::logical_plan::{Expr, FunctionRegistry, LogicalPlan};
-use arrow::datatypes::Schema;
+use crate::logical_plan::{
+    DFSchema, Expr, FunctionRegistry, JoinType, LogicalPlan, Partitioning,
+};
 use std::sync::Arc;
+
+use async_trait::async_trait;
 
 /// DataFrame represents a logical set of rows with the same named columns.
 /// Similar to a [Pandas DataFrame](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html) or
@@ -41,12 +44,13 @@ use std::sync::Arc;
 /// let mut ctx = ExecutionContext::new();
 /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
 /// let df = df.filter(col("a").lt_eq(col("b")))?
-///            .aggregate(vec![col("a")], vec![min(col("b"))])?
+///            .aggregate(&[col("a")], &[min(col("b"))])?
 ///            .limit(100)?;
 /// let results = df.collect();
 /// # Ok(())
 /// # }
 /// ```
+#[async_trait]
 pub trait DataFrame {
     /// Filter the DataFrame by column. Returns a new DataFrame only containing the
     /// specified columns.
@@ -57,11 +61,11 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let df = df.select_columns(vec!["a", "b"])?;
+    /// let df = df.select_columns(&["a", "b"])?;
     /// # Ok(())
     /// # }
     /// ```
-    fn select_columns(&self, columns: Vec<&str>) -> Result<Arc<dyn DataFrame>>;
+    fn select_columns(&self, columns: &[&str]) -> Result<Arc<dyn DataFrame>>;
 
     /// Create a projection based on arbitrary expressions.
     ///
@@ -71,11 +75,11 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let df = df.select(vec![col("a").multiply(col("b")), col("c")])?;
+    /// let df = df.select(&[col("a") * col("b"), col("c")])?;
     /// # Ok(())
     /// # }
     /// ```
-    fn select(&self, expr: Vec<Expr>) -> Result<Arc<dyn DataFrame>>;
+    fn select(&self, expr: &[Expr]) -> Result<Arc<dyn DataFrame>>;
 
     /// Filter a DataFrame to only include rows that match the specified filter expression.
     ///
@@ -101,17 +105,17 @@ pub trait DataFrame {
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
     ///
     /// // The following use is the equivalent of "SELECT MIN(b) GROUP BY a"
-    /// let _ = df.aggregate(vec![col("a")], vec![min(col("b"))])?;
+    /// let _ = df.aggregate(&[col("a")], &[min(col("b"))])?;
     ///
     /// // The following use is the equivalent of "SELECT MIN(b)"
-    /// let _ = df.aggregate(vec![], vec![min(col("b"))])?;
+    /// let _ = df.aggregate(&[], &[min(col("b"))])?;
     /// # Ok(())
     /// # }
     /// ```
     fn aggregate(
         &self,
-        group_expr: Vec<Expr>,
-        aggr_expr: Vec<Expr>,
+        group_expr: &[Expr],
+        aggr_expr: &[Expr],
     ) -> Result<Arc<dyn DataFrame>>;
 
     /// Limit the number of rows returned from this DataFrame.
@@ -137,13 +141,40 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let df = df.sort(vec![col("a").sort(true, true), col("b").sort(false, false)])?;
+    /// let df = df.sort(&[col("a").sort(true, true), col("b").sort(false, false)])?;
     /// # Ok(())
     /// # }
     /// ```
-    fn sort(&self, expr: Vec<Expr>) -> Result<Arc<dyn DataFrame>>;
+    fn sort(&self, expr: &[Expr]) -> Result<Arc<dyn DataFrame>>;
 
-    /// Executes this DataFrame and collects all results into a vector of RecordBatch.
+    /// Join this DataFrame with another DataFrame using the specified columns as join keys
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let left = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let right = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?
+    ///   .select(&[
+    ///     col("a").alias("a2"),
+    ///     col("b").alias("b2"),
+    ///     col("c").alias("c2")])?;
+    /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"])?;
+    /// let batches = join.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn join(
+        &self,
+        right: Arc<dyn DataFrame>,
+        join_type: JoinType,
+        left_cols: &[&str],
+        right_cols: &[&str],
+    ) -> Result<Arc<dyn DataFrame>>;
+
+    /// Repartition a DataFrame based on a logical partitioning scheme.
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -151,11 +182,29 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let batches = df.collect()?;
+    /// let df1 = df.repartition(Partitioning::RoundRobinBatch(4))?;
     /// # Ok(())
     /// # }
     /// ```
-    fn collect(&self) -> Result<Vec<RecordBatch>>;
+    fn repartition(
+        &self,
+        partitioning_scheme: Partitioning,
+    ) -> Result<Arc<dyn DataFrame>>;
+
+    /// Executes this DataFrame and collects all results into a vector of RecordBatch.
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let batches = df.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn collect(&self) -> Result<Vec<RecordBatch>>;
 
     /// Returns the schema describing the output of this DataFrame in terms of columns returned,
     /// where each column has a name, data type, and nullability attribute.
@@ -170,7 +219,7 @@ pub trait DataFrame {
     /// # Ok(())
     /// # }
     /// ```
-    fn schema(&self) -> &Schema;
+    fn schema(&self) -> &DFSchema;
 
     /// Return the logical plan represented by this DataFrame.
     fn to_logical_plan(&self) -> LogicalPlan;
@@ -180,10 +229,11 @@ pub trait DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
-    /// # fn main() -> Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let batches = df.limit(100)?.explain(false)?.collect()?;
+    /// let batches = df.limit(100)?.explain(false)?.collect().await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -202,5 +252,5 @@ pub trait DataFrame {
     /// # Ok(())
     /// # }
     /// ```
-    fn registry(&self) -> &dyn FunctionRegistry;
+    fn registry(&self) -> Arc<dyn FunctionRegistry>;
 }
