@@ -20,18 +20,16 @@
 
 #include "arrow/python/helpers.h"
 
+#include <cmath>
 #include <limits>
-#include <mutex>
 #include <sstream>
 #include <type_traits>
-#include <typeinfo>
 
 #include "arrow/python/common.h"
 #include "arrow/python/decimal.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/logging.h"
-
-#include <arrow/api.h>
 
 namespace arrow {
 
@@ -126,6 +124,14 @@ Status PyObject_StdStringStr(PyObject* obj, std::string* out) {
   OwnedRef string_ref(PyObject_Str(obj));
   RETURN_IF_PYERROR();
   return PyUnicode_AsStdString(string_ref.obj(), out);
+}
+
+Result<bool> IsModuleImported(const std::string& module_name) {
+  // PyImport_GetModuleDict returns with a borrowed reference
+  OwnedRef key(PyUnicode_FromString(module_name.c_str()));
+  auto is_imported = PyDict_Contains(PyImport_GetModuleDict(), key.obj());
+  RETURN_IF_PYERROR();
+  return is_imported;
 }
 
 Status ImportModule(const std::string& module_name, OwnedRef* ref) {
@@ -257,39 +263,65 @@ bool PyFloat_IsNaN(PyObject* obj) {
 
 namespace {
 
-static std::once_flag pandas_static_initialized;
-static PyTypeObject* pandas_NaTType = nullptr;
-static PyObject* pandas_NA = nullptr;
+static bool pandas_static_initialized = false;
 
-void GetPandasStaticSymbols() {
+// Once initialized, these variables hold borrowed references to Pandas static data.
+// We should not use OwnedRef here because Python destructors would be
+// called on a finalized interpreter.
+static PyObject* pandas_NA = nullptr;
+static PyObject* pandas_NaT = nullptr;
+static PyObject* pandas_Timedelta = nullptr;
+static PyObject* pandas_Timestamp = nullptr;
+static PyTypeObject* pandas_NaTType = nullptr;
+
+}  // namespace
+
+void InitPandasStaticData() {
+  // NOTE: This is called with the GIL held.  We needn't (and shouldn't,
+  // to avoid deadlocks) use an additional C++ lock (ARROW-10519).
+  if (pandas_static_initialized) {
+    return;
+  }
+
   OwnedRef pandas;
+
+  // Import pandas
   Status s = ImportModule("pandas", &pandas);
   if (!s.ok()) {
     return;
   }
 
-  OwnedRef ref;
-  s = ImportFromModule(pandas.obj(), "NaT", &ref);
-  if (!s.ok()) {
+  // Since ImportModule can release the GIL, another thread could have
+  // already initialized the static data.
+  if (pandas_static_initialized) {
     return;
   }
-  PyObject* nat_type = PyObject_Type(ref.obj());
-  pandas_NaTType = reinterpret_cast<PyTypeObject*>(nat_type);
+  OwnedRef ref;
 
-  // PyObject_Type returns a new reference but we trust that pandas.NaT will
-  // outlive our use of this PyObject*
-  Py_DECREF(nat_type);
+  // set NaT sentinel and its type
+  if (ImportFromModule(pandas.obj(), "NaT", &ref).ok()) {
+    pandas_NaT = ref.obj();
+    // PyObject_Type returns a new reference but we trust that pandas.NaT will
+    // outlive our use of this PyObject*
+    pandas_NaTType = Py_TYPE(ref.obj());
+  }
 
+  // retain a reference to Timedelta
+  if (ImportFromModule(pandas.obj(), "Timedelta", &ref).ok()) {
+    pandas_Timedelta = ref.obj();
+  }
+
+  // retain a reference to Timestamp
+  if (ImportFromModule(pandas.obj(), "Timestamp", &ref).ok()) {
+    pandas_Timestamp = ref.obj();
+  }
+
+  // if pandas.NA exists, retain a reference to it
   if (ImportFromModule(pandas.obj(), "NA", &ref).ok()) {
-    // If pandas.NA exists, retain a reference to it
     pandas_NA = ref.obj();
   }
-}
 
-}  // namespace
-
-void InitPandasStaticData() {
-  std::call_once(pandas_static_initialized, GetPandasStaticSymbols);
+  pandas_static_initialized = true;
 }
 
 bool PandasObjectIsNull(PyObject* obj) {
@@ -305,6 +337,14 @@ bool PandasObjectIsNull(PyObject* obj) {
     return true;
   }
   return false;
+}
+
+bool IsPandasTimedelta(PyObject* obj) {
+  return pandas_Timedelta && PyObject_IsInstance(obj, pandas_Timedelta);
+}
+
+bool IsPandasTimestamp(PyObject* obj) {
+  return pandas_Timestamp && PyObject_IsInstance(obj, pandas_Timestamp);
 }
 
 Status InvalidValue(PyObject* obj, const std::string& why) {

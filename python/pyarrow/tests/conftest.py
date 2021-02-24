@@ -28,7 +28,7 @@ from pyarrow.util import find_free_port
 
 # setup hypothesis profiles
 h.settings.register_profile('ci', max_examples=1000)
-h.settings.register_profile('dev', max_examples=10)
+h.settings.register_profile('dev', max_examples=50)
 h.settings.register_profile('debug', max_examples=10,
                             verbosity=h.Verbosity.verbose)
 
@@ -37,6 +37,11 @@ h.settings.register_profile('debug', max_examples=10,
 # examples try:
 # pytest pyarrow -sv --enable-hypothesis --hypothesis-profile=debug
 h.settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+
+# Set this at the beginning before the AWS SDK was loaded to avoid reading in
+# user configuration values.
+os.environ['AWS_CONFIG_FILE'] = "/dev/null"
+
 
 groups = [
     'cython',
@@ -57,6 +62,7 @@ groups = [
     'flight',
     'slow',
     'requires_testing_data',
+    'rados'
 ]
 
 defaults = {
@@ -77,6 +83,7 @@ defaults = {
     'tensorflow': False,
     'flight': False,
     'slow': False,
+    'rados': False,
     'requires_testing_data': True,
 }
 
@@ -152,6 +159,13 @@ try:
 except ImportError:
     pass
 
+try:
+    import pyarrow.rados  # noqa
+    if defaults['dataset']:
+        defaults['rados'] = True
+except ImportError:
+    pass
+
 
 def pytest_addoption(parser):
     # Create options to selectively enable test groups
@@ -222,7 +236,7 @@ def tempdir(tmpdir):
 
 
 @pytest.fixture(scope='session')
-def datadir():
+def base_datadir():
     return pathlib.Path(__file__).parent / 'data'
 
 

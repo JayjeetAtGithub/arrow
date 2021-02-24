@@ -23,7 +23,6 @@
 
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/file_base.h"
-#include "arrow/dataset/filter.h"
 #include "arrow/dataset/partition.h"
 #include "arrow/dataset/test_util.h"
 #include "arrow/io/memory.h"
@@ -76,7 +75,7 @@ TEST_F(TestCsvFileFormat, ScanRecordBatchReader) {
   int64_t row_count = 0;
 
   for (auto maybe_batch : Batches(fragment.get())) {
-    ASSERT_OK_AND_ASSIGN(auto batch, std::move(maybe_batch));
+    ASSERT_OK_AND_ASSIGN(auto batch, maybe_batch);
     row_count += batch->num_rows();
   }
 
@@ -92,7 +91,7 @@ TEST_F(TestCsvFileFormat, ScanRecordBatchReaderWithVirtualColumn) {
   int64_t row_count = 0;
 
   for (auto maybe_batch : Batches(fragment.get())) {
-    ASSERT_OK_AND_ASSIGN(auto batch, std::move(maybe_batch));
+    ASSERT_OK_AND_ASSIGN(auto batch, maybe_batch);
     AssertSchemaEqual(*batch->schema(), *schema_);
     row_count += batch->num_rows();
   }
@@ -148,19 +147,19 @@ N/A,bar
   schema_ = schema({field("f64", utf8()), field("str", utf8())});
   ScannerBuilder builder(schema_, fragment, ctx_);
   // filter expression validated against declared schema
-  ASSERT_OK(builder.Filter("f64"_ == "str"_));
+  ASSERT_OK(builder.Filter(equal(field_ref("f64"), field_ref("str"))));
   // project only "str"
   ASSERT_OK(builder.Project({"str"}));
   ASSERT_OK_AND_ASSIGN(auto scanner, builder.Finish());
 
   ASSERT_OK_AND_ASSIGN(auto scan_task_it, scanner->Scan());
   for (auto maybe_scan_task : scan_task_it) {
-    ASSERT_OK_AND_ASSIGN(auto scan_task, std::move(maybe_scan_task));
+    ASSERT_OK_AND_ASSIGN(auto scan_task, maybe_scan_task);
     ASSERT_OK_AND_ASSIGN(auto batch_it, scan_task->Execute());
     for (auto maybe_batch : batch_it) {
       // ERROR: "f64" is not projected and reverts to inferred type,
       // breaking the comparison expression
-      ASSERT_OK_AND_ASSIGN(auto batch, std::move(maybe_batch));
+      ASSERT_OK_AND_ASSIGN(auto batch, maybe_batch);
     }
   }
 }

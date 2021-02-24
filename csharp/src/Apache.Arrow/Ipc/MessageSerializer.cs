@@ -14,6 +14,8 @@
 // limitations under the License.
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 namespace Apache.Arrow.Ipc
@@ -52,21 +54,46 @@ namespace Apache.Arrow.Ipc
 
         internal static Schema GetSchema(Flatbuf.Schema schema)
         {
-            var schemaBuilder = new Schema.Builder();
-
+            List<Field> fields = new List<Field>();
             for (int i = 0; i < schema.FieldsLength; i++)
             {
                 Flatbuf.Field field = schema.Fields(i).GetValueOrDefault();
 
-                schemaBuilder.Field(
-                    new Field(field.Name, GetFieldArrowType(field), field.Nullable));
+                fields.Add(FieldFromFlatbuffer(field));
             }
 
-            return schemaBuilder.Build();
+            Dictionary<string, string> metadata = schema.CustomMetadataLength > 0 ? new Dictionary<string, string>() : null;
+            for (int i = 0; i < schema.CustomMetadataLength; i++)
+            {
+                Flatbuf.KeyValue keyValue = schema.CustomMetadata(i).GetValueOrDefault();
+
+                metadata[keyValue.Key] = keyValue.Value;
+            }
+
+            return new Schema(fields, metadata, copyCollections: false);
         }
 
+        private static Field FieldFromFlatbuffer(Flatbuf.Field flatbufField)
+        {
+            Field[] childFields = flatbufField.ChildrenLength > 0 ? new Field[flatbufField.ChildrenLength] : null;
+            for (int i = 0; i < flatbufField.ChildrenLength; i++)
+            {
+                Flatbuf.Field? childFlatbufField = flatbufField.Children(i);
+                childFields[i] = FieldFromFlatbuffer(childFlatbufField.Value);
+            }
 
-        private static Types.IArrowType GetFieldArrowType(Flatbuf.Field field)
+            Dictionary<string, string> metadata = flatbufField.CustomMetadataLength > 0 ? new Dictionary<string, string>() : null;
+            for (int i = 0; i < flatbufField.CustomMetadataLength; i++)
+            {
+                Flatbuf.KeyValue keyValue = flatbufField.CustomMetadata(i).GetValueOrDefault();
+
+                metadata[keyValue.Key] = keyValue.Value;
+            }
+
+            return new Field(flatbufField.Name, GetFieldArrowType(flatbufField, childFields), flatbufField.Nullable, metadata, copyCollections: false);
+        }
+
+        private static Types.IArrowType GetFieldArrowType(Flatbuf.Field field, Field[] childFields = null)
         {
             switch (field.TypeType)
             {
@@ -126,11 +153,14 @@ namespace Apache.Arrow.Ipc
                 case Flatbuf.Type.Binary:
                     return Types.BinaryType.Default;
                 case Flatbuf.Type.List:
-                    if (field.ChildrenLength != 1)
+                    if (childFields == null || childFields.Length != 1)
                     {
-                        throw new InvalidDataException($"List type must have only one child.");
+                        throw new InvalidDataException($"List type must have exactly one child.");
                     }
-                    return new Types.ListType(GetFieldArrowType(field.Children(0).GetValueOrDefault()));
+                    return new Types.ListType(childFields[0]);
+                case Flatbuf.Type.Struct_:
+                    Debug.Assert(childFields != null);
+                    return new Types.StructType(childFields);
                 default:
                     throw new InvalidDataException($"Arrow primitive '{field.TypeType}' is unsupported.");
             }

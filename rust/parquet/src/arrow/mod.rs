@@ -26,21 +26,21 @@
 //! use arrow::record_batch::RecordBatchReader;
 //! use parquet::file::reader::SerializedFileReader;
 //! use parquet::arrow::{ParquetFileArrowReader, ArrowReader};
-//! use std::rc::Rc;
+//! use std::sync::Arc;
 //! use std::fs::File;
 //!
 //! let file = File::open("parquet.file").unwrap();
 //! let file_reader = SerializedFileReader::new(file).unwrap();
-//! let mut arrow_reader = ParquetFileArrowReader::new(Rc::new(file_reader));
+//! let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
 //!
 //! println!("Converted arrow schema is: {}", arrow_reader.get_schema().unwrap());
 //! println!("Arrow schema after projection is: {}",
-//!    arrow_reader.get_schema_by_columns(vec![2, 4, 6]).unwrap());
+//!    arrow_reader.get_schema_by_columns(vec![2, 4, 6], true).unwrap());
 //!
 //! let mut record_batch_reader = arrow_reader.get_record_reader(2048).unwrap();
 //!
-//! loop {
-//!    let record_batch = record_batch_reader.next_batch().unwrap().unwrap();
+//! for maybe_record_batch in record_batch_reader {
+//!    let record_batch = maybe_record_batch.unwrap();
 //!    if record_batch.num_rows() > 0 {
 //!        println!("Read {} records.", record_batch.num_rows());
 //!    } else {
@@ -51,10 +51,19 @@
 
 pub(in crate::arrow) mod array_reader;
 pub mod arrow_reader;
+pub mod arrow_writer;
 pub(in crate::arrow) mod converter;
+pub mod levels;
 pub(in crate::arrow) mod record_reader;
 pub mod schema;
 
 pub use self::arrow_reader::ArrowReader;
 pub use self::arrow_reader::ParquetFileArrowReader;
-pub use self::schema::{parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns};
+pub use self::arrow_writer::ArrowWriter;
+pub use self::schema::{
+    arrow_to_parquet_schema, parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns,
+    parquet_to_arrow_schema_by_root_columns,
+};
+
+/// Schema metadata key used to store serialized Arrow IPC schema
+pub const ARROW_SCHEMA_META_KEY: &str = "ARROW:schema";
