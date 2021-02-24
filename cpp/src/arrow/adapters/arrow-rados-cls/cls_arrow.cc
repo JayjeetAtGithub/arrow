@@ -139,7 +139,7 @@ static arrow::Status ScanParquetObject(cls_method_context_t hctx,
   ceph::bufferlist* bl = new ceph::bufferlist();
   cls_cxx_read(hctx, 0, 0, bl);
 
-  auto buffer = std::make_shared<arrow::Buffer>(bl->c_str(), bl->length());
+  auto buffer = std::make_shared<arrow::Buffer>((uint8_t*)bl->c_str(), bl->length());
   ARROW_ASSIGN_OR_RAISE(auto file, arrow::Buffer::GetReader(buffer));
 
   arrow::dataset::FileSource source(file);
