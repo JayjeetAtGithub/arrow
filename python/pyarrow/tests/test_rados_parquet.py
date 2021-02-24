@@ -69,39 +69,39 @@ def test_without_partition_pruning():
     assert rados_parquet_df.equals(parquet_df) == 1
 
 
-@pytest.mark.rados
-def test_with_partition_pruning():
-    if skip:
-        return
-    filter_expression = (
-        (ds.field('tip_amount') > 10) &
-        (ds.field('payment_type') > 2) &
-        (ds.field('VendorID') > 1)
-    )
-    projection_cols = ['payment_type', 'tip_amount', 'VendorID']
-    partitioning = ds.partitioning(
-        pa.schema([("payment_type", pa.int32()), ("VendorID", pa.int32())]),
-        flavor="hive"
-    )
+# @pytest.mark.rados
+# def test_with_partition_pruning():
+#     if skip:
+#         return
+#     filter_expression = (
+#         (ds.field('tip_amount') > 10) &
+#         (ds.field('payment_type') > 2) &
+#         (ds.field('VendorID') > 1)
+#     )
+#     projection_cols = ['payment_type', 'tip_amount', 'VendorID']
+#     partitioning = ds.partitioning(
+#         pa.schema([("payment_type", pa.int32()), ("VendorID", pa.int32())]),
+#         flavor="hive"
+#     )
 
-    rados_parquet_dataset = ds.dataset(
-        "file:///mnt/cephfs/nyc/",
-        partitioning=partitioning,
-        format=ds.RadosParquetFileFormat("/etc/ceph/ceph.conf")
-    )
-    parquet_dataset = ds.dataset(
-        "file:///mnt/cephfs/nyc/",
-        partitioning=partitioning,
-        format="parquet"
-    )
+#     rados_parquet_dataset = ds.dataset(
+#         "file:///mnt/cephfs/nyc/",
+#         partitioning=partitioning,
+#         format=ds.RadosParquetFileFormat("/etc/ceph/ceph.conf")
+#     )
+#     parquet_dataset = ds.dataset(
+#         "file:///mnt/cephfs/nyc/",
+#         partitioning=partitioning,
+#         format="parquet"
+#     )
 
-    rados_parquet_df = rados_parquet_dataset.to_table(
-        columns=projection_cols, filter=filter_expression).to_pandas()
+#     rados_parquet_df = rados_parquet_dataset.to_table(
+#         columns=projection_cols, filter=filter_expression).to_pandas()
 
-    parquet_df = parquet_dataset.to_table(
-        columns=projection_cols, filter=filter_expression).to_pandas()
+#     parquet_df = parquet_dataset.to_table(
+#         columns=projection_cols, filter=filter_expression).to_pandas()
 
-    assert rados_parquet_df.equals(parquet_df) == 1
+#     assert rados_parquet_df.equals(parquet_df) == 1
 
 
 @pytest.mark.rados

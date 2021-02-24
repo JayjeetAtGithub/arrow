@@ -114,40 +114,40 @@ TEST(TestClsSDK, SimpleQuery) {
   std::cout << "Table: " << table->ToString() << "\n";
 }
 
-TEST(TestClsSDK, QueryOnPartitionKey) {
-  auto format = GetFormat();
+// TEST(TestClsSDK, QueryOnPartitionKey) {
+//   auto format = GetFormat();
 
-  std::string path;
-  auto fs = GetFileSystemFromUri("file:///mnt/cephfs/nyc", &path);
-  auto dataset = GetDatasetFromPath(fs, format, path);
+//   std::string path;
+//   auto fs = GetFileSystemFromUri("file:///mnt/cephfs/nyc", &path);
+//   auto dataset = GetDatasetFromPath(fs, format, path);
 
-  std::vector<std::string> columns = {"fare_amount", "VendorID", "payment_type"};
-  auto filter = arrow::dataset::greater(arrow::dataset::field_ref("payment_type"),
-                                        arrow::dataset::literal(2));
+//   std::vector<std::string> columns = {"fare_amount", "VendorID", "payment_type"};
+//   auto filter = arrow::dataset::greater(arrow::dataset::field_ref("payment_type"),
+//                                         arrow::dataset::literal(2));
 
-  auto scanner = GetScannerFromDataset(dataset, columns, filter, false);
+//   auto scanner = GetScannerFromDataset(dataset, columns, filter, false);
 
-  auto table = scanner->ToTable().ValueOrDie();
-  std::cout << "Table size: " << table->num_rows() << "\n";
-  std::cout << "Table: " << table->ToString() << "\n";
-}
+//   auto table = scanner->ToTable().ValueOrDie();
+//   std::cout << "Table size: " << table->num_rows() << "\n";
+//   std::cout << "Table: " << table->ToString() << "\n";
+// }
 
-TEST(TestClsSDK, QueryOnlyOnPartitionKey) {
-  auto format = GetFormat();
-  std::string path;
-  auto fs = GetFileSystemFromUri("file:///mnt/cephfs/nyc", &path);
-  auto dataset = GetDatasetFromPath(fs, format, path);
+// TEST(TestClsSDK, QueryOnlyOnPartitionKey) {
+//   auto format = GetFormat();
+//   std::string path;
+//   auto fs = GetFileSystemFromUri("file:///mnt/cephfs/nyc", &path);
+//   auto dataset = GetDatasetFromPath(fs, format, path);
 
-  std::vector<std::string> columns = {"total_amount", "VendorID", "payment_type"};
-  auto filter = arrow::dataset::and_(
-      arrow::dataset::greater(arrow::dataset::field_ref("payment_type"),
-                              arrow::dataset::literal(2)),
-      arrow::dataset::greater(arrow::dataset::field_ref("VendorID"),
-                              arrow::dataset::literal(1)));
+//   std::vector<std::string> columns = {"total_amount", "VendorID", "payment_type"};
+//   auto filter = arrow::dataset::and_(
+//       arrow::dataset::greater(arrow::dataset::field_ref("payment_type"),
+//                               arrow::dataset::literal(2)),
+//       arrow::dataset::greater(arrow::dataset::field_ref("VendorID"),
+//                               arrow::dataset::literal(1)));
 
-  auto scanner = GetScannerFromDataset(dataset, columns, filter, true);
+//   auto scanner = GetScannerFromDataset(dataset, columns, filter, true);
 
-  auto table = scanner->ToTable().ValueOrDie();
-  std::cout << "Table size: " << table->num_rows() << "\n";
-  std::cout << "Table: " << table->ToString() << "\n";
-}
+//   auto table = scanner->ToTable().ValueOrDie();
+//   std::cout << "Table size: " << table->num_rows() << "\n";
+//   std::cout << "Table: " << table->ToString() << "\n";
+// }

@@ -134,8 +134,13 @@ static arrow::Status ScanParquetObject(cls_method_context_t hctx,
                                        std::shared_ptr<arrow::Schema> projection_schema,
                                        std::shared_ptr<arrow::Schema> dataset_schema,
                                        std::shared_ptr<arrow::Table>& t) {
-  auto file = std::make_shared<RandomAccessObject>(hctx);
-  ARROW_RETURN_NOT_OK(file->Init());
+
+  // get the entire parquet file into the bufferlist
+  ceph::bufferlist* bl = new ceph::bufferlist();
+  cls_cxx_read(hctx, 0, 0, bl);
+
+  auto buffer = std::make_shared<arrow::Buffer>(bl->c_str(), bl->length());
+  ARROW_ASSIGN_OR_RAISE(auto file, arrow::Buffer::GetReader(buffer));
 
   arrow::dataset::FileSource source(file);
 
