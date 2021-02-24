@@ -22,15 +22,27 @@ arrow_install_all_headers("arrow/dataset")
 set(ARROW_DATASET_SRCS
     dataset.cc
     discovery.cc
+    expression.cc
     file_base.cc
     file_ipc.cc
-    filter.cc
     partition.cc
     projector.cc
     scanner.cc)
 
 set(ARROW_DATASET_LINK_STATIC arrow_static)
 set(ARROW_DATASET_LINK_SHARED arrow_shared)
+
+if(ARROW_RADOS)
+  find_package(librados REQUIRED)
+  include_directories(${LIBRADOS_INCLUDE_DIR})
+
+  set(ARROW_DATASET_LINK_STATIC ${ARROW_DATASET_LINK_STATIC} ${LIBRADOS_LIBRARIES})
+  set(ARROW_DATASET_LINK_SHARED ${ARROW_DATASET_LINK_SHARED} ${LIBRADOS_LIBRARIES})
+
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} file_rados_parquet.cc)
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} rados_utils.cc)
+  set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} rados.cc)
+endif()
 
 if(ARROW_CSV)
   set(ARROW_DATASET_SRCS ${ARROW_DATASET_SRCS} file_csv.cc)
@@ -106,9 +118,9 @@ endfunction()
 
 add_arrow_dataset_test(dataset_test)
 add_arrow_dataset_test(discovery_test)
+add_arrow_dataset_test(expression_test)
 add_arrow_dataset_test(file_ipc_test)
 add_arrow_dataset_test(file_test)
-add_arrow_dataset_test(filter_test)
 add_arrow_dataset_test(partition_test)
 add_arrow_dataset_test(scanner_test)
 

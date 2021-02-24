@@ -49,18 +49,9 @@ if [ "${IS_RC}" = "yes" ]; then
 fi
 
 have_flight=yes
-have_gandiva=yes
 have_plasma=yes
+workaround_missing_packages=()
 case "${distribution}-${code_name}" in
-  debian-stretch)
-    sed \
-      -i"" \
-      -e "s/ main$/ main contrib non-free/g" \
-      /etc/apt/sources.list
-    cat <<APT_LINE > /etc/apt/sources.list.d/backports.list
-deb http://deb.debian.org/debian ${code_name}-backports main
-APT_LINE
-    ;;
   debian-buster)
     sed \
       -i"" \
@@ -69,10 +60,13 @@ APT_LINE
     ;;
   ubuntu-xenial)
     have_flight=no
+    workaround_missing_packages+=(libprotobuf-dev)
+    ;;
+  ubuntu-groovy)
+    workaround_missing_packages+=(libgrpc++-dev protobuf-compiler-grpc)
     ;;
 esac
 if [ "$(arch)" = "aarch64" ]; then
-  have_gandiva=no
   have_plasma=no
 fi
 
@@ -98,6 +92,20 @@ fi
 apt update
 
 apt install -y -V libarrow-glib-dev=${deb_version}
+apt install -y -V \
+  cmake \
+  g++ \
+  git \
+  ${workaround_missing_packages[@]}
+mkdir -p build
+cp -a /arrow/cpp/examples/minimal_build build
+pushd build/minimal_build
+cmake .
+make -j$(nproc)
+./arrow_example
+popd
+
+apt install -y -V libarrow-glib-dev=${deb_version}
 apt install -y -V libarrow-glib-doc=${deb_version}
 
 if [ "${have_flight}" = "yes" ]; then
@@ -112,10 +120,8 @@ if [ "${have_plasma}" = "yes" ]; then
   apt install -y -V plasma-store-server=${deb_version}
 fi
 
-if [ "${have_gandiva}" = "yes" ]; then
-  apt install -y -V libgandiva-glib-dev=${deb_version}
-  apt install -y -V libgandiva-glib-doc=${deb_version}
-fi
+apt install -y -V libgandiva-glib-dev=${deb_version}
+apt install -y -V libgandiva-glib-doc=${deb_version}
 
 apt install -y -V libparquet-glib-dev=${deb_version}
 apt install -y -V libparquet-glib-doc=${deb_version}

@@ -23,16 +23,15 @@ use std::sync::Arc;
 
 extern crate arrow;
 
-use arrow::array::*;
 use arrow::compute::kernels::arithmetic::*;
 use arrow::compute::kernels::limit::*;
+use arrow::util::bench_util::*;
+use arrow::{array::*, datatypes::Float32Type};
 
-fn create_array(size: usize) -> ArrayRef {
-    let mut builder = Float32Builder::new(size);
-    for i in 0..size {
-        builder.append_value(1.0 + 1.0 * i as f32).unwrap();
-    }
-    Arc::new(builder.finish())
+fn create_array(size: usize, with_nulls: bool) -> ArrayRef {
+    let null_density = if with_nulls { 0.5 } else { 0.0 };
+    let array = create_primitive_array::<Float32Type>(size, null_density);
+    Arc::new(array)
 }
 
 fn bench_add(arr_a: &ArrayRef, arr_b: &ArrayRef) {
@@ -60,12 +59,12 @@ fn bench_divide(arr_a: &ArrayRef, arr_b: &ArrayRef) {
 }
 
 fn bench_limit(arr_a: &ArrayRef, max: usize) {
-    criterion::black_box(limit(arr_a, max).unwrap());
+    criterion::black_box(limit(arr_a, max));
 }
 
 fn add_benchmark(c: &mut Criterion) {
-    let arr_a = create_array(512);
-    let arr_b = create_array(512);
+    let arr_a = create_array(512, false);
+    let arr_b = create_array(512, false);
 
     c.bench_function("add 512", |b| b.iter(|| bench_add(&arr_a, &arr_b)));
     c.bench_function("subtract 512", |b| {
@@ -76,6 +75,15 @@ fn add_benchmark(c: &mut Criterion) {
     });
     c.bench_function("divide 512", |b| b.iter(|| bench_divide(&arr_a, &arr_b)));
     c.bench_function("limit 512, 512", |b| b.iter(|| bench_limit(&arr_a, 512)));
+
+    let arr_a_nulls = create_array(512, false);
+    let arr_b_nulls = create_array(512, false);
+    c.bench_function("add_nulls_512", |b| {
+        b.iter(|| bench_add(&arr_a_nulls, &arr_b_nulls))
+    });
+    c.bench_function("divide_nulls_512", |b| {
+        b.iter(|| bench_divide(&arr_a_nulls, &arr_b_nulls))
+    });
 }
 
 criterion_group!(benches, add_benchmark);

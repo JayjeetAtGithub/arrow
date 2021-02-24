@@ -15,13 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cell::RefCell, cmp, io::*};
+use std::{cell::RefCell, cmp, fmt, io::*};
 
-use crate::file::{reader::ParquetReader, writer::ParquetWriter};
+use crate::file::{reader::Length, writer::ParquetWriter};
 
 const DEFAULT_BUF_SIZE: usize = 8 * 1024;
 
 // ----------------------------------------------------------------------
+
+/// TryClone tries to clone the type and should maintain the `Seek` position of the given
+/// instance.
+pub trait TryClone: Sized {
+    /// Clones the type returning a new instance or an error if it's not possible
+    /// to clone it.
+    fn try_clone(&self) -> Result<Self>;
+}
+
+/// ParquetReader is the interface which needs to be fulfilled to be able to parse a
+/// parquet source.
+pub trait ParquetReader: Read + Seek + Length + TryClone {}
+impl<T: Read + Seek + Length + TryClone> ParquetReader for T {}
+
 // Read/Write wrappers for `File`.
 
 /// Position trait returns the current position in the stream.
@@ -49,6 +63,19 @@ pub struct FileSource<R: ParquetReader> {
     buf_cap: usize, // current number of bytes read into the buffer
 }
 
+impl<R: ParquetReader> fmt::Debug for FileSource<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileSource")
+            .field("reader", &"OPAQUE")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("buf.len", &self.buf.len())
+            .field("buf_pos", &self.buf_pos)
+            .field("buf_cap", &self.buf_cap)
+            .finish()
+    }
+}
+
 impl<R: ParquetReader> FileSource<R> {
     /// Creates new file reader with start and length from a file handle
     pub fn new(fd: &R, start: u64, length: usize) -> Self {
@@ -57,7 +84,7 @@ impl<R: ParquetReader> FileSource<R> {
             reader,
             start,
             end: start + length as u64,
-            buf: vec![0 as u8; DEFAULT_BUF_SIZE],
+            buf: vec![0_u8; DEFAULT_BUF_SIZE],
             buf_pos: 0,
             buf_cap: 0,
         }
@@ -118,6 +145,12 @@ impl<R: ParquetReader> Read for FileSource<R> {
 impl<R: ParquetReader> Position for FileSource<R> {
     fn pos(&self) -> u64 {
         self.start
+    }
+}
+
+impl<R: ParquetReader> Length for FileSource<R> {
+    fn len(&self) -> u64 {
+        self.end - self.start
     }
 }
 
@@ -202,10 +235,10 @@ mod tests {
     fn test_io_read_pos() {
         let mut src = FileSource::new(&get_test_file("alltypes_plain.parquet"), 0, 4);
 
-        src.read(&mut vec![0; 1]).unwrap();
+        let _ = src.read(&mut [0; 1]).unwrap();
         assert_eq!(src.pos(), 1);
 
-        src.read(&mut vec![0; 4]).unwrap();
+        let _ = src.read(&mut [0; 4]).unwrap();
         assert_eq!(src.pos(), 4);
     }
 
@@ -214,11 +247,11 @@ mod tests {
         let mut src = FileSource::new(&get_test_file("alltypes_plain.parquet"), 0, 4);
 
         // Read all bytes from source
-        src.read(&mut vec![0; 128]).unwrap();
+        let _ = src.read(&mut [0; 128]).unwrap();
         assert_eq!(src.pos(), 4);
 
         // Try reading again, should return 0 bytes.
-        let bytes_read = src.read(&mut vec![0; 128]).unwrap();
+        let bytes_read = src.read(&mut [0; 128]).unwrap();
         assert_eq!(bytes_read, 0);
         assert_eq!(src.pos(), 4);
     }
@@ -229,7 +262,7 @@ mod tests {
         let mut file = get_test_file("alltypes_plain.parquet");
         let mut src = FileSource::new(&file, 0, 4);
 
-        file.seek(SeekFrom::Start(5 as u64))
+        file.seek(SeekFrom::Start(5_u64))
             .expect("File seek to a position");
 
         let bytes_read = src.read(&mut buf[..]).unwrap();
@@ -246,7 +279,7 @@ mod tests {
         let mut sink = FileSink::new(&file);
         assert_eq!(sink.pos(), 3);
 
-        sink.write(&[b'd', b'e', b'f', b'g']).unwrap();
+        sink.write_all(&[b'd', b'e', b'f', b'g']).unwrap();
         assert_eq!(sink.pos(), 7);
 
         sink.flush().unwrap();
@@ -256,7 +289,7 @@ mod tests {
         let mut res = vec![0u8; 7];
         let mut chunk =
             FileSource::new(&file, 0, file.metadata().unwrap().len() as usize);
-        chunk.read(&mut res[..]).unwrap();
+        chunk.read_exact(&mut res[..]).unwrap();
         assert_eq!(res, vec![b'a', b'b', b'c', b'd', b'e', b'f', b'g']);
     }
 

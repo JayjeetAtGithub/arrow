@@ -79,7 +79,7 @@ cdef class ChunkedArray(_PandasConvertible):
                 )
             )
 
-        return frombytes(result)
+        return frombytes(result, safe=True)
 
     def format(self, **kwargs):
         import warnings
@@ -158,15 +158,12 @@ cdef class ChunkedArray(_PandasConvertible):
         """
         if isinstance(key, slice):
             return _normalize_slice(self, key)
-        elif isinstance(key, int):
-            return self.getitem(key)
-        else:
-            raise TypeError("key must either be a slice or integer")
 
-    cdef getitem(self, int64_t i):
+        return self.getitem(_normalize_index(key, self.chunked_array.length()))
+
+    cdef getitem(self, int64_t index):
         cdef int j
 
-        index = _normalize_index(i, self.chunked_array.length())
         for j in range(self.num_chunks):
             if index < self.chunked_array.chunk(j).get().length():
                 return self.chunk(j)[index]
@@ -313,6 +310,21 @@ cdef class ChunkedArray(_PandasConvertible):
 
         return [pyarrow_wrap_chunked_array(col) for col in flattened]
 
+    def combine_chunks(self, MemoryPool memory_pool=None):
+        """
+        Flatten this ChunkedArray into a single non-chunked array.
+
+        Parameters
+        ----------
+        memory_pool : MemoryPool, default None
+            For memory allocations, if required, otherwise use default pool
+
+        Returns
+        -------
+        result : Array
+        """
+        return concat_arrays(self.chunks)
+
     def unique(self):
         """
         Compute distinct elements in array
@@ -354,6 +366,7 @@ cdef class ChunkedArray(_PandasConvertible):
         if offset < 0:
             raise IndexError('Offset must be non-negative')
 
+        offset = min(len(self), offset)
         if length is None:
             result = self.chunked_array.Slice(offset)
         else:
@@ -674,6 +687,21 @@ cdef class RecordBatch(_PandasConvertible):
 
         return self._schema
 
+    def field(self, i):
+        """
+        Select a schema field by its column name or numeric index
+
+        Parameters
+        ----------
+        i : int or string
+            The index or name of the field to retrieve
+
+        Returns
+        -------
+        pyarrow.Field
+        """
+        return self.schema.field(i)
+
     @property
     def columns(self):
         """
@@ -685,9 +713,51 @@ cdef class RecordBatch(_PandasConvertible):
         """
         return [self.column(i) for i in range(self.num_columns)]
 
+    def _ensure_integer_index(self, i):
+        """
+        Ensure integer index (convert string column name to integer if needed).
+        """
+        if isinstance(i, (bytes, str)):
+            field_indices = self.schema.get_all_field_indices(i)
+
+            if len(field_indices) == 0:
+                raise KeyError(
+                    "Field \"{}\" does not exist in record batch schema"
+                    .format(i))
+            elif len(field_indices) > 1:
+                raise KeyError(
+                    "Field \"{}\" exists {} times in record batch schema"
+                    .format(i, len(field_indices)))
+            else:
+                return field_indices[0]
+        elif isinstance(i, int):
+            return i
+        else:
+            raise TypeError("Index must either be string or integer")
+
     def column(self, i):
         """
         Select single column from record batch
+
+        Parameters
+        ----------
+        i : int or string
+            The index or name of the column to retrieve.
+
+        Returns
+        -------
+        column : pyarrow.Array
+        """
+        return self._column(self._ensure_integer_index(i))
+
+    def _column(self, int i):
+        """
+        Select single column from record batch by its numeric index.
+
+        Parameters
+        ----------
+        i : int
+            The index of the column to retrieve.
 
         Returns
         -------
@@ -713,17 +783,17 @@ cdef class RecordBatch(_PandasConvertible):
 
     def __getitem__(self, key):
         """
-        Slice or return column at given index
+        Slice or return column at given index or column name
 
         Parameters
         ----------
-        key : integer or slice
+        key : integer, str, or slice
             Slices with step not equal to 1 (or None) will produce a copy
             rather than a zero-copy view
 
         Returns
         -------
-        value : ChunkedArray (index) or RecordBatch (slice)
+        value : Array (index/column) or RecordBatch (slice)
         """
         if isinstance(key, slice):
             return _normalize_slice(self, key)
@@ -773,6 +843,7 @@ cdef class RecordBatch(_PandasConvertible):
         if offset < 0:
             raise IndexError('Offset must be non-negative')
 
+        offset = min(len(self), offset)
         if length is None:
             result = self.batch.Slice(offset)
         else:
@@ -1116,6 +1187,19 @@ cdef class Table(_PandasConvertible):
         return _reconstruct_table, (columns, self.schema)
 
     def __getitem__(self, key):
+        """
+        Slice or return column at given index or column name
+
+        Parameters
+        ----------
+        key : integer, str, or slice
+            Slices with step not equal to 1 (or None) will produce a copy
+            rather than a zero-copy view
+
+        Returns
+        -------
+        value : ChunkedArray (index/column) or Table (slice)
+        """
         if isinstance(key, slice):
             return _normalize_slice(self, key)
         else:
@@ -1142,6 +1226,7 @@ cdef class Table(_PandasConvertible):
         if offset < 0:
             raise IndexError('Offset must be non-negative')
 
+        offset = min(len(self), offset)
         if length is None:
             result = self.table.Slice(offset)
         else:

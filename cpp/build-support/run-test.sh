@@ -65,14 +65,10 @@ function setup_sanitizers() {
 
   # Configure TSAN (ignored if this isn't a TSAN build).
   #
-  # Deadlock detection (new in clang 3.5) is disabled because:
-  # 1. The clang 3.5 deadlock detector crashes in some unit tests. It
-  #    needs compiler-rt commits c4c3dfd, 9a8efe3, and possibly others.
-  # 2. Many unit tests report lock-order-inversion warnings; they should be
-  #    fixed before reenabling the detector.
-  TSAN_OPTIONS="$TSAN_OPTIONS detect_deadlocks=0"
   TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$ROOT/build-support/tsan-suppressions.txt"
   TSAN_OPTIONS="$TSAN_OPTIONS history_size=7"
+  # Some tests deliberately fail allocating memory
+  TSAN_OPTIONS="$TSAN_OPTIONS allocator_may_return_null=1"
   export TSAN_OPTIONS
 
   UBSAN_OPTIONS="$UBSAN_OPTIONS print_stacktrace=1"
@@ -96,12 +92,14 @@ function run_test() {
   # even when retries are successful.
   rm -f $XMLFILE
 
-  $TEST_EXECUTABLE "$@" 2>&1 \
+  $TEST_EXECUTABLE "$@" > $LOGFILE.raw 2>&1
+  STATUS=$?
+  cat $LOGFILE.raw \
     | ${PYTHON:-python} $ROOT/build-support/asan_symbolize.py \
     | ${CXXFILT:-c++filt} \
     | $ROOT/build-support/stacktrace_addr2line.pl $TEST_EXECUTABLE \
     | $pipe_cmd 2>&1 | tee $LOGFILE
-  STATUS=$?
+  rm -f $LOGFILE.raw
 
   # TSAN doesn't always exit with a non-zero exit code due to a bug:
   # mutex errors don't get reported through the normal error reporting infrastructure.

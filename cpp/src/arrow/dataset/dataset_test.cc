@@ -211,6 +211,7 @@ TEST(TestProjector, CheckProjectable) {
   auto i8_req = field("i8", int8(), false);
   auto u16_req = field("u16", uint16(), false);
   auto str_req = field("str", utf8(), false);
+  auto str_nil = field("str", null());
 
   // trivial
   Assert({}).ProjectableTo({});
@@ -235,6 +236,8 @@ TEST(TestProjector, CheckProjectable) {
   Assert({i8}).NotProjectableTo({i8_req},
                                 "not nullable but is not required in origin schema");
   Assert({i8_req}).ProjectableTo({i8});
+  Assert({str_nil}).ProjectableTo({str});
+  Assert({str_nil}).NotProjectableTo({str_req});
 
   // change field type
   Assert({i8}).NotProjectableTo({field("i8", utf8())},
@@ -257,15 +260,18 @@ TEST(TestProjector, MismatchedType) {
 TEST(TestProjector, AugmentWithNull) {
   constexpr int64_t kBatchSize = 1024;
 
-  auto from_schema = schema({field("f64", float64()), field("b", boolean())});
+  auto from_schema =
+      schema({field("f64", float64()), field("b", boolean()), field("str", null())});
   auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, from_schema);
-  auto to_schema = schema({field("i32", int32()), field("f64", float64())});
+  auto to_schema =
+      schema({field("i32", int32()), field("f64", float64()), field("str", utf8())});
 
   RecordBatchProjector projector(to_schema);
 
   ASSERT_OK_AND_ASSIGN(auto null_i32, MakeArrayOfNull(int32(), batch->num_rows()));
-  auto expected_batch =
-      RecordBatch::Make(to_schema, batch->num_rows(), {null_i32, batch->column(0)});
+  ASSERT_OK_AND_ASSIGN(auto null_str, MakeArrayOfNull(utf8(), batch->num_rows()));
+  auto expected_batch = RecordBatch::Make(to_schema, batch->num_rows(),
+                                          {null_i32, batch->column(0), null_str});
 
   ASSERT_OK_AND_ASSIGN(auto reconciled_batch, projector.Project(*batch));
   AssertBatchesEqual(*expected_batch, *reconciled_batch);
@@ -499,20 +505,18 @@ TEST_F(TestEndToEnd, EndToEndSingleDataset) {
   // The following filter tests both predicate pushdown and post filtering
   // without partition information because `year` is a partition and `sales` is
   // not.
-  auto filter = ("year"_ == 2019 && "sales"_ > 100.0);
+  auto filter = and_(equal(field_ref("year"), literal(2019)),
+                     greater(field_ref("sales"), literal(100.0)));
   ASSERT_OK(scanner_builder->Filter(filter));
 
   ASSERT_OK_AND_ASSIGN(auto scanner, scanner_builder->Finish());
   // In the simplest case, consumption is simply conversion to a Table.
   ASSERT_OK_AND_ASSIGN(auto table, scanner->ToTable());
 
-  using row_type = std::tuple<double, std::string, util::optional<std::string>>;
-  std::vector<row_type> rows{
-      row_type{152.25, "3", "CA"},
-      row_type{273.5, "3", "US"},
-  };
-  std::shared_ptr<Table> expected;
-  ASSERT_OK(stl::TableFromTupleRange(default_memory_pool(), rows, columns, &expected));
+  auto expected = TableFromJSON(scanner->schema(), {R"([
+    {"sales": 152.25, "model": "3", "country": "CA"},
+    {"sales": 273.5, "model": "3", "country": "US"}
+  ])"});
   AssertTablesEqual(*expected, *table, false, true);
 }
 
@@ -698,8 +702,10 @@ TEST_F(TestSchemaUnification, SelectPhysicalColumnsFilterPartitionColumn) {
   //   when some of the columns may not be materialized
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
   ASSERT_OK(scan_builder->Project({"phy_2", "phy_3", "phy_4"}));
-  ASSERT_OK(scan_builder->Filter(("part_df"_ == 1 && "phy_2"_ == 211) ||
-                                 ("part_ds"_ == 2 && "phy_4"_ != 422)));
+  ASSERT_OK(scan_builder->Filter(or_(and_(equal(field_ref("part_df"), literal(1)),
+                                          equal(field_ref("phy_2"), literal(211))),
+                                     and_(equal(field_ref("part_ds"), literal(2)),
+                                          not_equal(field_ref("phy_4"), literal(422))))));
 
   using TupleType = std::tuple<i32, i32, i32>;
   std::vector<TupleType> rows = {
@@ -730,7 +736,7 @@ TEST_F(TestSchemaUnification, SelectPartitionColumns) {
 TEST_F(TestSchemaUnification, SelectPartitionColumnsFilterPhysicalColumn) {
   // Selects re-ordered virtual columns with a filter on a physical columns
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_1"_ == 111));
+  ASSERT_OK(scan_builder->Filter(equal(field_ref("phy_1"), literal(111))));
 
   ASSERT_OK(scan_builder->Project({"part_df", "part_ds"}));
   using TupleType = std::tuple<i32, i32>;
@@ -741,10 +747,10 @@ TEST_F(TestSchemaUnification, SelectPartitionColumnsFilterPhysicalColumn) {
 }
 
 TEST_F(TestSchemaUnification, SelectMixedColumnsAndFilter) {
-  // Selects mix of phyical/virtual with a different order and uses a filter on
+  // Selects mix of physical/virtual with a different order and uses a filter on
   // a physical column not selected.
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_2"_ >= 212));
+  ASSERT_OK(scan_builder->Filter(greater_equal(field_ref("phy_2"), literal(212))));
   ASSERT_OK(scan_builder->Project({"part_df", "phy_3", "part_ds", "phy_1"}));
 
   using TupleType = std::tuple<i32, i32, i32, i32>;
@@ -782,8 +788,7 @@ TEST(TestDictPartitionColumn, SelectPartitionColumnFilterPhysicalColumn) {
 
   // Selects re-ordered virtual column with a filter on a physical column
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_1"_ == 111));
-
+  ASSERT_OK(scan_builder->Filter(equal(field_ref("phy_1"), literal(111))));
   ASSERT_OK(scan_builder->Project({"part"}));
 
   ASSERT_OK_AND_ASSIGN(auto scanner, scan_builder->Finish());

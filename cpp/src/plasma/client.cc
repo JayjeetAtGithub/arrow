@@ -64,7 +64,6 @@ using arrow::cuda::CudaDeviceManager;
 #endif
 
 #define XXH_INLINE_ALL 1
-#define XXH_NAMESPACE plasma_client_
 #include "arrow/vendored/xxhash.h"
 
 #define XXH64_DEFAULT_SEED 0
@@ -797,7 +796,7 @@ bool PlasmaClient::Impl::ComputeObjectHashParallel(XXH64_state_t* hash_state,
   // | num_threads * chunk_size | suffix |, where chunk_size = k * block_size.
   // Each thread gets a "chunk" of k blocks, except the suffix thread.
 
-  std::vector<arrow::Future<void>> futures;
+  std::vector<arrow::Future<>> futures;
   for (int i = 0; i < num_threads; i++) {
     futures.push_back(*pool->Submit(
         ComputeBlockHash, reinterpret_cast<uint8_t*>(data_address) + i * chunk_size,

@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/dataset/filter.h"
+#include "arrow/dataset/expression.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
 #include "arrow/util/optional.h"
@@ -60,16 +60,16 @@ class ARROW_DS_EXPORT Partitioning {
   virtual std::string type_name() const = 0;
 
   /// \brief If the input batch shares any fields with this partitioning,
-  /// produce slices of the batch which satisfy mutually exclusive Expressions.
-  struct PartitionedBatch {
-    std::shared_ptr<RecordBatch> batch;
-    std::shared_ptr<Expression> partition_expression;
+  /// produce sub-batches which satisfy mutually exclusive Expressions.
+  struct PartitionedBatches {
+    RecordBatchVector batches;
+    std::vector<Expression> expressions;
   };
-  virtual Result<std::vector<PartitionedBatch>> Partition(
+  virtual Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const = 0;
 
   /// \brief Parse a path into a partition expression
-  virtual Result<std::shared_ptr<Expression>> Parse(const std::string& path) const = 0;
+  virtual Result<Expression> Parse(const std::string& path) const = 0;
 
   virtual Result<std::string> Format(const Expression& expr) const = 0;
 
@@ -85,14 +85,11 @@ class ARROW_DS_EXPORT Partitioning {
 };
 
 struct PartitioningFactoryOptions {
-  /// When inferring a schema for partition fields, string fields may be inferred as
-  /// a dictionary type instead. This can be more efficient when materializing virtual
-  /// columns. If the number of discovered unique values of a string field exceeds
-  /// max_partition_dictionary_size, it will instead be inferred as a string.
-  ///
-  /// max_partition_dictionary_size = 0: No fields will be inferred as dictionary.
-  /// max_partition_dictionary_size = -1: All fields will be inferred as dictionary.
-  int max_partition_dictionary_size = 0;
+  /// When inferring a schema for partition fields, yield dictionary encoded types
+  /// instead of plain. This can be more efficient when materializing virtual
+  /// columns, and Expressions parsed by the finished Partitioning will include
+  /// dictionaries of all unique inspected values for each field.
+  bool infer_dictionary = false;
 };
 
 /// \brief PartitioningFactory provides creation of a partitioning  when the
@@ -125,21 +122,13 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
     std::string name, value;
   };
 
-  static Status VisitKeys(
-      const Expression& expr,
-      const std::function<Status(const std::string& name,
-                                 const std::shared_ptr<Scalar>& value)>& visitor);
-
-  static Result<std::unordered_map<std::string, std::shared_ptr<Scalar>>> GetKeys(
-      const Expression& expr);
-
   static Status SetDefaultValuesFromKeys(const Expression& expr,
                                          RecordBatchProjector* projector);
 
-  Result<std::vector<PartitionedBatch>> Partition(
+  Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const override;
 
-  Result<std::shared_ptr<Expression>> Parse(const std::string& path) const override;
+  Result<Expression> Parse(const std::string& path) const override;
 
   Result<std::string> Format(const Expression& expr) const override;
 
@@ -153,10 +142,10 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
 
   virtual std::vector<Key> ParseKeys(const std::string& path) const = 0;
 
-  virtual Result<std::string> FormatValues(const std::vector<Scalar*>& values) const = 0;
+  virtual Result<std::string> FormatValues(const ScalarVector& values) const = 0;
 
   /// Convert a Key to a full expression.
-  Result<std::shared_ptr<Expression>> ConvertKey(const Key& key) const;
+  Result<Expression> ConvertKey(const Key& key) const;
 
   ArrayVector dictionaries_;
 };
@@ -183,7 +172,7 @@ class ARROW_DS_EXPORT DirectoryPartitioning : public KeyValuePartitioning {
  private:
   std::vector<Key> ParseKeys(const std::string& path) const override;
 
-  Result<std::string> FormatValues(const std::vector<Scalar*>& values) const override;
+  Result<std::string> FormatValues(const ScalarVector& values) const override;
 };
 
 /// \brief Multi-level, directory based partitioning
@@ -212,14 +201,13 @@ class ARROW_DS_EXPORT HivePartitioning : public KeyValuePartitioning {
  private:
   std::vector<Key> ParseKeys(const std::string& path) const override;
 
-  Result<std::string> FormatValues(const std::vector<Scalar*>& values) const override;
+  Result<std::string> FormatValues(const ScalarVector& values) const override;
 };
 
 /// \brief Implementation provided by lambda or other callable
 class ARROW_DS_EXPORT FunctionPartitioning : public Partitioning {
  public:
-  using ParseImpl =
-      std::function<Result<std::shared_ptr<Expression>>(const std::string&)>;
+  using ParseImpl = std::function<Result<Expression>(const std::string&)>;
 
   using FormatImpl = std::function<Result<std::string>(const Expression&)>;
 
@@ -232,7 +220,7 @@ class ARROW_DS_EXPORT FunctionPartitioning : public Partitioning {
 
   std::string type_name() const override { return name_; }
 
-  Result<std::shared_ptr<Expression>> Parse(const std::string& path) const override {
+  Result<Expression> Parse(const std::string& path) const override {
     return parse_impl_(path);
   }
 
@@ -243,7 +231,7 @@ class ARROW_DS_EXPORT FunctionPartitioning : public Partitioning {
     return Status::NotImplemented("formatting paths from ", type_name(), " Partitioning");
   }
 
-  Result<std::vector<PartitionedBatch>> Partition(
+  Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const override {
     return Status::NotImplemented("partitioning batches from ", type_name(),
                                   " Partitioning");
@@ -296,6 +284,65 @@ class ARROW_DS_EXPORT PartitioningOrFactory {
   std::shared_ptr<PartitioningFactory> factory_;
   std::shared_ptr<Partitioning> partitioning_;
 };
+
+/// \brief Assemble lists of indices of identical rows.
+///
+/// \param[in] by A StructArray whose columns will be used as grouping criteria.
+///               Top level nulls are invalid, as are empty criteria (no grouping
+///               columns).
+/// \return A array of type `struct<values: by.type, groupings: list<int64>>`,
+///         which is a mapping from unique rows (field "values") to lists of
+///         indices into `by` where that row appears (field "groupings").
+///
+/// For example,
+///   MakeGroupings([
+///       {"a": "ex",  "b": 0},
+///       {"a": "ex",  "b": 0},
+///       {"a": "why", "b": 0},
+///       {"a": "why", "b": 0},
+///       {"a": "ex",  "b": 0},
+///       {"a": "why", "b": 1}
+///   ]) == [
+///       {"values": {"a": "ex",  "b": 0}, "groupings": [0, 1, 4]},
+///       {"values": {"a": "why", "b": 0}, "groupings": [2, 3]},
+///       {"values": {"a": "why", "b": 1}, "groupings": [5]}
+///   ]
+ARROW_DS_EXPORT
+Result<std::shared_ptr<StructArray>> MakeGroupings(const StructArray& by);
+
+/// \brief Produce a ListArray whose slots are selections of `array` which correspond to
+/// the provided groupings.
+///
+/// For example,
+///   ApplyGroupings([[0, 1, 4], [2, 3], [5]], [
+///       {"a": "ex",  "b": 0, "passenger": 0},
+///       {"a": "ex",  "b": 0, "passenger": 1},
+///       {"a": "why", "b": 0, "passenger": 2},
+///       {"a": "why", "b": 0, "passenger": 3},
+///       {"a": "ex",  "b": 0, "passenger": 4},
+///       {"a": "why", "b": 1, "passenger": 5}
+///   ]) == [
+///     [
+///       {"a": "ex",  "b": 0, "passenger": 0},
+///       {"a": "ex",  "b": 0, "passenger": 1},
+///       {"a": "ex",  "b": 0, "passenger": 4},
+///     ],
+///     [
+///       {"a": "why", "b": 0, "passenger": 2},
+///       {"a": "why", "b": 0, "passenger": 3},
+///     ],
+///     [
+///       {"a": "why", "b": 1, "passenger": 5}
+///     ]
+///   ]
+ARROW_DS_EXPORT
+Result<std::shared_ptr<ListArray>> ApplyGroupings(const ListArray& groupings,
+                                                  const Array& array);
+
+/// \brief Produce selections of a RecordBatch which correspond to the provided groupings.
+ARROW_DS_EXPORT
+Result<RecordBatchVector> ApplyGroupings(const ListArray& groupings,
+                                         const std::shared_ptr<RecordBatch>& batch);
 
 }  // namespace dataset
 }  // namespace arrow
