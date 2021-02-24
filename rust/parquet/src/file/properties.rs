@@ -48,7 +48,7 @@
 //! );
 //! ```
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::basic::{Compression, Encoding};
 use crate::file::metadata::KeyValue;
@@ -85,12 +85,12 @@ impl WriterVersion {
 }
 
 /// Reference counted writer properties.
-pub type WriterPropertiesPtr = Rc<WriterProperties>;
+pub type WriterPropertiesPtr = Arc<WriterProperties>;
 
 /// Writer properties.
 ///
-/// It is created as an immutable data structure, use [`WriterPropertiesBuilder`] to
-/// assemble the properties.
+/// All properties except the key-value metadata are immutable,
+/// use [`WriterPropertiesBuilder`] to assemble these properties.
 #[derive(Debug, Clone)]
 pub struct WriterProperties {
     data_pagesize_limit: usize,
@@ -99,7 +99,7 @@ pub struct WriterProperties {
     max_row_group_size: usize,
     writer_version: WriterVersion,
     created_by: String,
-    key_value_metadata: Option<Vec<KeyValue>>,
+    pub(crate) key_value_metadata: Option<Vec<KeyValue>>,
     default_column_properties: ColumnProperties,
     column_properties: HashMap<ColumnPath, ColumnProperties>,
 }
@@ -546,9 +546,9 @@ mod tests {
     fn test_writer_properties_dictionary_encoding() {
         // dictionary encoding is not configurable, and it should be the same for both
         // writer version 1 and 2.
-        for version in vec![WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+        for version in &[WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
             let props = WriterProperties::builder()
-                .set_writer_version(version)
+                .set_writer_version(*version)
                 .build();
             assert_eq!(props.dictionary_page_encoding(), Encoding::PLAIN);
             assert_eq!(

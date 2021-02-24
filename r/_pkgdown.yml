@@ -61,6 +61,7 @@ reference:
 - title: Multi-file datasets
   contents:
   - open_dataset
+  - write_dataset
   - dataset_factory
   - hive_partition
   - Dataset
@@ -68,6 +69,7 @@ reference:
   - Expression
   - Scanner
   - FileFormat
+  - FileWriteOptions
   - map_batches
 - title: Reading and writing files
   contents:
@@ -83,7 +85,7 @@ reference:
 - title: C++ reader/writer interface
   contents:
   - ParquetFileReader
-  - ParquetReaderProperties
+  - ParquetArrowReaderProperties
   - ParquetFileWriter
   - ParquetWriterProperties
   - FeatherReader
@@ -115,7 +117,20 @@ reference:
   - DataType
   - DictionaryType
   - FixedWidthType
-  - cast_options
+- title: Flight
+  contents:
+  - load_flight_server
+  - flight_connect
+  - flight_get
+  - flight_put
+  - list_flights
+- title: File systems
+  contents:
+  - s3_bucket
+  - FileSystem
+  - FileInfo
+  - FileSelector
+  - copy_files
 - title: Input/Output
   contents:
   - InputStream
@@ -127,16 +142,18 @@ reference:
   - compression
   - Codec
   - codec_is_available
-  - MemoryPool
-  - default_memory_pool
-  - FileSystem
-  - FileInfo
-  - FileSelector
+- title: Computation
+  contents:
+  - match_arrow
+  - value_counts
 - title: Configuration
   contents:
+  - arrow_info
   - cpu_count
-- title: Installation helpers
-  contents:
   - arrow_available
   - install_arrow
   - install_pyarrow
+
+repo:
+  url:
+    source: https://github.com/apache/arrow/blob/master/r/

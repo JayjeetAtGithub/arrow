@@ -29,10 +29,12 @@ API Reference
    api/scalar
    api/builder
    api/table
+   api/c_abi
    api/compute
    api/tensor
    api/utilities
    api/io
+   api/ipc
    api/formats
    api/cuda
    api/flight

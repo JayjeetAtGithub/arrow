@@ -197,6 +197,7 @@ set(ARROW_SRCS
     util/string.cc
     util/string_builder.cc
     util/task_group.cc
+    util/tdigest.cc
     util/thread_pool.cc
     util/time.cc
     util/trie.cc
@@ -214,13 +215,13 @@ set(ARROW_SRCS
     vendored/double-conversion/diy-fp.cc
     vendored/double-conversion/strtod.cc)
 
-if(CXX_SUPPORTS_AVX2)
+if(ARROW_HAVE_RUNTIME_AVX2)
   list(APPEND ARROW_SRCS util/bpacking_avx2.cc)
   set_source_files_properties(util/bpacking_avx2.cc PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
   set_source_files_properties(util/bpacking_avx2.cc PROPERTIES COMPILE_FLAGS
                               ${ARROW_AVX2_FLAG})
 endif()
-if(CXX_SUPPORTS_AVX512)
+if(ARROW_HAVE_RUNTIME_AVX512)
   list(APPEND ARROW_SRCS util/bpacking_avx512.cc)
   set_source_files_properties(util/bpacking_avx512.cc PROPERTIES SKIP_PRECOMPILE_HEADERS
                               ON)
@@ -365,6 +366,8 @@ if(ARROW_COMPUTE)
               compute/registry.cc
               compute/kernels/aggregate_basic.cc
               compute/kernels/aggregate_mode.cc
+              compute/kernels/aggregate_quantile.cc
+              compute/kernels/aggregate_var_std.cc
               compute/kernels/codegen_internal.cc
               compute/kernels/scalar_arithmetic.cc
               compute/kernels/scalar_boolean.cc
@@ -386,14 +389,14 @@ if(ARROW_COMPUTE)
               compute/kernels/vector_selection.cc
               compute/kernels/vector_sort.cc)
 
-  if(CXX_SUPPORTS_AVX2)
+  if(ARROW_HAVE_RUNTIME_AVX2)
     list(APPEND ARROW_SRCS compute/kernels/aggregate_basic_avx2.cc)
     set_source_files_properties(compute/kernels/aggregate_basic_avx2.cc PROPERTIES
                                 SKIP_PRECOMPILE_HEADERS ON)
     set_source_files_properties(compute/kernels/aggregate_basic_avx2.cc PROPERTIES
                                 COMPILE_FLAGS ${ARROW_AVX2_FLAG})
   endif()
-  if(CXX_SUPPORTS_AVX512)
+  if(ARROW_HAVE_RUNTIME_AVX512)
     list(APPEND ARROW_SRCS compute/kernels/aggregate_basic_avx512.cc)
     set_source_files_properties(compute/kernels/aggregate_basic_avx512.cc PROPERTIES
                                 SKIP_PRECOMPILE_HEADERS ON)
@@ -405,9 +408,6 @@ endif()
 if(ARROW_FILESYSTEM)
   if(ARROW_HDFS)
     add_definitions(-DARROW_HDFS)
-  endif()
-  if(ARROW_S3)
-    add_definitions(-DARROW_S3)
   endif()
 
   list(APPEND ARROW_SRCS
@@ -529,11 +529,7 @@ if(ARROW_BUILD_STATIC AND ARROW_BUNDLED_STATIC_LIBS)
                            ${_OTHER_LIBS})
 endif()
 
-if(ARROW_BUILD_TESTS
-   OR ARROW_BUILD_BENCHMARKS
-   OR ARROW_BUILD_INTEGRATION
-   OR ARROW_FUZZING)
-
+if(ARROW_TESTING)
   # that depend on gtest
   add_arrow_lib(arrow_testing
                 CMAKE_PACKAGE_NAME
@@ -628,12 +624,15 @@ add_arrow_test(table_test
 add_arrow_test(tensor_test)
 add_arrow_test(sparse_tensor_test)
 
+set(STL_TEST_SRCS stl_iterator_test.cc)
 if(ARROW_COMPUTE)
   # This unit test uses compute code
-  add_arrow_test(stl_test)
+  list(APPEND STL_TEST_SRCS stl_test.cc)
 endif()
+add_arrow_test(stl_test SOURCES ${STL_TEST_SRCS})
 
 add_arrow_benchmark(builder_benchmark)
+add_arrow_benchmark(compare_benchmark)
 add_arrow_benchmark(memory_pool_benchmark)
 add_arrow_benchmark(type_benchmark)
 
@@ -689,6 +688,10 @@ endif()
 
 if(ARROW_ORC)
   add_subdirectory(adapters/orc)
+endif()
+
+if(ARROW_CLS)
+  add_subdirectory(adapters/arrow-rados-cls)
 endif()
 
 if(ARROW_PYTHON)

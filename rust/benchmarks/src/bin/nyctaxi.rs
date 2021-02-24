@@ -27,8 +27,13 @@ use arrow::util::pretty;
 use datafusion::error::Result;
 use datafusion::execution::context::{ExecutionConfig, ExecutionContext};
 
+use datafusion::physical_plan::collect;
 use datafusion::physical_plan::csv::CsvReadOptions;
 use structopt::StructOpt;
+
+#[cfg(feature = "snmalloc")]
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Benchmarks", about = "Apache Arrow Rust Benchmarks.")]
@@ -58,7 +63,8 @@ struct Opt {
     file_format: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opt = Opt::from_args();
     println!("Running benchmarks with the following options: {:?}", opt);
 
@@ -82,21 +88,21 @@ fn main() -> Result<()> {
         }
     }
 
-    datafusion_sql_benchmarks(&mut ctx, opt.iterations, opt.debug)
+    datafusion_sql_benchmarks(&mut ctx, opt.iterations, opt.debug).await
 }
 
-fn datafusion_sql_benchmarks(
+async fn datafusion_sql_benchmarks(
     ctx: &mut ExecutionContext,
     iterations: usize,
     debug: bool,
 ) -> Result<()> {
     let mut queries = HashMap::new();
-    queries.insert("fare_amt_by_passenger", "SELECT passenger_count, MIN(fare_amount), MIN(fare_amount), SUM(fare_amount) FROM tripdata GROUP BY passenger_count");
+    queries.insert("fare_amt_by_passenger", "SELECT passenger_count, MIN(fare_amount), MAX(fare_amount), SUM(fare_amount) FROM tripdata GROUP BY passenger_count");
     for (name, sql) in &queries {
         println!("Executing '{}'", name);
         for i in 0..iterations {
             let start = Instant::now();
-            execute_sql(ctx, sql, debug)?;
+            execute_sql(ctx, sql, debug).await?;
             println!(
                 "Query '{}' iteration {} took {} ms",
                 name,
@@ -108,14 +114,14 @@ fn datafusion_sql_benchmarks(
     Ok(())
 }
 
-fn execute_sql(ctx: &mut ExecutionContext, sql: &str, debug: bool) -> Result<()> {
+async fn execute_sql(ctx: &mut ExecutionContext, sql: &str, debug: bool) -> Result<()> {
     let plan = ctx.create_logical_plan(sql)?;
     let plan = ctx.optimize(&plan)?;
     if debug {
         println!("Optimized logical plan:\n{:?}", plan);
     }
     let physical_plan = ctx.create_physical_plan(&plan)?;
-    let result = ctx.collect(physical_plan)?;
+    let result = collect(physical_plan).await?;
     if debug {
         pretty::print_batches(&result)?;
     }

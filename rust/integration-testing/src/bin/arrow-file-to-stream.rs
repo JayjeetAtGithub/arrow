@@ -22,15 +22,10 @@ use std::io::{self, BufReader};
 use arrow::error::Result;
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatchReader;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    eprintln!("{:?}", args);
-
     let filename = &args[1];
-    eprintln!("Reading from Arrow file {}", filename);
-
     let f = File::open(filename)?;
     let reader = BufReader::new(f);
     let mut reader = FileReader::try_new(reader)?;
@@ -38,12 +33,11 @@ fn main() -> Result<()> {
 
     let mut writer = StreamWriter::try_new(io::stdout(), &schema)?;
 
-    while let Some(batch) = reader.next_batch()? {
-        writer.write(&batch)?;
-    }
+    reader.try_for_each(|batch| {
+        let batch = batch?;
+        writer.write(&batch)
+    })?;
     writer.finish()?;
-
-    eprintln!("Completed without error");
 
     Ok(())
 }

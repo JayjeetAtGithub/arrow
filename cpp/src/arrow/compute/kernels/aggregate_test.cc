@@ -31,6 +31,7 @@
 #include "arrow/compute/kernels/test_util.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
+#include "arrow/util/bitmap_reader.h"
 #include "arrow/util/checked_cast.h"
 
 #include "arrow/testing/gtest_common.h"
@@ -513,7 +514,7 @@ TEST_F(TestBooleanMinMaxKernel, Basics) {
   this->AssertMinMaxIs(chunked_input2, false, false, options);
   this->AssertMinMaxIs(chunked_input3, false, true, options);
 
-  options = MinMaxOptions(MinMaxOptions::OUTPUT_NULL);
+  options = MinMaxOptions(MinMaxOptions::EMIT_NULL);
   this->AssertMinMaxIsNull("[]", options);
   this->AssertMinMaxIsNull("[null, null, null]", options);
   this->AssertMinMaxIsNull("[false, null, false]", options);
@@ -543,7 +544,7 @@ TYPED_TEST(TestIntegerMinMaxKernel, Basics) {
   this->AssertMinMaxIs(chunked_input2, 1, 9, options);
   this->AssertMinMaxIs(chunked_input3, 1, 9, options);
 
-  options = MinMaxOptions(MinMaxOptions::OUTPUT_NULL);
+  options = MinMaxOptions(MinMaxOptions::EMIT_NULL);
   this->AssertMinMaxIs("[5, 1, 2, 3, 4]", 1, 5, options);
   // output null
   this->AssertMinMaxIsNull("[5, null, 2, 3, 4]", options);
@@ -570,7 +571,7 @@ TYPED_TEST(TestFloatingMinMaxKernel, Floats) {
   this->AssertMinMaxIs(chunked_input2, 1, 9, options);
   this->AssertMinMaxIs(chunked_input3, 1, 9, options);
 
-  options = MinMaxOptions(MinMaxOptions::OUTPUT_NULL);
+  options = MinMaxOptions(MinMaxOptions::EMIT_NULL);
   this->AssertMinMaxIs("[5, 1, 2, 3, 4]", 1, 5, options);
   this->AssertMinMaxIs("[5, -Inf, 2, 3, 4]", -INFINITY, 5, options);
   // output null
@@ -727,6 +728,114 @@ TYPED_TEST(TestRandomNumericMinMaxKernel, RandomArrayMinMax) {
 }
 
 //
+// Any
+//
+
+class TestPrimitiveAnyKernel : public ::testing::Test {
+ public:
+  void AssertAnyIs(const Datum& array, bool expected) {
+    ASSERT_OK_AND_ASSIGN(Datum out, Any(array));
+    const BooleanScalar& out_any = out.scalar_as<BooleanScalar>();
+    const auto expected_any = static_cast<const BooleanScalar>(expected);
+    ASSERT_EQ(out_any, expected_any);
+  }
+
+  void AssertAnyIs(const std::string& json, bool expected) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertAnyIs(array, expected);
+  }
+
+  void AssertAnyIs(const std::vector<std::string>& json, bool expected) {
+    auto array = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertAnyIs(array, expected);
+  }
+
+  std::shared_ptr<DataType> type_singleton() {
+    return TypeTraits<BooleanType>::type_singleton();
+  }
+};
+
+class TestAnyKernel : public TestPrimitiveAnyKernel {};
+
+TEST_F(TestAnyKernel, Basics) {
+  std::vector<std::string> chunked_input0 = {"[]", "[true]"};
+  std::vector<std::string> chunked_input1 = {"[true, true, null]", "[true, null]"};
+  std::vector<std::string> chunked_input2 = {"[false, false, false]", "[false]"};
+  std::vector<std::string> chunked_input3 = {"[false, null]", "[null, false]"};
+  std::vector<std::string> chunked_input4 = {"[true, null]", "[null, false]"};
+
+  this->AssertAnyIs("[]", false);
+  this->AssertAnyIs("[false]", false);
+  this->AssertAnyIs("[true, false]", true);
+  this->AssertAnyIs("[null, null, null]", false);
+  this->AssertAnyIs("[false, false, false]", false);
+  this->AssertAnyIs("[false, false, false, null]", false);
+  this->AssertAnyIs("[true, null, true, true]", true);
+  this->AssertAnyIs("[false, null, false, true]", true);
+  this->AssertAnyIs("[true, null, false, true]", true);
+  this->AssertAnyIs(chunked_input0, true);
+  this->AssertAnyIs(chunked_input1, true);
+  this->AssertAnyIs(chunked_input2, false);
+  this->AssertAnyIs(chunked_input3, false);
+  this->AssertAnyIs(chunked_input4, true);
+}
+
+//
+// All
+//
+
+class TestPrimitiveAllKernel : public ::testing::Test {
+ public:
+  void AssertAllIs(const Datum& array, bool expected) {
+    ASSERT_OK_AND_ASSIGN(Datum out, All(array));
+    const BooleanScalar& out_all = out.scalar_as<BooleanScalar>();
+    const auto expected_all = static_cast<const BooleanScalar>(expected);
+    ASSERT_EQ(out_all, expected_all);
+  }
+
+  void AssertAllIs(const std::string& json, bool expected) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertAllIs(array, expected);
+  }
+
+  void AssertAllIs(const std::vector<std::string>& json, bool expected) {
+    auto array = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertAllIs(array, expected);
+  }
+
+  std::shared_ptr<DataType> type_singleton() {
+    return TypeTraits<BooleanType>::type_singleton();
+  }
+};
+
+class TestAllKernel : public TestPrimitiveAllKernel {};
+
+TEST_F(TestAllKernel, Basics) {
+  std::vector<std::string> chunked_input0 = {"[]", "[true]"};
+  std::vector<std::string> chunked_input1 = {"[true, true, null]", "[true, null]"};
+  std::vector<std::string> chunked_input2 = {"[false, false, false]", "[false]"};
+  std::vector<std::string> chunked_input3 = {"[false, null]", "[null, false]"};
+  std::vector<std::string> chunked_input4 = {"[true, null]", "[null, false]"};
+  std::vector<std::string> chunked_input5 = {"[false, null]", "[null, true]"};
+
+  this->AssertAllIs("[]", true);
+  this->AssertAllIs("[false]", false);
+  this->AssertAllIs("[true, false]", false);
+  this->AssertAllIs("[null, null, null]", true);
+  this->AssertAllIs("[false, false, false]", false);
+  this->AssertAllIs("[false, false, false, null]", false);
+  this->AssertAllIs("[true, null, true, true]", true);
+  this->AssertAllIs("[false, null, false, true]", false);
+  this->AssertAllIs("[true, null, false, true]", false);
+  this->AssertAllIs(chunked_input0, true);
+  this->AssertAllIs(chunked_input1, true);
+  this->AssertAllIs(chunked_input2, false);
+  this->AssertAllIs(chunked_input3, false);
+  this->AssertAllIs(chunked_input4, false);
+  this->AssertAllIs(chunked_input5, false);
+}
+
+//
 // Mode
 //
 
@@ -735,55 +844,65 @@ class TestPrimitiveModeKernel : public ::testing::Test {
  public:
   using ArrowType = T;
   using Traits = TypeTraits<ArrowType>;
-  using c_type = typename ArrowType::c_type;
-  using ModeType = typename Traits::ScalarType;
-  using CountType = typename TypeTraits<Int64Type>::ScalarType;
+  using CType = typename ArrowType::c_type;
 
-  void AssertModeIs(const Datum& array, c_type expected_mode, int64_t expected_count) {
-    ASSERT_OK_AND_ASSIGN(Datum out, Mode(array));
-    const StructScalar& value = out.scalar_as<StructScalar>();
+  void AssertModesAre(const Datum& array, const int n,
+                      const std::vector<CType>& expected_modes,
+                      const std::vector<int64_t>& expected_counts) {
+    ASSERT_OK_AND_ASSIGN(Datum out, Mode(array, ModeOptions{n}));
+    ASSERT_OK(out.make_array()->ValidateFull());
+    const StructArray out_array(out.array());
+    ASSERT_EQ(out_array.length(), expected_modes.size());
+    ASSERT_EQ(out_array.num_fields(), 2);
 
-    const auto& out_mode = checked_cast<const ModeType&>(*value.value[0]);
-    ASSERT_EQ(expected_mode, out_mode.value);
-
-    const auto& out_count = checked_cast<const CountType&>(*value.value[1]);
-    ASSERT_EQ(expected_count, out_count.value);
+    const CType* out_modes = out_array.field(0)->data()->GetValues<CType>(1);
+    const int64_t* out_counts = out_array.field(1)->data()->GetValues<int64_t>(1);
+    for (int i = 0; i < out_array.length(); ++i) {
+      // equal or nan equal
+      ASSERT_TRUE(
+          (expected_modes[i] == out_modes[i]) ||
+          (expected_modes[i] != expected_modes[i] && out_modes[i] != out_modes[i]));
+      ASSERT_EQ(expected_counts[i], out_counts[i]);
+    }
   }
 
-  void AssertModeIs(const std::string& json, c_type expected_mode,
+  void AssertModesAre(const std::string& json, const int n,
+                      const std::vector<CType>& expected_modes,
+                      const std::vector<int64_t>& expected_counts) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertModesAre(array, n, expected_modes, expected_counts);
+  }
+
+  void AssertModeIs(const Datum& array, CType expected_mode, int64_t expected_count) {
+    AssertModesAre(array, 1, {expected_mode}, {expected_count});
+  }
+
+  void AssertModeIs(const std::string& json, CType expected_mode,
                     int64_t expected_count) {
     auto array = ArrayFromJSON(type_singleton(), json);
     AssertModeIs(array, expected_mode, expected_count);
   }
 
-  void AssertModeIsNull(const Datum& array) {
-    ASSERT_OK_AND_ASSIGN(Datum out, Mode(array));
-    const StructScalar& value = out.scalar_as<StructScalar>();
-
-    for (const auto& val : value.value) {
-      ASSERT_FALSE(val->is_valid);
-    }
+  void AssertModeIs(const std::vector<std::string>& json, CType expected_mode,
+                    int64_t expected_count) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertModeIs(chunked, expected_mode, expected_count);
   }
 
-  void AssertModeIsNull(const std::string& json) {
+  void AssertModesEmpty(const Datum& array, int n) {
+    ASSERT_OK_AND_ASSIGN(Datum out, Mode(array, ModeOptions{n}));
+    ASSERT_OK(out.make_array()->ValidateFull());
+    ASSERT_EQ(out.array()->length, 0);
+  }
+
+  void AssertModesEmpty(const std::string& json, int n = 1) {
     auto array = ArrayFromJSON(type_singleton(), json);
-    AssertModeIsNull(array);
+    AssertModesEmpty(array, n);
   }
 
-  void AssertModeIsNaN(const Datum& array, int64_t expected_count) {
-    ASSERT_OK_AND_ASSIGN(Datum out, Mode(array));
-    const StructScalar& value = out.scalar_as<StructScalar>();
-
-    const auto& out_mode = checked_cast<const ModeType&>(*value.value[0]);
-    ASSERT_NE(out_mode.value, out_mode.value);  // NaN != NaN
-
-    const auto& out_count = checked_cast<const CountType&>(*value.value[1]);
-    ASSERT_EQ(expected_count, out_count.value);
-  }
-
-  void AssertModeIsNaN(const std::string& json, int64_t expected_count) {
-    auto array = ArrayFromJSON(type_singleton(), json);
-    AssertModeIsNaN(array, expected_count);
+  void AssertModesEmpty(const std::vector<std::string>& json, int n = 1) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertModesEmpty(chunked, n);
   }
 
   std::shared_ptr<DataType> type_singleton() { return Traits::type_singleton(); }
@@ -808,8 +927,18 @@ TEST_F(TestBooleanModeKernel, Basics) {
   this->AssertModeIs("[false, false, true, true, true, false]", false, 3);
 
   this->AssertModeIs("[true, null, false, false, null, true, null, null, true]", true, 3);
-  this->AssertModeIsNull("[null, null, null]");
-  this->AssertModeIsNull("[]");
+  this->AssertModesEmpty("[null, null, null]");
+  this->AssertModesEmpty("[]");
+
+  this->AssertModeIs({"[true, false]", "[true, true]", "[false, false]"}, false, 3);
+  this->AssertModeIs({"[true, null]", "[]", "[null, false]"}, false, 1);
+  this->AssertModesEmpty({"[null, null]", "[]", "[null]"});
+
+  this->AssertModesAre("[false, false, true, true, true, false]", 2, {false, true},
+                       {3, 3});
+  this->AssertModesAre("[true, null, false, false, null, true, null, null, true]", 100,
+                       {true, false}, {3, 2});
+  this->AssertModesEmpty({"[null, null]", "[]", "[null]"}, 4);
 }
 
 TYPED_TEST_SUITE(TestIntegerModeKernel, IntegralArrowTypes);
@@ -819,8 +948,16 @@ TYPED_TEST(TestIntegerModeKernel, Basics) {
   this->AssertModeIs("[127, 0, 127, 127, 0, 1, 0, 127]", 127, 4);
 
   this->AssertModeIs("[null, null, 2, null, 1]", 1, 1);
-  this->AssertModeIsNull("[null, null, null]");
-  this->AssertModeIsNull("[]");
+  this->AssertModesEmpty("[null, null, null]");
+  this->AssertModesEmpty("[]");
+
+  this->AssertModeIs({"[5]", "[1, 1, 5]", "[5]"}, 5, 3);
+  this->AssertModeIs({"[5]", "[1, 1, 5]", "[5, 1]"}, 1, 3);
+  this->AssertModesEmpty({"[null, null]", "[]", "[null]"});
+
+  this->AssertModesAre("[127, 0, 127, 127, 0, 1, 0, 127]", 2, {127, 0}, {4, 3});
+  this->AssertModesAre("[null, null, 2, null, 1]", 3, {1, 2}, {1, 1});
+  this->AssertModesEmpty("[null, null, null]", 10);
 }
 
 TYPED_TEST_SUITE(TestFloatingModeKernel, RealArrowTypes);
@@ -833,12 +970,19 @@ TYPED_TEST(TestFloatingModeKernel, Floats) {
   this->AssertModeIs("[null, null, 2, null, 1]", 1, 1);
   this->AssertModeIs("[NaN, NaN, 1, null, 1]", 1, 2);
 
-  this->AssertModeIsNull("[null, null, null]");
-  this->AssertModeIsNull("[]");
+  this->AssertModesEmpty("[null, null, null]");
+  this->AssertModesEmpty("[]");
 
-  this->AssertModeIsNaN("[NaN, NaN, 1]", 2);
-  this->AssertModeIsNaN("[NaN, NaN, null]", 2);
-  this->AssertModeIsNaN("[NaN, NaN, NaN]", 3);
+  this->AssertModeIs("[NaN, NaN, 1]", NAN, 2);
+  this->AssertModeIs("[NaN, NaN, null]", NAN, 2);
+  this->AssertModeIs("[NaN, NaN, NaN]", NAN, 3);
+
+  this->AssertModeIs({"[Inf, 100]", "[Inf, 100]", "[Inf]"}, INFINITY, 3);
+  this->AssertModeIs({"[NaN, 1]", "[NaN, 1]", "[NaN]"}, NAN, 3);
+  this->AssertModesEmpty({"[null, null]", "[]", "[null]"});
+
+  this->AssertModesAre("[Inf, 100, Inf, 100, Inf]", 2, {INFINITY, 100}, {3, 2});
+  this->AssertModesAre("[NaN, NaN, 1, null, 1, 2, 2]", 3, {1, 2, NAN}, {2, 2, 2});
 }
 
 TEST_F(TestInt8ModeKernelValueRange, Basics) {
@@ -886,22 +1030,21 @@ ModeResult<ArrowType> NaiveMode(const Array& array) {
 
 template <typename ArrowType, typename CTYPE = typename ArrowType::c_type>
 void CheckModeWithRange(CTYPE range_min, CTYPE range_max) {
-  using ModeScalar = typename TypeTraits<ArrowType>::ScalarType;
-  using CountScalar = typename TypeTraits<Int64Type>::ScalarType;
-
   auto rand = random::RandomArrayGenerator(0x5487655);
   // 32K items (>= counting mode cutoff) within range, 10% null
   auto array = rand.Numeric<ArrowType>(32 * 1024, range_min, range_max, 0.1);
 
   auto expected = NaiveMode<ArrowType>(*array);
   ASSERT_OK_AND_ASSIGN(Datum out, Mode(array));
-  const StructScalar& value = out.scalar_as<StructScalar>();
+  ASSERT_OK(out.make_array()->ValidateFull());
+  const StructArray out_array(out.array());
+  ASSERT_EQ(out_array.length(), 1);
+  ASSERT_EQ(out_array.num_fields(), 2);
 
-  ASSERT_TRUE(value.is_valid);
-  const auto& out_mode = checked_cast<const ModeScalar&>(*value.value[0]);
-  const auto& out_count = checked_cast<const CountScalar&>(*value.value[1]);
-  ASSERT_EQ(out_mode.value, expected.mode);
-  ASSERT_EQ(out_count.value, expected.count);
+  const CTYPE* out_modes = out_array.field(0)->data()->GetValues<CTYPE>(1);
+  const int64_t* out_counts = out_array.field(1)->data()->GetValues<int64_t>(1);
+  ASSERT_EQ(out_modes[0], expected.mode);
+  ASSERT_EQ(out_counts[0], expected.count);
 }
 
 TEST_F(TestInt32ModeKernel, SmallValueRange) {
@@ -913,6 +1056,556 @@ TEST_F(TestInt32ModeKernel, LargeValueRange) {
   // Large value range => should exercise hashmap-based Mode implementation
   CheckModeWithRange<ArrowType>(-10000000, 10000000);
 }
+
+//
+// Variance/Stddev
+//
+
+template <typename ArrowType>
+class TestPrimitiveVarStdKernel : public ::testing::Test {
+ public:
+  using Traits = TypeTraits<ArrowType>;
+  using ScalarType = typename TypeTraits<DoubleType>::ScalarType;
+
+  void AssertVarStdIs(const Array& array, const VarianceOptions& options,
+                      double expected_var) {
+    AssertVarStdIsInternal(array, options, expected_var);
+  }
+
+  void AssertVarStdIs(const std::shared_ptr<ChunkedArray>& array,
+                      const VarianceOptions& options, double expected_var) {
+    AssertVarStdIsInternal(array, options, expected_var);
+  }
+
+  void AssertVarStdIs(const std::string& json, const VarianceOptions& options,
+                      double expected_var) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertVarStdIs(*array, options, expected_var);
+  }
+
+  void AssertVarStdIs(const std::vector<std::string>& json,
+                      const VarianceOptions& options, double expected_var) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertVarStdIs(chunked, options, expected_var);
+  }
+
+  void AssertVarStdIsInvalid(const Array& array, const VarianceOptions& options) {
+    AssertVarStdIsInvalidInternal(array, options);
+  }
+
+  void AssertVarStdIsInvalid(const std::shared_ptr<ChunkedArray>& array,
+                             const VarianceOptions& options) {
+    AssertVarStdIsInvalidInternal(array, options);
+  }
+
+  void AssertVarStdIsInvalid(const std::string& json, const VarianceOptions& options) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertVarStdIsInvalid(*array, options);
+  }
+
+  void AssertVarStdIsInvalid(const std::vector<std::string>& json,
+                             const VarianceOptions& options) {
+    auto array = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertVarStdIsInvalid(array, options);
+  }
+
+  std::shared_ptr<DataType> type_singleton() { return Traits::type_singleton(); }
+
+ private:
+  void AssertVarStdIsInternal(const Datum& array, const VarianceOptions& options,
+                              double expected_var) {
+    ASSERT_OK_AND_ASSIGN(Datum out_var, Variance(array, options));
+    ASSERT_OK_AND_ASSIGN(Datum out_std, Stddev(array, options));
+    auto var = checked_cast<const ScalarType*>(out_var.scalar().get());
+    auto std = checked_cast<const ScalarType*>(out_std.scalar().get());
+    ASSERT_TRUE(var->is_valid && std->is_valid);
+    ASSERT_DOUBLE_EQ(std->value * std->value, var->value);
+    ASSERT_DOUBLE_EQ(var->value, expected_var);  // < 4ULP
+  }
+
+  void AssertVarStdIsInvalidInternal(const Datum& array, const VarianceOptions& options) {
+    ASSERT_OK_AND_ASSIGN(Datum out_var, Variance(array, options));
+    ASSERT_OK_AND_ASSIGN(Datum out_std, Stddev(array, options));
+    auto var = checked_cast<const ScalarType*>(out_var.scalar().get());
+    auto std = checked_cast<const ScalarType*>(out_std.scalar().get());
+    ASSERT_FALSE(var->is_valid || std->is_valid);
+  }
+};
+
+template <typename ArrowType>
+class TestNumericVarStdKernel : public TestPrimitiveVarStdKernel<ArrowType> {};
+
+// Reference value from numpy.var
+TYPED_TEST_SUITE(TestNumericVarStdKernel, NumericArrowTypes);
+TYPED_TEST(TestNumericVarStdKernel, Basics) {
+  VarianceOptions options;  // ddof = 0, population variance/stddev
+
+  this->AssertVarStdIs("[100]", options, 0);
+  this->AssertVarStdIs("[1, 2, 3]", options, 0.6666666666666666);
+  this->AssertVarStdIs("[null, 1, 2, null, 3]", options, 0.6666666666666666);
+
+  std::vector<std::string> chunks;
+  chunks = {"[]", "[1]", "[2]", "[null]", "[3]"};
+  this->AssertVarStdIs(chunks, options, 0.6666666666666666);
+  chunks = {"[1, 2, 3]", "[4, 5, 6]", "[7, 8]"};
+  this->AssertVarStdIs(chunks, options, 5.25);
+  chunks = {"[1, 2, 3, 4, 5, 6, 7]", "[8]"};
+  this->AssertVarStdIs(chunks, options, 5.25);
+
+  this->AssertVarStdIsInvalid("[null, null, null]", options);
+  this->AssertVarStdIsInvalid("[]", options);
+  this->AssertVarStdIsInvalid("[]", options);
+
+  options.ddof = 1;  // sample variance/stddev
+
+  this->AssertVarStdIs("[1, 2]", options, 0.5);
+
+  chunks = {"[1]", "[2]"};
+  this->AssertVarStdIs(chunks, options, 0.5);
+  chunks = {"[1, 2, 3]", "[4, 5, 6]", "[7, 8]"};
+  this->AssertVarStdIs(chunks, options, 6.0);
+  chunks = {"[1, 2, 3, 4, 5, 6, 7]", "[8]"};
+  this->AssertVarStdIs(chunks, options, 6.0);
+
+  this->AssertVarStdIsInvalid("[100]", options);
+  this->AssertVarStdIsInvalid("[100, null, null]", options);
+  chunks = {"[100]", "[null]", "[]"};
+  this->AssertVarStdIsInvalid(chunks, options);
+}
+
+// Test numerical stability
+template <typename ArrowType>
+class TestVarStdKernelStability : public TestPrimitiveVarStdKernel<ArrowType> {};
+
+typedef ::testing::Types<Int32Type, UInt32Type, Int64Type, UInt64Type, DoubleType>
+    VarStdStabilityTypes;
+
+TYPED_TEST_SUITE(TestVarStdKernelStability, VarStdStabilityTypes);
+TYPED_TEST(TestVarStdKernelStability, Basics) {
+  VarianceOptions options{1};  // ddof = 1
+  this->AssertVarStdIs("[100000004, 100000007, 100000013, 100000016]", options, 30.0);
+  this->AssertVarStdIs("[1000000004, 1000000007, 1000000013, 1000000016]", options, 30.0);
+  if (!is_unsigned_integer_type<TypeParam>::value) {
+    this->AssertVarStdIs("[-1000000016, -1000000013, -1000000007, -1000000004]", options,
+                         30.0);
+  }
+}
+
+// Test numerical stability of variance merging code
+class TestVarStdKernelMergeStability : public TestPrimitiveVarStdKernel<DoubleType> {};
+
+TEST_F(TestVarStdKernelMergeStability, Basics) {
+  VarianceOptions options{1};  // ddof = 1
+
+#ifndef __MINGW32__  // MinGW has precision issues
+  // XXX: The reference value from numpy is actually wrong due to floating
+  // point limits. The correct result should equals variance(90, 0) = 4050.
+  std::vector<std::string> chunks = {"[40000008000000490]", "[40000008000000400]"};
+  this->AssertVarStdIs(chunks, options, 3904.0);
+#endif
+}
+
+// Test integer arithmetic code
+class TestVarStdKernelInt32 : public TestPrimitiveVarStdKernel<Int32Type> {};
+
+TEST_F(TestVarStdKernelInt32, Basics) {
+  VarianceOptions options{1};
+  this->AssertVarStdIs("[-2147483648, -2147483647, -2147483646]", options, 1.0);
+  this->AssertVarStdIs("[2147483645, 2147483646, 2147483647]", options, 1.0);
+  this->AssertVarStdIs("[-2147483648, -2147483648, 2147483647]", options,
+                       6.148914688373205e+18);
+}
+
+class TestVarStdKernelUInt32 : public TestPrimitiveVarStdKernel<UInt32Type> {};
+
+TEST_F(TestVarStdKernelUInt32, Basics) {
+  VarianceOptions options{1};
+  this->AssertVarStdIs("[4294967293, 4294967294, 4294967295]", options, 1.0);
+  this->AssertVarStdIs("[0, 0, 4294967295]", options, 6.148914688373205e+18);
+}
+
+// https://en.wikipedia.org/wiki/Kahan_summation_algorithm
+void KahanSum(double& sum, double& adjust, double addend) {
+  double y = addend - adjust;
+  double t = sum + y;
+  adjust = (t - sum) - y;
+  sum = t;
+}
+
+// Calculate reference variance with Welford's online algorithm + Kahan summation
+// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+// XXX: not stable for long array with very small `stddev / average`
+template <typename ArrayType>
+std::pair<double, double> WelfordVar(const ArrayType& array) {
+  const auto values = array.raw_values();
+  internal::BitmapReader reader(array.null_bitmap_data(), array.offset(), array.length());
+  double count = 0, mean = 0, m2 = 0;
+  double mean_adjust = 0, m2_adjust = 0;
+  for (int64_t i = 0; i < array.length(); ++i) {
+    if (reader.IsSet()) {
+      ++count;
+      double delta = static_cast<double>(values[i]) - mean;
+      KahanSum(mean, mean_adjust, delta / count);
+      double delta2 = static_cast<double>(values[i]) - mean;
+      KahanSum(m2, m2_adjust, delta * delta2);
+    }
+    reader.Next();
+  }
+  return std::make_pair(m2 / count, m2 / (count - 1));
+}
+
+// Test random chunked array
+template <typename ArrowType>
+class TestVarStdKernelRandom : public TestPrimitiveVarStdKernel<ArrowType> {};
+
+typedef ::testing::Types<Int32Type, UInt32Type, Int64Type, UInt64Type, FloatType,
+                         DoubleType>
+    VarStdRandomTypes;
+
+TYPED_TEST_SUITE(TestVarStdKernelRandom, VarStdRandomTypes);
+TYPED_TEST(TestVarStdKernelRandom, Basics) {
+  // Cut array into small chunks
+  constexpr int array_size = 5000;
+  constexpr int chunk_size_max = 50;
+  constexpr int chunk_count = array_size / chunk_size_max;
+
+  std::shared_ptr<Array> array;
+  auto rand = random::RandomArrayGenerator(0x5487656);
+  if (is_floating_type<TypeParam>::value) {
+    array = rand.Numeric<TypeParam>(array_size, -10000.0, 100000.0, 0.1);
+  } else {
+    using CType = typename TypeParam::c_type;
+    constexpr CType min = std::numeric_limits<CType>::min();
+    constexpr CType max = std::numeric_limits<CType>::max();
+    array = rand.Numeric<TypeParam>(array_size, min, max, 0.1);
+  }
+  auto chunk_size_array = rand.Numeric<Int32Type>(chunk_count, 0, chunk_size_max);
+  const int* chunk_size = chunk_size_array->data()->GetValues<int>(1);
+  int total_size = 0;
+
+  ArrayVector array_vector;
+  for (int i = 0; i < chunk_count; ++i) {
+    array_vector.emplace_back(array->Slice(total_size, chunk_size[i]));
+    total_size += chunk_size[i];
+  }
+  auto chunked = *ChunkedArray::Make(array_vector);
+
+  double var_population, var_sample;
+  using ArrayType = typename TypeTraits<TypeParam>::ArrayType;
+  auto typed_array = std::static_pointer_cast<ArrayType>(array->Slice(0, total_size));
+  std::tie(var_population, var_sample) = WelfordVar(*typed_array);
+
+  this->AssertVarStdIs(chunked, VarianceOptions{0}, var_population);
+  this->AssertVarStdIs(chunked, VarianceOptions{1}, var_sample);
+}
+
+// This test is too heavy to run in CI, should be checked manually
+#if 0
+class TestVarStdKernelIntegerLength : public TestPrimitiveVarStdKernel<Int32Type> {};
+
+TEST_F(TestVarStdKernelIntegerLength, Basics) {
+  constexpr int32_t min = std::numeric_limits<int32_t>::min();
+  constexpr int32_t max = std::numeric_limits<int32_t>::max();
+  auto rand = random::RandomArrayGenerator(0x5487657);
+  // large data volume
+  auto array = rand.Numeric<Int32Type>(4000000000, min, max, 0.1);
+  // biased distribution
+  // auto array = rand.Numeric<Int32Type>(4000000000, min, min + 100000, 0.1);
+
+  double var_population, var_sample;
+  auto int32_array = std::static_pointer_cast<Int32Array>(array);
+  std::tie(var_population, var_sample) = WelfordVar(*int32_array);
+
+  this->AssertVarStdIs(*array, VarianceOptions{0}, var_population);
+  this->AssertVarStdIs(*array, VarianceOptions{1}, var_sample);
+}
+#endif
+
+//
+// Quantile
+//
+
+template <typename ArrowType>
+class TestPrimitiveQuantileKernel : public ::testing::Test {
+ public:
+  using Traits = TypeTraits<ArrowType>;
+  using CType = typename ArrowType::c_type;
+
+  void AssertQuantilesAre(const Datum& array, QuantileOptions options,
+                          const std::vector<std::vector<Datum>>& expected) {
+    ASSERT_EQ(options.q.size(), expected.size());
+
+    for (size_t i = 0; i < this->interpolations_.size(); ++i) {
+      options.interpolation = this->interpolations_[i];
+
+      ASSERT_OK_AND_ASSIGN(Datum out, Quantile(array, options));
+      const auto& out_array = out.make_array();
+      ASSERT_OK(out_array->ValidateFull());
+      ASSERT_EQ(out_array->length(), options.q.size());
+      ASSERT_EQ(out_array->null_count(), 0);
+      ASSERT_EQ(out_array->type(), expected[0][i].type());
+
+      if (out_array->type() == float64()) {
+        const double* quantiles = out_array->data()->GetValues<double>(1);
+        for (int64_t j = 0; j < out_array->length(); ++j) {
+          const auto& numeric_scalar =
+              std::static_pointer_cast<DoubleScalar>(expected[j][i].scalar());
+          ASSERT_TRUE((quantiles[j] == numeric_scalar->value) ||
+                      (std::isnan(quantiles[j]) && std::isnan(numeric_scalar->value)));
+        }
+      } else {
+        ASSERT_EQ(out_array->type(), type_singleton());
+        const CType* quantiles = out_array->data()->GetValues<CType>(1);
+        for (int64_t j = 0; j < out_array->length(); ++j) {
+          const auto& numeric_scalar =
+              std::static_pointer_cast<NumericScalar<ArrowType>>(expected[j][i].scalar());
+          ASSERT_EQ(quantiles[j], numeric_scalar->value);
+        }
+      }
+    }
+  }
+
+  void AssertQuantilesAre(const std::string& json, const std::vector<double>& q,
+                          const std::vector<std::vector<Datum>>& expected) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertQuantilesAre(array, QuantileOptions{q}, expected);
+  }
+
+  void AssertQuantilesAre(const std::vector<std::string>& json,
+                          const std::vector<double>& q,
+                          const std::vector<std::vector<Datum>>& expected) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertQuantilesAre(chunked, QuantileOptions{q}, expected);
+  }
+
+  void AssertQuantileIs(const Datum& array, double q,
+                        const std::vector<Datum>& expected) {
+    AssertQuantilesAre(array, QuantileOptions{q}, {expected});
+  }
+
+  void AssertQuantileIs(const std::string& json, double q,
+                        const std::vector<Datum>& expected) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertQuantileIs(array, q, expected);
+  }
+
+  void AssertQuantileIs(const std::vector<std::string>& json, double q,
+                        const std::vector<Datum>& expected) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertQuantileIs(chunked, q, expected);
+  }
+
+  void AssertQuantilesEmpty(const Datum& array, const std::vector<double>& q) {
+    QuantileOptions options{q};
+    for (auto interpolation : this->interpolations_) {
+      options.interpolation = interpolation;
+      ASSERT_OK_AND_ASSIGN(Datum out, Quantile(array, options));
+      ASSERT_OK(out.make_array()->ValidateFull());
+      ASSERT_EQ(out.array()->length, 0);
+    }
+  }
+
+  void AssertQuantilesEmpty(const std::string& json, const std::vector<double>& q) {
+    auto array = ArrayFromJSON(type_singleton(), json);
+    AssertQuantilesEmpty(array, q);
+  }
+
+  void AssertQuantilesEmpty(const std::vector<std::string>& json,
+                            const std::vector<double>& q) {
+    auto chunked = ChunkedArrayFromJSON(type_singleton(), json);
+    AssertQuantilesEmpty(chunked, q);
+  }
+
+  std::shared_ptr<DataType> type_singleton() { return Traits::type_singleton(); }
+
+  std::vector<enum QuantileOptions::Interpolation> interpolations_ = {
+      QuantileOptions::LINEAR, QuantileOptions::LOWER, QuantileOptions::HIGHER,
+      QuantileOptions::NEAREST, QuantileOptions::MIDPOINT};
+};
+
+template <typename ArrowType>
+class TestIntegerQuantileKernel : public TestPrimitiveQuantileKernel<ArrowType> {};
+
+template <typename ArrowType>
+class TestFloatingQuantileKernel : public TestPrimitiveQuantileKernel<ArrowType> {};
+
+template <typename ArrowType>
+class TestInt64QuantileKernel : public TestPrimitiveQuantileKernel<ArrowType> {};
+
+#define INTYPE(x) Datum(static_cast<typename TypeParam::c_type>(x))
+#define DOUBLE(x) Datum(static_cast<double>(x))
+// output type per interplation: linear, lower, higher, nearest, midpoint
+#define O(a, b, c, d, e) \
+  { DOUBLE(a), INTYPE(b), INTYPE(c), INTYPE(d), DOUBLE(e) }
+
+TYPED_TEST_SUITE(TestIntegerQuantileKernel, IntegralArrowTypes);
+TYPED_TEST(TestIntegerQuantileKernel, Basics) {
+  // reference values from numpy
+  // ordered by interpolation method: {linear, lower, higher, nearest, midpoint}
+  this->AssertQuantileIs("[1]", 0.1, O(1, 1, 1, 1, 1));
+  this->AssertQuantileIs("[1, 2]", 0.5, O(1.5, 1, 2, 1, 1.5));
+  this->AssertQuantileIs("[3, 5, 2, 9, 0, 1, 8]", 0.5, O(3, 3, 3, 3, 3));
+  this->AssertQuantileIs("[3, 5, 2, 9, 0, 1, 8]", 0.33, O(1.98, 1, 2, 2, 1.5));
+  this->AssertQuantileIs("[3, 5, 2, 9, 0, 1, 8]", 0.9, O(8.4, 8, 9, 8, 8.5));
+  this->AssertQuantilesAre("[3, 5, 2, 9, 0, 1, 8]", {0.5, 0.9},
+                           {O(3, 3, 3, 3, 3), O(8.4, 8, 9, 8, 8.5)});
+  this->AssertQuantilesAre("[3, 5, 2, 9, 0, 1, 8]", {1, 0.5},
+                           {O(9, 9, 9, 9, 9), O(3, 3, 3, 3, 3)});
+  this->AssertQuantileIs("[3, 5, 2, 9, 0, 1, 8]", 0, O(0, 0, 0, 0, 0));
+  this->AssertQuantileIs("[3, 5, 2, 9, 0, 1, 8]", 1, O(9, 9, 9, 9, 9));
+
+  this->AssertQuantileIs("[5, null, null, 3, 9, null, 8, 1, 2, 0]", 0.21,
+                         O(1.26, 1, 2, 1, 1.5));
+  this->AssertQuantilesAre("[5, null, null, 3, 9, null, 8, 1, 2, 0]", {0.5, 0.9},
+                           {O(3, 3, 3, 3, 3), O(8.4, 8, 9, 8, 8.5)});
+  this->AssertQuantilesAre("[5, null, null, 3, 9, null, 8, 1, 2, 0]", {0.9, 0.5},
+                           {O(8.4, 8, 9, 8, 8.5), O(3, 3, 3, 3, 3)});
+
+  this->AssertQuantileIs({"[5]", "[null, null]", "[3, 9, null]", "[8, 1, 2, 0]"}, 0.33,
+                         O(1.98, 1, 2, 2, 1.5));
+  this->AssertQuantilesAre({"[5]", "[null, null]", "[3, 9, null]", "[8, 1, 2, 0]"},
+                           {0.21, 1}, {O(1.26, 1, 2, 1, 1.5), O(9, 9, 9, 9, 9)});
+
+  this->AssertQuantilesEmpty("[]", {0.5});
+  this->AssertQuantilesEmpty("[null, null, null]", {0.1, 0.2});
+  this->AssertQuantilesEmpty({"[null, null]", "[]", "[null]"}, {0.3, 0.4});
+}
+
+#ifndef __MINGW32__
+TYPED_TEST_SUITE(TestFloatingQuantileKernel, RealArrowTypes);
+TYPED_TEST(TestFloatingQuantileKernel, Floats) {
+  // ordered by interpolation method: {linear, lower, higher, nearest, midpoint}
+  this->AssertQuantileIs("[-9, 7, Inf, -Inf, 2, 11]", 0.5, O(4.5, 2, 7, 2, 4.5));
+  this->AssertQuantileIs("[-9, 7, Inf, -Inf, 2, 11]", 0.1,
+                         O(-INFINITY, -INFINITY, -9, -INFINITY, -INFINITY));
+  this->AssertQuantileIs("[-9, 7, Inf, -Inf, 2, 11]", 0.9,
+                         O(INFINITY, 11, INFINITY, 11, INFINITY));
+  this->AssertQuantilesAre("[-9, 7, Inf, -Inf, 2, 11]", {0.3, 0.6},
+                           {O(-3.5, -9, 2, 2, -3.5), O(7, 7, 7, 7, 7)});
+  this->AssertQuantileIs("[-Inf, Inf]", 0.2, O(NAN, -INFINITY, INFINITY, -INFINITY, NAN));
+
+  this->AssertQuantileIs("[NaN, -9, 7, Inf, null, null, -Inf, NaN, 2, 11]", 0.5,
+                         O(4.5, 2, 7, 2, 4.5));
+  this->AssertQuantilesAre("[null, -9, 7, Inf, NaN, NaN, -Inf, null, 2, 11]", {0.3, 0.6},
+                           {O(-3.5, -9, 2, 2, -3.5), O(7, 7, 7, 7, 7)});
+  this->AssertQuantilesAre("[null, -9, 7, Inf, NaN, NaN, -Inf, null, 2, 11]", {0.6, 0.3},
+                           {O(7, 7, 7, 7, 7), O(-3.5, -9, 2, 2, -3.5)});
+
+  this->AssertQuantileIs({"[NaN, -9, 7, Inf]", "[null, NaN]", "[-Inf, NaN, 2, 11]"}, 0.5,
+                         O(4.5, 2, 7, 2, 4.5));
+  this->AssertQuantilesAre({"[null, -9, 7, Inf]", "[NaN, NaN]", "[-Inf, null, 2, 11]"},
+                           {0.3, 0.6}, {O(-3.5, -9, 2, 2, -3.5), O(7, 7, 7, 7, 7)});
+
+  this->AssertQuantilesEmpty("[]", {0.5, 0.6});
+  this->AssertQuantilesEmpty("[null, NaN, null]", {0.1});
+  this->AssertQuantilesEmpty({"[NaN, NaN]", "[]", "[null]"}, {0.3, 0.4});
+}
+#endif
+
+// Test big int64 numbers cannot be precisely presented by double
+TYPED_TEST_SUITE(TestInt64QuantileKernel, Int64Type);
+TYPED_TEST(TestInt64QuantileKernel, Int64) {
+  this->AssertQuantileIs(
+      "[9223372036854775806, 9223372036854775807]", 0.5,
+      O(9.223372036854776e+18, 9223372036854775806, 9223372036854775807,
+        9223372036854775806, 9.223372036854776e+18));
+}
+
+#undef INTYPE
+#undef DOUBLE
+#undef O
+
+#ifndef __MINGW32__
+class TestRandomQuantileKernel : public TestPrimitiveQuantileKernel<Int32Type> {
+ public:
+  void CheckQuantiles(int64_t array_size, int64_t num_quantiles) {
+    auto rand = random::RandomArrayGenerator(0x5487658);
+    // set a small value range to exercise input array with equal values
+    const auto array = rand.Numeric<Int32Type>(array_size, -100, 200, 0.1);
+
+    std::vector<double> quantiles;
+    random_real(num_quantiles, 0x5487658, 0.0, 1.0, &quantiles);
+    // make sure to exercise 0 and 1 quantiles
+    *std::min_element(quantiles.begin(), quantiles.end()) = 0;
+    *std::max_element(quantiles.begin(), quantiles.end()) = 1;
+
+    this->AssertQuantilesAre(array, QuantileOptions{quantiles},
+                             NaiveQuantile(*array, quantiles));
+  }
+
+ private:
+  std::vector<std::vector<Datum>> NaiveQuantile(const Array& array,
+                                                const std::vector<double>& quantiles) {
+    // copy and sort input array
+    std::vector<int32_t> input(array.length() - array.null_count());
+    const int32_t* values = array.data()->GetValues<int32_t>(1);
+    const auto bitmap = array.null_bitmap_data();
+    int64_t index = 0;
+    for (int64_t i = 0; i < array.length(); ++i) {
+      if (BitUtil::GetBit(bitmap, i)) {
+        input[index++] = values[i];
+      }
+    }
+    std::sort(input.begin(), input.end());
+
+    std::vector<std::vector<Datum>> output(quantiles.size(),
+                                           std::vector<Datum>(interpolations_.size()));
+    for (uint64_t i = 0; i < interpolations_.size(); ++i) {
+      const auto interp = interpolations_[i];
+      for (uint64_t j = 0; j < quantiles.size(); ++j) {
+        output[j][i] = GetQuantile(input, quantiles[j], interp);
+      }
+    }
+    return output;
+  }
+
+  Datum GetQuantile(const std::vector<int32_t>& input, double q,
+                    enum QuantileOptions::Interpolation interp) {
+    const double index = (input.size() - 1) * q;
+    const uint64_t lower_index = static_cast<uint64_t>(index);
+    const double fraction = index - lower_index;
+
+    switch (interp) {
+      case QuantileOptions::LOWER:
+        return Datum(input[lower_index]);
+      case QuantileOptions::HIGHER:
+        return Datum(input[lower_index + (fraction != 0)]);
+      case QuantileOptions::NEAREST:
+        if (fraction < 0.5) {
+          return Datum(input[lower_index]);
+        } else if (fraction > 0.5) {
+          return Datum(input[lower_index + 1]);
+        } else {
+          return Datum(input[lower_index + (lower_index & 1)]);
+        }
+      case QuantileOptions::LINEAR:
+        if (fraction == 0) {
+          return Datum(static_cast<double>(input[lower_index]));
+        } else {
+          return Datum(fraction * input[lower_index + 1] +
+                       (1 - fraction) * input[lower_index]);
+        }
+      case QuantileOptions::MIDPOINT:
+        if (fraction == 0) {
+          return Datum(static_cast<double>(input[lower_index]));
+        } else {
+          return Datum(input[lower_index] / 2.0 + input[lower_index + 1] / 2.0);
+        }
+      default:
+        return Datum(NAN);
+    }
+  }
+};
+
+TEST_F(TestRandomQuantileKernel, Normal) {
+  this->CheckQuantiles(/*array_size=*/10000, /*num_quantiles=*/100);
+}
+
+TEST_F(TestRandomQuantileKernel, Overlapped) {
+  // much more quantiles than array size => many overlaps
+  this->CheckQuantiles(/*array_size=*/999, /*num_quantiles=*/9999);
+}
+#endif
 
 }  // namespace compute
 }  // namespace arrow

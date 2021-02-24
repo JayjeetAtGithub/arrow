@@ -22,23 +22,23 @@ use datafusion::prelude::*;
 
 /// This example demonstrates executing a simple query against an Arrow data source (Parquet) and
 /// fetching results, using the DataFrame trait
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // create local execution context
     let mut ctx = ExecutionContext::new();
 
-    let testdata =
-        std::env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::parquet_test_data();
 
     let filename = &format!("{}/alltypes_plain.parquet", testdata);
 
     // define the query using the DataFrame trait
     let df = ctx
         .read_parquet(filename)?
-        .filter(col("id").gt(lit(1)))?
-        .filter(col("tinyint_col").lt(col("tinyint_col")))?;
+        .select_columns(&["id", "bool_col", "timestamp_col"])?
+        .filter(col("id").gt(lit(1)))?;
 
     // execute the query
-    let results = df.collect()?;
+    let results = df.collect().await?;
 
     // print the results
     pretty::print_batches(&results)?;

@@ -216,6 +216,7 @@ cdef extern from "arrow/flight/api.h" namespace "arrow" nogil:
         CFlightCallOptions()
         CTimeoutDuration timeout
         CIpcWriteOptions write_options
+        vector[pair[c_string, c_string]] headers
 
     cdef cppclass CCertKeyPair" arrow::flight::CertKeyPair":
         CCertKeyPair()
@@ -296,6 +297,7 @@ cdef extern from "arrow/flight/api.h" namespace "arrow" nogil:
         vector[shared_ptr[CClientMiddlewareFactory]] middleware
         int64_t write_size_limit_bytes
         vector[pair[c_string, CIntStringVariant]] generic_options
+        c_bool disable_server_verification
 
     cdef cppclass CFlightClient" arrow::flight::FlightClient":
         @staticmethod
@@ -305,6 +307,11 @@ cdef extern from "arrow/flight/api.h" namespace "arrow" nogil:
 
         CStatus Authenticate(CFlightCallOptions& options,
                              unique_ptr[CClientAuthHandler] auth_handler)
+
+        CResult[pair[c_string, c_string]] AuthenticateBasicToken(
+            CFlightCallOptions& options,
+            const c_string& username,
+            const c_string& password)
 
         CStatus DoAction(CFlightCallOptions& options, CAction& action,
                          unique_ptr[CResultStream]* results)
@@ -537,7 +544,7 @@ cdef extern from "arrow/python/flight.h" namespace "arrow::py::flight" nogil:
 
 
 cdef extern from "arrow/util/variant.h" namespace "arrow" nogil:
-    cdef cppclass CIntStringVariant" arrow::util::variant<int, std::string>":
+    cdef cppclass CIntStringVariant" arrow::util::Variant<int, std::string>":
         CIntStringVariant()
         CIntStringVariant(int)
         CIntStringVariant(c_string)

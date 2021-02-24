@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <boost/multiprecision/cpp_int.hpp>
 
 #include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
@@ -37,6 +38,10 @@
 namespace arrow {
 
 using internal::int128_t;
+using internal::uint128_t;
+
+static const int128_t kInt128Max =
+    (static_cast<int128_t>(INT64_MAX) << 64) + static_cast<int128_t>(UINT64_MAX);
 
 class DecimalTestFixture : public ::testing::Test {
  public:
@@ -892,7 +897,8 @@ TEST(Decimal128Test, TestToInteger) {
 template <typename ArrowType, typename CType = typename ArrowType::c_type>
 std::vector<CType> GetRandomNumbers(int32_t size) {
   auto rand = random::RandomArrayGenerator(0x5487655);
-  auto x_array = rand.Numeric<ArrowType>(size, 0, std::numeric_limits<CType>::max(), 0);
+  auto x_array = rand.Numeric<ArrowType>(size, static_cast<CType>(0),
+                                         std::numeric_limits<CType>::max(), 0);
 
   auto x_ptr = x_array->data()->template GetValues<CType>(1);
   std::vector<CType> ret;
@@ -922,6 +928,14 @@ TEST(Decimal128Test, Multiply) {
       Decimal128 result = Decimal128(x) * Decimal128(y);
       ASSERT_EQ(Decimal128(static_cast<int64_t>(x) * y), result)
           << " x: " << x << " y: " << y;
+      // Test by multiplying with an additional 32 bit factor, then additional
+      // factor of 2^30 to test results in the range of -2^123 to 2^123 without overflow.
+      for (auto z : GetRandomNumbers<Int32Type>(32)) {
+        int128_t w = static_cast<int128_t>(x) * y * (1ull << 30);
+        Decimal128 expected = Decimal128FromInt128(static_cast<int128_t>(w) * z);
+        Decimal128 actual = Decimal128FromInt128(w) * Decimal128(z);
+        ASSERT_EQ(expected, actual) << " w: " << x << " * " << y << " * 2^30 z: " << z;
+      }
     }
   }
 
@@ -968,6 +982,39 @@ TEST(Decimal128Test, Divide) {
       Decimal128 result = decimal_x / decimal_y;
       EXPECT_EQ(Decimal128FromInt128(x / y), result)
           << " x: " << decimal_x << " y: " << decimal_y;
+    }
+  }
+}
+
+TEST(Decimal128Test, Rescale) {
+  ASSERT_OK_AND_EQ(Decimal128(11100), Decimal128(111).Rescale(0, 2));
+  ASSERT_OK_AND_EQ(Decimal128(111), Decimal128(11100).Rescale(2, 0));
+  ASSERT_OK_AND_EQ(Decimal128(5), Decimal128(500000).Rescale(6, 1));
+  ASSERT_OK_AND_EQ(Decimal128(500000), Decimal128(5).Rescale(1, 6));
+  ASSERT_RAISES(Invalid, Decimal128(555555).Rescale(6, 1));
+
+  // Test some random numbers.
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    for (auto value : GetRandomNumbers<Int32Type>(16)) {
+      Decimal128 unscaled_value = Decimal128(value);
+      Decimal128 scaled_value = unscaled_value;
+      for (int32_t new_scale = original_scale; new_scale < original_scale + 29;
+           new_scale++, scaled_value *= Decimal128(10)) {
+        ASSERT_OK_AND_EQ(scaled_value, unscaled_value.Rescale(original_scale, new_scale));
+        ASSERT_OK_AND_EQ(unscaled_value, scaled_value.Rescale(new_scale, original_scale));
+      }
+    }
+  }
+
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    Decimal128 value(1);
+    for (int32_t new_scale = original_scale; new_scale < original_scale + 39;
+         new_scale++, value *= Decimal128(10)) {
+      Decimal128 negative_value = value * -1;
+      ASSERT_OK_AND_EQ(value, Decimal128(1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(negative_value, Decimal128(-1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(Decimal128(1), value.Rescale(new_scale, original_scale));
+      ASSERT_OK_AND_EQ(Decimal128(-1), negative_value.Rescale(new_scale, original_scale));
     }
   }
 }
@@ -1145,5 +1192,379 @@ TEST(Decimal128Test, FitsInPrecision) {
   ASSERT_FALSE(
       Decimal128("-100000000000000000000000000000000000000").FitsInPrecision(38));
 }
+
+static constexpr std::array<uint64_t, 4> kSortedDecimal256Bits[] = {
+    {0, 0, 0, 0x8000000000000000ULL},  // min
+    {0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+     0xFFFFFFFFFFFFFFFFULL},  // -2
+    {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+     0xFFFFFFFFFFFFFFFFULL},  // -1
+    {0, 0, 0, 0},
+    {1, 0, 0, 0},
+    {2, 0, 0, 0},
+    {0xFFFFFFFFFFFFFFFFULL, 0, 0, 0},
+    {0, 1, 0, 0},
+    {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0, 0},
+    {0, 0, 1, 0},
+    {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0},
+    {0, 0, 0, 1},
+    {0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+     0x7FFFFFFFFFFFFFFFULL},  // max
+};
+
+TEST(Decimal256Test, TestComparators) {
+  constexpr size_t num_values =
+      sizeof(kSortedDecimal256Bits) / sizeof(kSortedDecimal256Bits[0]);
+  for (size_t i = 0; i < num_values; ++i) {
+    Decimal256 left(kSortedDecimal256Bits[i]);
+    for (size_t j = 0; j < num_values; ++j) {
+      Decimal256 right(kSortedDecimal256Bits[j]);
+      EXPECT_EQ(i == j, left == right);
+      EXPECT_EQ(i != j, left != right);
+      EXPECT_EQ(i < j, left < right);
+      EXPECT_EQ(i > j, left > right);
+      EXPECT_EQ(i <= j, left <= right);
+      EXPECT_EQ(i >= j, left >= right);
+    }
+  }
+}
+
+TEST(Decimal256Test, TestToBytesRoundTrip) {
+  for (const std::array<uint64_t, 4>& bits : kSortedDecimal256Bits) {
+    Decimal256 decimal(bits);
+    EXPECT_EQ(decimal, Decimal256(decimal.ToBytes().data()));
+  }
+}
+
+template <typename T>
+class Decimal256Test : public ::testing::Test {
+ public:
+  Decimal256Test() {}
+};
+
+using Decimal256Types =
+    ::testing::Types<char, unsigned char, short, unsigned short,  // NOLINT
+                     int, unsigned int, long, unsigned long,      // NOLINT
+                     long long, unsigned long long                // NOLINT
+                     >;
+
+TYPED_TEST_SUITE(Decimal256Test, Decimal256Types);
+
+TYPED_TEST(Decimal256Test, ConstructibleFromAnyIntegerType) {
+  using UInt64Array = std::array<uint64_t, 4>;
+  Decimal256 value(TypeParam{42});
+  EXPECT_EQ(UInt64Array({42, 0, 0, 0}), value.little_endian_array());
+
+  TypeParam max = std::numeric_limits<TypeParam>::max();
+  Decimal256 max_value(max);
+  EXPECT_EQ(UInt64Array({static_cast<uint64_t>(max), 0, 0, 0}),
+            max_value.little_endian_array());
+
+  TypeParam min = std::numeric_limits<TypeParam>::min();
+  Decimal256 min_value(min);
+  uint64_t high_bits = std::is_signed<TypeParam>::value ? ~uint64_t{0} : uint64_t{0};
+  EXPECT_EQ(UInt64Array({static_cast<uint64_t>(min), high_bits, high_bits, high_bits}),
+            min_value.little_endian_array());
+}
+
+TEST(Decimal256Test, ConstructibleFromBool) {
+  EXPECT_EQ(Decimal256(0), Decimal256(false));
+  EXPECT_EQ(Decimal256(1), Decimal256(true));
+}
+
+Decimal256 Decimal256FromInt128(int128_t value) {
+  return Decimal256(Decimal128(static_cast<int64_t>(value >> 64),
+                               static_cast<uint64_t>(value & 0xFFFFFFFFFFFFFFFFULL)));
+}
+
+TEST(Decimal256Test, Multiply) {
+  using boost::multiprecision::int256_t;
+  using boost::multiprecision::uint256_t;
+
+  ASSERT_EQ(Decimal256(60501), Decimal256(301) * Decimal256(201));
+
+  ASSERT_EQ(Decimal256(-60501), Decimal256(-301) * Decimal256(201));
+
+  ASSERT_EQ(Decimal256(-60501), Decimal256(301) * Decimal256(-201));
+
+  ASSERT_EQ(Decimal256(60501), Decimal256(-301) * Decimal256(-201));
+
+  // Test some random numbers.
+  std::vector<int128_t> left;
+  std::vector<int128_t> right;
+  for (auto x : GetRandomNumbers<Int32Type>(16)) {
+    for (auto y : GetRandomNumbers<Int32Type>(16)) {
+      for (auto z : GetRandomNumbers<Int32Type>(16)) {
+        for (auto w : GetRandomNumbers<Int32Type>(16)) {
+          // Test two 128 bit numbers which have a large amount of bits set.
+          int128_t l = static_cast<uint128_t>(x) << 96 | static_cast<uint128_t>(y) << 64 |
+                       static_cast<uint128_t>(z) << 32 | static_cast<uint128_t>(w);
+          int128_t r = static_cast<uint128_t>(w) << 96 | static_cast<uint128_t>(z) << 64 |
+                       static_cast<uint128_t>(y) << 32 | static_cast<uint128_t>(x);
+          int256_t expected = int256_t(l) * r;
+          Decimal256 actual = Decimal256FromInt128(l) * Decimal256FromInt128(r);
+          ASSERT_EQ(expected.str(), actual.ToIntegerString())
+              << " " << int256_t(l).str() << " * " << int256_t(r).str();
+          // Test a 96 bit number against a 160 bit number.
+          int128_t s = l >> 32;
+          uint256_t b = uint256_t(r) << 32;
+          Decimal256 b_dec =
+              Decimal256FromInt128(r) * Decimal256(static_cast<uint64_t>(1) << 32);
+          ASSERT_EQ(b.str(), b_dec.ToIntegerString()) << int256_t(r).str();
+          expected = int256_t(s) * b;
+          actual = Decimal256FromInt128(s) * b_dec;
+          ASSERT_EQ(expected.str(), actual.ToIntegerString())
+              << " " << int256_t(s).str() << " * " << int256_t(b).str();
+        }
+      }
+    }
+  }
+
+  // Test some edge cases
+  for (auto x : std::vector<int128_t>{-INT64_MAX, -INT32_MAX, 0, INT32_MAX, INT64_MAX}) {
+    for (auto y :
+         std::vector<int128_t>{-INT32_MAX, -32, -2, -1, 0, 1, 2, 32, INT32_MAX}) {
+      Decimal256 decimal_x = Decimal256FromInt128(x);
+      Decimal256 decimal_y = Decimal256FromInt128(y);
+      Decimal256 result = decimal_x * decimal_y;
+      EXPECT_EQ(Decimal256FromInt128(x * y), result)
+          << " x: " << decimal_x << " y: " << decimal_y;
+    }
+  }
+}
+
+TEST(Decimal256Test, Shift) {
+  {
+    // Values compared against python's implementation of shift.
+    Decimal256 v(967);
+    v <<= 16;
+    ASSERT_EQ(v, Decimal256("63373312"));
+    v <<= 66;
+    ASSERT_EQ(v, Decimal256("4676125070269385647763488768"));
+    v <<= 128;
+    ASSERT_EQ(v,
+              Decimal256(
+                  "1591202906929606242763855199532957938318305582067671727858104926208"));
+  }
+  {
+    // Values compared against python's implementation of shift.
+    Decimal256 v(0xEFFACDA);
+    v <<= 17;
+    ASSERT_EQ(v, Decimal256("32982558834688"));
+    v <<= 67;
+    ASSERT_EQ(v, Decimal256("4867366573756459829801535578046464"));
+    v <<= 129;
+    ASSERT_EQ(
+        v,
+        Decimal256(
+            "3312558036779413504434176328500812891073739806516698535430241719490183168"));
+    v <<= 43;
+    ASSERT_EQ(v, Decimal256(0));
+  }
+
+  {
+    // Values compared against python's implementation of shift.
+    Decimal256 v("-12346789123456789123456789");
+    v <<= 15;
+    ASSERT_EQ(v, Decimal256("-404579585997432065997432061952"))
+        << std::hex << v.little_endian_array()[0] << " " << v.little_endian_array()[1]
+        << " " << v.little_endian_array()[2] << " " << v.little_endian_array()[3] << "\n"
+        << Decimal256("-404579585997432065997432061952").little_endian_array()[0] << " "
+        << Decimal256("-404579585997432065997432061952").little_endian_array()[1] << " "
+        << Decimal256("-404579585997432065997432061952").little_endian_array()[2] << " "
+        << Decimal256("-404579585997432065997432061952").little_endian_array()[3];
+    v <<= 30;
+    ASSERT_EQ(v, Decimal256("-434414022622047565860171081516421480448"));
+    v <<= 66;
+    ASSERT_EQ(v,
+              Decimal256("-32054097189358332105678889809255994470201895906771963215872"));
+  }
+}
+
+TEST(Decimal256Test, Add) {
+  EXPECT_EQ(Decimal256(103), Decimal256(100) + Decimal256(3));
+  EXPECT_EQ(Decimal256(203), Decimal256(200) + Decimal256(3));
+  EXPECT_EQ(Decimal256(20401), Decimal256(20100) + Decimal256(301));
+  EXPECT_EQ(Decimal256(-19799), Decimal256(-20100) + Decimal256(301));
+  EXPECT_EQ(Decimal256(19799), Decimal256(20100) + Decimal256(-301));
+  EXPECT_EQ(Decimal256(-20401), Decimal256(-20100) + Decimal256(-301));
+  EXPECT_EQ(Decimal256("100000000000000000000000000000000001"),
+            Decimal256("99999999999999999999999999999999999") + Decimal256("2"));
+  EXPECT_EQ(Decimal256("120200000000000000000000000000002019"),
+            Decimal256("99999999999999999999999999999999999") +
+                Decimal256("20200000000000000000000000000002020"));
+
+  // Test some random numbers.
+  for (auto x : GetRandomNumbers<Int32Type>(16)) {
+    for (auto y : GetRandomNumbers<Int32Type>(16)) {
+      if (y == 0) {
+        continue;
+      }
+
+      Decimal256 result = Decimal256(x) + Decimal256(y);
+      ASSERT_EQ(Decimal256(static_cast<int64_t>(x) + y), result)
+          << " x: " << x << " y: " << y;
+    }
+  }
+}
+
+TEST(Decimal256Test, Divide) {
+  ASSERT_EQ(Decimal256(33), Decimal256(100) / Decimal256(3));
+  ASSERT_EQ(Decimal256(66), Decimal256(200) / Decimal256(3));
+  ASSERT_EQ(Decimal256(66), Decimal256(20100) / Decimal256(301));
+  ASSERT_EQ(Decimal256(-66), Decimal256(-20100) / Decimal256(301));
+  ASSERT_EQ(Decimal256(-66), Decimal256(20100) / Decimal256(-301));
+  ASSERT_EQ(Decimal256(66), Decimal256(-20100) / Decimal256(-301));
+  ASSERT_EQ(Decimal256("-5192296858534827628530496329343552"),
+            Decimal256("-269599466671506397946670150910580797473777870509761363"
+                       "24636208709184") /
+                Decimal256("5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("5192296858534827628530496329343552"),
+            Decimal256("-269599466671506397946670150910580797473777870509761363"
+                       "24636208709184") /
+                Decimal256("-5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("5192296858534827628530496329343552"),
+            Decimal256("2695994666715063979466701509105807974737778705097613632"
+                       "4636208709184") /
+                Decimal256("5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("-5192296858534827628530496329343552"),
+            Decimal256("2695994666715063979466701509105807974737778705097613632"
+                       "4636208709184") /
+                Decimal256("-5192296858534827628530496329874417"));
+
+  // Test some random numbers.
+  for (auto x : GetRandomNumbers<Int32Type>(16)) {
+    for (auto y : GetRandomNumbers<Int32Type>(16)) {
+      if (y == 0) {
+        continue;
+      }
+
+      Decimal256 result = Decimal256(x) / Decimal256(y);
+      ASSERT_EQ(Decimal256(static_cast<int64_t>(x) / y), result)
+          << " x: " << x << " y: " << y;
+    }
+  }
+
+  // Test some edge cases
+  for (auto x :
+       std::vector<int128_t>{-kInt128Max, -INT64_MAX - 1, -INT64_MAX, -INT32_MAX - 1,
+                             -INT32_MAX, 0, INT32_MAX, INT64_MAX, kInt128Max}) {
+    for (auto y : std::vector<int128_t>{-INT64_MAX - 1, -INT64_MAX, -INT32_MAX, -32, -2,
+                                        -1, 1, 2, 32, INT32_MAX, INT64_MAX}) {
+      Decimal256 decimal_x = Decimal256FromInt128(x);
+      Decimal256 decimal_y = Decimal256FromInt128(y);
+      Decimal256 result = decimal_x / decimal_y;
+      EXPECT_EQ(Decimal256FromInt128(x / y), result)
+          << " x: " << decimal_x.ToIntegerString()
+          << " y: " << decimal_y.ToIntegerString();
+    }
+  }
+}
+
+TEST(Decimal256Test, Rescale) {
+  ASSERT_OK_AND_EQ(Decimal256(11100), Decimal256(111).Rescale(0, 2));
+  ASSERT_OK_AND_EQ(Decimal256(111), Decimal256(11100).Rescale(2, 0));
+  ASSERT_OK_AND_EQ(Decimal256(5), Decimal256(500000).Rescale(6, 1));
+  ASSERT_OK_AND_EQ(Decimal256(500000), Decimal256(5).Rescale(1, 6));
+  ASSERT_RAISES(Invalid, Decimal256(555555).Rescale(6, 1));
+
+  // Test some random numbers.
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    for (auto value : GetRandomNumbers<Int32Type>(16)) {
+      Decimal256 unscaled_value = Decimal256(value);
+      Decimal256 scaled_value = unscaled_value;
+      for (int32_t new_scale = original_scale; new_scale < original_scale + 68;
+           new_scale++, scaled_value *= Decimal256(10)) {
+        ASSERT_OK_AND_EQ(scaled_value, unscaled_value.Rescale(original_scale, new_scale));
+        ASSERT_OK_AND_EQ(unscaled_value, scaled_value.Rescale(new_scale, original_scale));
+      }
+    }
+  }
+
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    Decimal256 value(1);
+    for (int32_t new_scale = original_scale; new_scale < original_scale + 77;
+         new_scale++, value *= Decimal256(10)) {
+      Decimal256 negative_value = value * -1;
+      ASSERT_OK_AND_EQ(value, Decimal256(1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(negative_value, Decimal256(-1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(Decimal256(1), value.Rescale(new_scale, original_scale));
+      ASSERT_OK_AND_EQ(Decimal256(-1), negative_value.Rescale(new_scale, original_scale));
+    }
+  }
+}
+
+TEST(Decimal256, FromBigEndianTest) {
+  // We test out a variety of scenarios:
+  //
+  // * Positive values that are left shifted
+  //   and filled in with the same bit pattern
+  // * Negated of the positive values
+  // * Complement of the positive values
+  //
+  // For the positive values, we can call FromBigEndian
+  // with a length that is less than 16, whereas we must
+  // pass all 32 bytes for the negative and complement.
+  //
+  // We use a number of bit patterns to increase the coverage
+  // of scenarios
+  for (int32_t start : {1, 1, 15, /* 00001111 */
+                        85,       /* 01010101 */
+                        127 /* 01111111 */}) {
+    Decimal256 value(start);
+    for (int ii = 0; ii < 32; ++ii) {
+      auto native_endian = value.ToBytes();
+#if ARROW_LITTLE_ENDIAN
+      std::reverse(native_endian.begin(), native_endian.end());
+#endif
+      // Limit the number of bytes we are passing to make
+      // sure that it works correctly. That's why all of the
+      // 'start' values don't have a 1 in the most significant
+      // bit place
+      ASSERT_OK_AND_EQ(value,
+                       Decimal256::FromBigEndian(native_endian.data() + 31 - ii, ii + 1));
+
+      // Negate it
+      auto negated = -value;
+      native_endian = negated.ToBytes();
+#if ARROW_LITTLE_ENDIAN
+      // convert to big endian
+      std::reverse(native_endian.begin(), native_endian.end());
+#endif
+      // The sign bit is looked up in the MSB
+      ASSERT_OK_AND_EQ(negated,
+                       Decimal256::FromBigEndian(native_endian.data() + 31 - ii, ii + 1));
+
+      // Take the complement
+      auto complement = ~value;
+      native_endian = complement.ToBytes();
+#if ARROW_LITTLE_ENDIAN
+      // convert to big endian
+      std::reverse(native_endian.begin(), native_endian.end());
+#endif
+      ASSERT_OK_AND_EQ(complement, Decimal256::FromBigEndian(native_endian.data(), 32));
+
+      value <<= 8;
+      value += Decimal256(start);
+    }
+  }
+}
+
+TEST(Decimal256Test, TestFromBigEndianBadLength) {
+  ASSERT_RAISES(Invalid, Decimal128::FromBigEndian(nullptr, -1));
+  ASSERT_RAISES(Invalid, Decimal128::FromBigEndian(nullptr, 33));
+}
+
+class Decimal256ToStringTest : public ::testing::TestWithParam<ToStringTestParam> {};
+
+TEST_P(Decimal256ToStringTest, ToString) {
+  const ToStringTestParam& data = GetParam();
+  const Decimal256 value(data.test_value);
+  const std::string printed_value = value.ToString(data.scale);
+  ASSERT_EQ(data.expected_string, printed_value);
+}
+
+INSTANTIATE_TEST_SUITE_P(Decimal256ToStringTest, Decimal256ToStringTest,
+                         ::testing::ValuesIn(kToStringTestData));
 
 }  // namespace arrow

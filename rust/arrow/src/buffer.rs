@@ -15,116 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The main type in the module is `Buffer`, a contiguous immutable memory region of
-//! fixed size aligned at a 64-byte boundary. `MutableBuffer` is like `Buffer`, but it can
-//! be mutated and grown.
+//! This module contains two main structs: [Buffer] and [MutableBuffer]. A buffer represents
+//! a contiguous memory region that can be shared via `offsets`.
+
 #[cfg(feature = "simd")]
 use packed_simd::u8x64;
 
-use std::cmp;
-use std::convert::AsRef;
-use std::fmt::{Debug, Formatter};
-use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
-use std::mem;
+use crate::{
+    bytes::{Bytes, Deallocation},
+    datatypes::{ArrowNativeType, ToByteSlice},
+    ffi,
+};
+
+use std::fmt::Debug;
+use std::iter::FromIterator;
 use std::ops::{BitAnd, BitOr, Not};
 use std::ptr::NonNull;
-use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::Arc;
+use std::{convert::AsRef, usize};
 
-use crate::datatypes::ArrowNativeType;
+#[cfg(feature = "avx512")]
+use crate::arch::avx512::*;
 use crate::error::{ArrowError, Result};
 use crate::memory;
+use crate::util::bit_chunk_iterator::BitChunks;
 use crate::util::bit_util;
-#[cfg(feature = "simd")]
+use crate::util::bit_util::ceil;
+#[cfg(any(feature = "simd", feature = "avx512"))]
 use std::borrow::BorrowMut;
 
-/// Buffer is a contiguous memory region of fixed size and is aligned at a 64-byte
-/// boundary. Buffer is immutable.
-#[derive(PartialEq, Debug)]
+/// Buffer represents a contiguous memory region that can be shared with other buffers and across
+/// thread boundaries.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Buffer {
-    /// Reference-counted pointer to the internal byte buffer.
-    data: Arc<BufferData>,
+    /// the internal byte buffer.
+    data: Arc<Bytes>,
 
     /// The offset into the buffer.
     offset: usize,
 }
 
-struct BufferData {
-    /// The raw pointer into the buffer bytes
-    ptr: *const u8,
-
-    /// The length (num of bytes) of the buffer. The region `[0, len)` of the buffer
-    /// is occupied with meaningful data, while the rest `[len, capacity)` is the
-    /// unoccupied region.
-    len: usize,
-
-    /// Whether this piece of memory is owned by this object
-    owned: bool,
-
-    /// The capacity (num of bytes) of the buffer
-    /// Invariant: len <= capacity
-    capacity: usize,
-}
-
-impl PartialEq for BufferData {
-    fn eq(&self, other: &BufferData) -> bool {
-        if self.capacity != other.capacity {
-            return false;
-        }
-
-        self.data() == other.data()
-    }
-}
-
-/// Release the underlying memory when the current buffer goes out of scope
-impl Drop for BufferData {
-    fn drop(&mut self) {
-        if self.is_allocated() && self.owned {
-            unsafe { memory::free_aligned(self.ptr as *mut u8, self.capacity) };
-        }
-    }
-}
-
-impl Debug for BufferData {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "BufferData {{ ptr: {:?}, len: {}, capacity: {}, data: ",
-            self.ptr, self.len, self.capacity
-        )?;
-
-        f.debug_list().entries(self.data().iter()).finish()?;
-
-        write!(f, " }}")
-    }
-}
-
-impl BufferData {
-    fn data(&self) -> &[u8] {
-        if !self.is_allocated() {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-        }
-    }
-
-    fn is_zst(&self) -> bool {
-        self.ptr == BUFFER_INIT.as_ptr() as _
-    }
-
-    fn is_allocated(&self) -> bool {
-        !(self.is_zst() || self.ptr.is_null())
-    }
-}
-
-///
-/// SAFETY: (vcq):
-/// As you can see this is global and lives as long as the program lives.
-/// This is used for lazy allocation in the further steps of buffer allocations.
-/// Pointer below is well-aligned, only used for ZSTs and discarded afterwards.
-const BUFFER_INIT: NonNull<u8> = NonNull::dangling();
-
 impl Buffer {
+    /// Initializes a [Buffer] from a slice of items.
+    pub fn from_slice_ref<U: ArrowNativeType, T: AsRef<[U]>>(items: &T) -> Self {
+        // allocate aligned memory buffer
+        let slice = items.as_ref();
+        let len = slice.len() * std::mem::size_of::<U>();
+        let capacity = bit_util::round_upto_multiple_of_64(len);
+        let buffer = memory::allocate_aligned(capacity);
+        unsafe {
+            memory::memcpy(
+                buffer,
+                NonNull::new_unchecked(slice.as_ptr() as *mut u8),
+                len,
+            );
+            Buffer::build_with_arguments(buffer, len, Deallocation::Native(capacity))
+        }
+    }
+
     /// Creates a buffer from an existing memory region (must already be byte-aligned), this
     /// `Buffer` will free this piece of memory when dropped.
     ///
@@ -138,8 +86,9 @@ impl Buffer {
     ///
     /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
     /// bytes. If the `ptr` and `capacity` come from a `Buffer`, then this is guaranteed.
-    pub unsafe fn from_raw_parts(ptr: *const u8, len: usize, capacity: usize) -> Self {
-        Buffer::build_with_arguments(ptr, len, capacity, true)
+    pub unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize, capacity: usize) -> Self {
+        assert!(len <= capacity);
+        Buffer::build_with_arguments(ptr, len, Deallocation::Native(capacity))
     }
 
     /// Creates a buffer from an existing memory region (must already be byte-aligned), this
@@ -149,73 +98,58 @@ impl Buffer {
     ///
     /// * `ptr` - Pointer to raw parts
     /// * `len` - Length of raw parts in **bytes**
-    /// * `capacity` - Total allocated memory for the pointer `ptr`, in **bytes**
+    /// * `data` - An [ffi::FFI_ArrowArray] with the data
     ///
     /// # Safety
     ///
     /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
-    /// bytes. If the `ptr` and `capacity` come from a `Buffer`, then this is guaranteed.
-    pub unsafe fn from_unowned(ptr: *const u8, len: usize, capacity: usize) -> Self {
-        Buffer::build_with_arguments(ptr, len, capacity, false)
+    /// bytes and that the foreign deallocator frees the region.
+    pub unsafe fn from_unowned(
+        ptr: NonNull<u8>,
+        len: usize,
+        data: Arc<ffi::FFI_ArrowArray>,
+    ) -> Self {
+        Buffer::build_with_arguments(ptr, len, Deallocation::Foreign(data))
     }
 
-    /// Creates a buffer from an existing memory region (must already be byte-aligned).
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to raw parts
-    /// * `len` - Length of raw parts in bytes
-    /// * `capacity` - Total allocated memory for the pointer `ptr`, in **bytes**
-    /// * `owned` - Whether the raw parts is owned by this `Buffer`. If true, this `Buffer` will
-    /// free this memory when dropped, otherwise it will skip freeing the raw parts.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
-    /// bytes. If the `ptr` and `capacity` come from a `Buffer`, then this is guaranteed.
+    /// Auxiliary method to create a new Buffer
     unsafe fn build_with_arguments(
-        ptr: *const u8,
+        ptr: NonNull<u8>,
         len: usize,
-        capacity: usize,
-        owned: bool,
+        deallocation: Deallocation,
     ) -> Self {
-        assert!(
-            memory::is_aligned(ptr, memory::ALIGNMENT),
-            "memory not aligned"
-        );
-        let buf_data = BufferData {
-            ptr,
-            len,
-            capacity,
-            owned,
-        };
+        let bytes = Bytes::new(ptr, len, deallocation);
         Buffer {
-            data: Arc::new(buf_data),
+            data: Arc::new(bytes),
             offset: 0,
         }
     }
 
     /// Returns the number of bytes in the buffer
     pub fn len(&self) -> usize {
-        self.data.len - self.offset
+        self.data.len() - self.offset
     }
 
-    /// Returns the capacity of this buffer
+    /// Returns the capacity of this buffer.
+    /// For exernally owned buffers, this returns zero
     pub fn capacity(&self) -> usize {
-        self.data.capacity
+        self.data.capacity()
     }
 
     /// Returns whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.len - self.offset == 0
+        self.data.len() - self.offset == 0
     }
 
     /// Returns the byte slice stored in this buffer
-    pub fn data(&self) -> &[u8] {
-        &self.data.data()[self.offset..]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[self.offset..]
     }
 
-    /// Returns a slice of this buffer, starting from `offset`.
+    /// Returns a new [Buffer] that is a slice of this buffer starting at `offset`.
+    /// Doing so allows the same memory region to be shared between buffers.
+    /// # Panics
+    /// Panics iff `offset` is larger than `len`.
     pub fn slice(&self, offset: usize) -> Self {
         assert!(
             offset <= self.len(),
@@ -227,12 +161,12 @@ impl Buffer {
         }
     }
 
-    /// Returns a raw pointer for this buffer.
+    /// Returns a pointer to the start of this buffer.
     ///
     /// Note that this should be used cautiously, and the returned pointer should not be
     /// stored anywhere, to avoid dangling pointers.
-    pub fn raw_data(&self) -> *const u8 {
-        unsafe { self.data.ptr.add(self.offset) }
+    pub fn as_ptr(&self) -> *const u8 {
+        unsafe { self.data.ptr().as_ptr().add(self.offset) }
     }
 
     /// View buffer as typed slice.
@@ -245,27 +179,52 @@ impl Buffer {
     ///
     /// Also `typed_data::<bool>` is unsafe as `0x00` and `0x01` are the only valid values for
     /// `bool` in Rust.  However, `bool` arrays in Arrow are bit-packed which breaks this condition.
+    /// View buffer as typed slice.
     pub unsafe fn typed_data<T: ArrowNativeType + num::Num>(&self) -> &[T] {
-        assert_eq!(self.len() % mem::size_of::<T>(), 0);
-        assert!(memory::is_ptr_aligned::<T>(self.raw_data() as *const T));
-        from_raw_parts(
-            self.raw_data() as *const T,
-            self.len() / mem::size_of::<T>(),
-        )
+        // JUSTIFICATION
+        //  Benefit
+        //      Many of the buffers represent specific types, and consumers of `Buffer` often need to re-interpret them.
+        //  Soundness
+        //      * The pointer is non-null by construction
+        //      * alignment asserted below.
+        let (prefix, offsets, suffix) = self.as_slice().align_to::<T>();
+        assert!(prefix.is_empty() && suffix.is_empty());
+        offsets
     }
 
-    /// Returns an empty buffer.
-    pub fn empty() -> Self {
-        unsafe { Self::from_raw_parts(BUFFER_INIT.as_ptr() as _, 0, 0) }
-    }
-}
-
-impl Clone for Buffer {
-    fn clone(&self) -> Buffer {
-        Buffer {
-            data: self.data.clone(),
-            offset: self.offset,
+    /// Returns a slice of this buffer starting at a certain bit offset.
+    /// If the offset is byte-aligned the returned buffer is a shallow clone,
+    /// otherwise a new buffer is allocated and filled with a copy of the bits in the range.
+    pub fn bit_slice(&self, offset: usize, len: usize) -> Self {
+        if offset % 8 == 0 && len % 8 == 0 {
+            return self.slice(offset / 8);
         }
+
+        bitwise_unary_op_helper(&self, offset, len, |a| a)
+    }
+
+    /// Returns a `BitChunks` instance which can be used to iterate over this buffers bits
+    /// in larger chunks and starting at arbitrary bit offsets.
+    /// Note that both `offset` and `length` are measured in bits.
+    pub fn bit_chunks(&self, offset: usize, len: usize) -> BitChunks {
+        BitChunks::new(&self.as_slice(), offset, len)
+    }
+
+    /// Returns the number of 1-bits in this buffer.
+    pub fn count_set_bits(&self) -> usize {
+        let len_in_bits = self.len() * 8;
+        // self.offset is already taken into consideration by the bit_chunks implementation
+        self.count_set_bits_offset(0, len_in_bits)
+    }
+
+    /// Returns the number of 1-bits in this buffer, starting from `offset` with `length` bits
+    /// inspected. Note that both `offset` and `length` are measured in bits.
+    pub fn count_set_bits_offset(&self, offset: usize, len: usize) -> usize {
+        let chunks = self.bit_chunks(offset, len);
+        let mut count = chunks.iter().map(|c| c.count_ones() as usize).sum();
+        count += chunks.remainder_bits().count_ones() as usize;
+
+        count
     }
 }
 
@@ -275,18 +234,37 @@ impl<T: AsRef<[u8]>> From<T> for Buffer {
     fn from(p: T) -> Self {
         // allocate aligned memory buffer
         let slice = p.as_ref();
-        let len = slice.len() * mem::size_of::<u8>();
-        let capacity = bit_util::round_upto_multiple_of_64(len);
-        let buffer = memory::allocate_aligned(capacity);
-        unsafe {
-            memory::memcpy(buffer, slice.as_ptr(), len);
-            Buffer::from_raw_parts(buffer, len, capacity)
-        }
+        let len = slice.len();
+        let mut buffer = MutableBuffer::new(len);
+        buffer.extend_from_slice(slice);
+        buffer.into()
     }
 }
 
-///  Helper function for binary SIMD operations like `BitAnd` and `BitOr`.
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+/// Creating a `Buffer` instance by storing the boolean values into the buffer
+impl std::iter::FromIterator<bool> for Buffer {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = bool>,
+    {
+        MutableBuffer::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for Buffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+}
+
+/// Apply a bitwise operation `simd_op` / `scalar_op` to two inputs using simd instructions and return the result as a Buffer.
+/// The `simd_op` functions gets applied on chunks of 64 bytes (512 bits) at a time
+/// and the `scalar_op` gets applied to remaining bytes.
+/// Contrary to the non-simd version `bitwise_bin_op_helper`, the offset and length is specified in bytes
+/// and this version does not support operations starting at arbitrary bit offsets.
+#[cfg(simd)]
 fn bitwise_bin_op_simd_helper<F_SIMD, F_SCALAR>(
     left: &Buffer,
     left_offset: usize,
@@ -303,9 +281,9 @@ where
     let mut result = MutableBuffer::new(len).with_bitset(len, false);
     let lanes = u8x64::lanes();
 
-    let mut left_chunks = left.data()[left_offset..].chunks_exact(lanes);
-    let mut right_chunks = right.data()[right_offset..].chunks_exact(lanes);
-    let mut result_chunks = result.data_mut().chunks_exact_mut(lanes);
+    let mut left_chunks = left.as_slice()[left_offset..].chunks_exact(lanes);
+    let mut right_chunks = right.as_slice()[right_offset..].chunks_exact(lanes);
+    let mut result_chunks = result.as_slice_mut().chunks_exact_mut(lanes);
 
     result_chunks
         .borrow_mut()
@@ -327,11 +305,15 @@ where
             *res = scalar_op(*left, *right);
         });
 
-    result.freeze()
+    result.into()
 }
 
-///  Helper function for unary SIMD operations like `BitNot`.
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+/// Apply a bitwise operation `simd_op` / `scalar_op` to one input using simd instructions and return the result as a Buffer.
+/// The `simd_op` functions gets applied on chunks of 64 bytes (512 bits) at a time
+/// and the `scalar_op` gets applied to remaining bytes.
+/// Contrary to the non-simd version `bitwise_unary_op_helper`, the offset and length is specified in bytes
+/// and this version does not support operations starting at arbitrary bit offsets.
+#[cfg(simd)]
 fn bitwise_unary_op_simd_helper<F_SIMD, F_SCALAR>(
     left: &Buffer,
     left_offset: usize,
@@ -346,8 +328,8 @@ where
     let mut result = MutableBuffer::new(len).with_bitset(len, false);
     let lanes = u8x64::lanes();
 
-    let mut left_chunks = left.data()[left_offset..].chunks_exact(lanes);
-    let mut result_chunks = result.data_mut().chunks_exact_mut(lanes);
+    let mut left_chunks = left.as_slice()[left_offset..].chunks_exact(lanes);
+    let mut result_chunks = result.as_slice_mut().chunks_exact_mut(lanes);
 
     result_chunks
         .borrow_mut()
@@ -366,137 +348,318 @@ where
             *res = scalar_op(*left);
         });
 
-    result.freeze()
+    result.into()
 }
 
+/// Apply a bitwise operation `op` to two inputs and return the result as a Buffer.
+/// The inputs are treated as bitmaps, meaning that offsets and length are specified in number of bits.
 fn bitwise_bin_op_helper<F>(
     left: &Buffer,
-    left_offset: usize,
+    left_offset_in_bits: usize,
     right: &Buffer,
-    right_offset: usize,
-    len: usize,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
     op: F,
 ) -> Buffer
 where
-    F: Fn(u8, u8) -> u8,
+    F: Fn(u64, u64) -> u64,
 {
-    let mut result = MutableBuffer::new(len).with_bitset(len, false);
+    // reserve capacity and set length so we can get a typed view of u64 chunks
+    let mut result =
+        MutableBuffer::new(ceil(len_in_bits, 8)).with_bitset(len_in_bits / 64 * 8, false);
 
-    result
-        .data_mut()
-        .iter_mut()
-        .zip(
-            left.data()[left_offset..]
-                .iter()
-                .zip(right.data()[right_offset..].iter()),
-        )
+    let left_chunks = left.bit_chunks(left_offset_in_bits, len_in_bits);
+    let right_chunks = right.bit_chunks(right_offset_in_bits, len_in_bits);
+    let result_chunks = result.typed_data_mut::<u64>().iter_mut();
+
+    result_chunks
+        .zip(left_chunks.iter().zip(right_chunks.iter()))
         .for_each(|(res, (left, right))| {
-            *res = op(*left, *right);
+            *res = op(left, right);
         });
 
-    result.freeze()
+    let remainder_bytes = ceil(left_chunks.remainder_len(), 8);
+    let rem = op(left_chunks.remainder_bits(), right_chunks.remainder_bits());
+    // we are counting its starting from the least significant bit, to to_le_bytes should be correct
+    let rem = &rem.to_le_bytes()[0..remainder_bytes];
+    result.extend_from_slice(rem);
+
+    result.into()
 }
 
+/// Apply a bitwise operation `op` to one input and return the result as a Buffer.
+/// The input is treated as a bitmap, meaning that offset and length are specified in number of bits.
 fn bitwise_unary_op_helper<F>(
     left: &Buffer,
-    left_offset: usize,
-    len: usize,
+    offset_in_bits: usize,
+    len_in_bits: usize,
     op: F,
 ) -> Buffer
 where
-    F: Fn(u8) -> u8,
+    F: Fn(u64) -> u64,
 {
-    let mut result = MutableBuffer::new(len).with_bitset(len, false);
+    // reserve capacity and set length so we can get a typed view of u64 chunks
+    let mut result =
+        MutableBuffer::new(ceil(len_in_bits, 8)).with_bitset(len_in_bits / 64 * 8, false);
 
-    result
-        .data_mut()
-        .iter_mut()
-        .zip(left.data()[left_offset..].iter())
+    let left_chunks = left.bit_chunks(offset_in_bits, len_in_bits);
+    let result_chunks = result.typed_data_mut::<u64>().iter_mut();
+
+    result_chunks
+        .zip(left_chunks.iter())
         .for_each(|(res, left)| {
-            *res = op(*left);
+            *res = op(left);
         });
 
-    result.freeze()
+    let remainder_bytes = ceil(left_chunks.remainder_len(), 8);
+    let rem = op(left_chunks.remainder_bits());
+    // we are counting its starting from the least significant bit, to to_le_bytes should be correct
+    let rem = &rem.to_le_bytes()[0..remainder_bytes];
+    result.extend_from_slice(rem);
+
+    result.into()
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(super) fn buffer_bin_and(
     left: &Buffer,
-    left_offset: usize,
+    left_offset_in_bits: usize,
     right: &Buffer,
-    right_offset: usize,
-    len: usize,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
 ) -> Buffer {
-    // SIMD implementation if available
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+    if left_offset_in_bits % 8 == 0
+        && right_offset_in_bits % 8 == 0
+        && len_in_bits % 8 == 0
     {
-        return bitwise_bin_op_simd_helper(
+        let len = len_in_bits / 8;
+        let left_offset = left_offset_in_bits / 8;
+        let right_offset = right_offset_in_bits / 8;
+
+        let mut result = MutableBuffer::new(len).with_bitset(len, false);
+
+        let mut left_chunks =
+            left.as_slice()[left_offset..].chunks_exact(AVX512_U8X64_LANES);
+        let mut right_chunks =
+            right.as_slice()[right_offset..].chunks_exact(AVX512_U8X64_LANES);
+        let mut result_chunks =
+            result.as_slice_mut().chunks_exact_mut(AVX512_U8X64_LANES);
+
+        result_chunks
+            .borrow_mut()
+            .zip(left_chunks.borrow_mut().zip(right_chunks.borrow_mut()))
+            .for_each(|(res, (left, right))| unsafe {
+                avx512_bin_and(left, right, res);
+            });
+
+        result_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(
+                left_chunks
+                    .remainder()
+                    .iter()
+                    .zip(right_chunks.remainder().iter()),
+            )
+            .for_each(|(res, (left, right))| {
+                *res = *left & *right;
+            });
+
+        result.into()
+    } else {
+        bitwise_bin_op_helper(
             &left,
-            left_offset,
-            &right,
-            right_offset,
-            len,
-            |a, b| a & b,
-            |a, b| a & b,
-        );
-    }
-    // Default implementation
-    #[allow(unreachable_code)]
-    {
-        return bitwise_bin_op_helper(
-            &left,
-            left_offset,
+            left_offset_in_bits,
             right,
-            right_offset,
-            len,
+            right_offset_in_bits,
+            len_in_bits,
             |a, b| a & b,
-        );
+        )
     }
 }
 
+#[cfg(all(feature = "simd", not(feature = "avx512")))]
+pub(super) fn buffer_bin_and(
+    left: &Buffer,
+    left_offset_in_bits: usize,
+    right: &Buffer,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
+) -> Buffer {
+    if left_offset_in_bits % 8 == 0
+        && right_offset_in_bits % 8 == 0
+        && len_in_bits % 8 == 0
+    {
+        bitwise_bin_op_simd_helper(
+            &left,
+            left_offset_in_bits / 8,
+            &right,
+            right_offset_in_bits / 8,
+            len_in_bits / 8,
+            |a, b| a & b,
+            |a, b| a & b,
+        )
+    } else {
+        bitwise_bin_op_helper(
+            &left,
+            left_offset_in_bits,
+            right,
+            right_offset_in_bits,
+            len_in_bits,
+            |a, b| a & b,
+        )
+    }
+}
+
+// Note: do not target specific features like x86 without considering
+// other targets like wasm32, as those would fail to build
+#[cfg(all(not(any(feature = "simd", feature = "avx512"))))]
+pub(super) fn buffer_bin_and(
+    left: &Buffer,
+    left_offset_in_bits: usize,
+    right: &Buffer,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
+) -> Buffer {
+    bitwise_bin_op_helper(
+        &left,
+        left_offset_in_bits,
+        right,
+        right_offset_in_bits,
+        len_in_bits,
+        |a, b| a & b,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(super) fn buffer_bin_or(
     left: &Buffer,
-    left_offset: usize,
+    left_offset_in_bits: usize,
     right: &Buffer,
-    right_offset: usize,
-    len: usize,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
 ) -> Buffer {
-    // SIMD implementation if available
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+    if left_offset_in_bits % 8 == 0
+        && right_offset_in_bits % 8 == 0
+        && len_in_bits % 8 == 0
     {
-        return bitwise_bin_op_simd_helper(
+        let len = len_in_bits / 8;
+        let left_offset = left_offset_in_bits / 8;
+        let right_offset = right_offset_in_bits / 8;
+
+        let mut result = MutableBuffer::new(len).with_bitset(len, false);
+
+        let mut left_chunks =
+            left.as_slice()[left_offset..].chunks_exact(AVX512_U8X64_LANES);
+        let mut right_chunks =
+            right.as_slice()[right_offset..].chunks_exact(AVX512_U8X64_LANES);
+        let mut result_chunks =
+            result.as_slice_mut().chunks_exact_mut(AVX512_U8X64_LANES);
+
+        result_chunks
+            .borrow_mut()
+            .zip(left_chunks.borrow_mut().zip(right_chunks.borrow_mut()))
+            .for_each(|(res, (left, right))| unsafe {
+                avx512_bin_or(left, right, res);
+            });
+
+        result_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(
+                left_chunks
+                    .remainder()
+                    .iter()
+                    .zip(right_chunks.remainder().iter()),
+            )
+            .for_each(|(res, (left, right))| {
+                *res = *left | *right;
+            });
+
+        result.into()
+    } else {
+        bitwise_bin_op_helper(
             &left,
-            left_offset,
-            &right,
-            right_offset,
-            len,
-            |a, b| a | b,
-            |a, b| a | b,
-        );
-    }
-    // Default implementation
-    #[allow(unreachable_code)]
-    {
-        return bitwise_bin_op_helper(
-            &left,
-            left_offset,
+            left_offset_in_bits,
             right,
-            right_offset,
-            len,
+            right_offset_in_bits,
+            len_in_bits,
             |a, b| a | b,
-        );
+        )
     }
 }
 
-pub(super) fn buffer_unary_not(left: &Buffer, left_offset: usize, len: usize) -> Buffer {
-    // SIMD implementation if available
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "simd"))]
+#[cfg(all(feature = "simd", not(feature = "avx512")))]
+pub(super) fn buffer_bin_or(
+    left: &Buffer,
+    left_offset_in_bits: usize,
+    right: &Buffer,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
+) -> Buffer {
+    if left_offset_in_bits % 8 == 0
+        && right_offset_in_bits % 8 == 0
+        && len_in_bits % 8 == 0
     {
-        return bitwise_unary_op_simd_helper(&left, left_offset, len, |a| !a, |a| !a);
+        bitwise_bin_op_simd_helper(
+            &left,
+            left_offset_in_bits / 8,
+            &right,
+            right_offset_in_bits / 8,
+            len_in_bits / 8,
+            |a, b| a | b,
+            |a, b| a | b,
+        )
+    } else {
+        bitwise_bin_op_helper(
+            &left,
+            left_offset_in_bits,
+            right,
+            right_offset_in_bits,
+            len_in_bits,
+            |a, b| a | b,
+        )
+    }
+}
+
+#[cfg(all(not(any(feature = "simd", feature = "avx512"))))]
+pub(super) fn buffer_bin_or(
+    left: &Buffer,
+    left_offset_in_bits: usize,
+    right: &Buffer,
+    right_offset_in_bits: usize,
+    len_in_bits: usize,
+) -> Buffer {
+    bitwise_bin_op_helper(
+        &left,
+        left_offset_in_bits,
+        right,
+        right_offset_in_bits,
+        len_in_bits,
+        |a, b| a | b,
+    )
+}
+
+pub(super) fn buffer_unary_not(
+    left: &Buffer,
+    offset_in_bits: usize,
+    len_in_bits: usize,
+) -> Buffer {
+    // SIMD implementation if available and byte-aligned
+    #[cfg(simd)]
+    if offset_in_bits % 8 == 0 && len_in_bits % 8 == 0 {
+        return bitwise_unary_op_simd_helper(
+            &left,
+            offset_in_bits / 8,
+            len_in_bits / 8,
+            |a| !a,
+            |a| !a,
+        );
     }
     // Default implementation
     #[allow(unreachable_code)]
     {
-        return bitwise_unary_op_helper(&left, left_offset, len, |a| !a);
+        bitwise_unary_op_helper(&left, offset_in_bits, len_in_bits, |a| !a)
     }
 }
 
@@ -510,7 +673,8 @@ impl<'a, 'b> BitAnd<&'b Buffer> for &'a Buffer {
             ));
         }
 
-        Ok(buffer_bin_and(&self, 0, &rhs, 0, self.len()))
+        let len_in_bits = self.len() * 8;
+        Ok(buffer_bin_and(&self, 0, &rhs, 0, len_in_bits))
     }
 }
 
@@ -524,7 +688,9 @@ impl<'a, 'b> BitOr<&'b Buffer> for &'a Buffer {
             ));
         }
 
-        Ok(buffer_bin_or(&self, 0, &rhs, 0, self.len()))
+        let len_in_bits = self.len() * 8;
+
+        Ok(buffer_bin_or(&self, 0, &rhs, 0, len_in_bits))
     }
 }
 
@@ -532,32 +698,83 @@ impl Not for &Buffer {
     type Output = Buffer;
 
     fn not(self) -> Buffer {
-        buffer_unary_not(&self, 0, self.len())
+        let len_in_bits = self.len() * 8;
+        buffer_unary_not(&self, 0, len_in_bits)
     }
 }
 
 unsafe impl Sync for Buffer {}
 unsafe impl Send for Buffer {}
 
-/// Similar to `Buffer`, but is growable and can be mutated. A mutable buffer can be
-/// converted into a immutable buffer via the `freeze` method.
+impl From<MutableBuffer> for Buffer {
+    #[inline]
+    fn from(buffer: MutableBuffer) -> Self {
+        buffer.into_buffer()
+    }
+}
+
+/// A [`MutableBuffer`] is Arrow's interface to build a [`Buffer`] out of items or slices of items.
+/// [`Buffer`]s created from [`MutableBuffer`] (via `into`) are guaranteed to have its pointer aligned
+/// along cache lines and in multiple of 64 bytes.
+/// Use [MutableBuffer::push] to insert an item, [MutableBuffer::extend_from_slice]
+/// to insert many items, and `into` to convert it to [`Buffer`].
+/// # Example
+/// ```
+/// # use arrow::buffer::{Buffer, MutableBuffer};
+/// let mut buffer = MutableBuffer::new(0);
+/// buffer.push(256u32);
+/// buffer.extend_from_slice(&[1u32]);
+/// let buffer: Buffer = buffer.into();
+/// assert_eq!(buffer.as_slice(), &[0u8, 1, 0, 0, 1, 0, 0, 0])
+/// ```
 #[derive(Debug)]
 pub struct MutableBuffer {
-    data: *mut u8,
+    // dangling iff capacity = 0
+    data: NonNull<u8>,
+    // invariant: len <= capacity
     len: usize,
     capacity: usize,
 }
 
 impl MutableBuffer {
-    /// Allocate a new mutable buffer with initial capacity to be `capacity`.
+    /// Allocate a new [MutableBuffer] with initial capacity to be at least `capacity`.
+    #[inline]
     pub fn new(capacity: usize) -> Self {
-        let new_capacity = bit_util::round_upto_multiple_of_64(capacity);
-        let ptr = memory::allocate_aligned(new_capacity);
+        let capacity = bit_util::round_upto_multiple_of_64(capacity);
+        let ptr = memory::allocate_aligned(capacity);
         Self {
             data: ptr,
             len: 0,
+            capacity,
+        }
+    }
+
+    /// Allocates a new [MutableBuffer] with `len` and capacity to be at least `len` where
+    /// all bytes are guaranteed to be `0u8`.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::{Buffer, MutableBuffer};
+    /// let mut buffer = MutableBuffer::from_len_zeroed(127);
+    /// assert_eq!(buffer.len(), 127);
+    /// assert!(buffer.capacity() >= 127);
+    /// let data = buffer.as_slice_mut();
+    /// assert_eq!(data[126], 0u8);
+    /// ```
+    pub fn from_len_zeroed(len: usize) -> Self {
+        let new_capacity = bit_util::round_upto_multiple_of_64(len);
+        let ptr = memory::allocate_aligned_zeroed(new_capacity);
+        Self {
+            data: ptr,
+            len,
             capacity: new_capacity,
         }
+    }
+
+    /// creates a new [MutableBuffer] with capacity and length capable of holding `len` bits.
+    /// This is useful to create a buffer for packed bitmaps.
+    pub fn new_null(len: usize) -> Self {
+        let num_bytes = bit_util::ceil(len, 8);
+        MutableBuffer::from_len_zeroed(num_bytes)
     }
 
     /// Set the bits in the range of `[0, end)` to 0 (if `val` is false), or 1 (if `val`
@@ -570,7 +787,7 @@ impl MutableBuffer {
         assert!(end <= self.capacity);
         let v = if val { 255 } else { 0 };
         unsafe {
-            std::ptr::write_bytes(self.data, v, end);
+            std::ptr::write_bytes(self.data.as_ptr(), v, end);
             self.len = end;
         }
         self
@@ -584,61 +801,79 @@ impl MutableBuffer {
     pub fn set_null_bits(&mut self, start: usize, count: usize) {
         assert!(start + count <= self.capacity);
         unsafe {
-            std::ptr::write_bytes(self.data.add(start), 0, count);
+            std::ptr::write_bytes(self.data.as_ptr().add(start), 0, count);
         }
     }
 
-    /// Ensures that this buffer has at least `capacity` slots in this buffer. This will
-    /// also ensure the new capacity will be a multiple of 64 bytes.
-    ///
-    /// Returns the new capacity for this buffer.
-    pub fn reserve(&mut self, capacity: usize) -> Result<usize> {
-        if capacity > self.capacity {
-            let new_capacity = bit_util::round_upto_multiple_of_64(capacity);
-            let new_capacity = cmp::max(new_capacity, self.capacity * 2);
-            let new_data =
-                unsafe { memory::reallocate(self.data, self.capacity, new_capacity) };
-            self.data = new_data as *mut u8;
+    /// Ensures that this buffer has at least `self.len + additional` bytes. This re-allocates iff
+    /// `self.len + additional > capacity`.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::{Buffer, MutableBuffer};
+    /// let mut buffer = MutableBuffer::new(0);
+    /// buffer.reserve(253); // allocates for the first time
+    /// (0..253u8).for_each(|i| buffer.push(i)); // no reallocation
+    /// let buffer: Buffer = buffer.into();
+    /// assert_eq!(buffer.len(), 253);
+    /// ```
+    // For performance reasons, this must be inlined so that the `if` is executed inside the caller, and not as an extra call that just
+    // exits.
+    #[inline(always)]
+    pub fn reserve(&mut self, additional: usize) {
+        let required_cap = self.len + additional;
+        if required_cap > self.capacity {
+            // JUSTIFICATION
+            //  Benefit
+            //      necessity
+            //  Soundness
+            //      `self.data` is valid for `self.capacity`.
+            let (ptr, new_capacity) =
+                unsafe { reallocate(self.data, self.capacity, required_cap) };
+            self.data = ptr;
             self.capacity = new_capacity;
         }
-        Ok(self.capacity)
     }
 
-    /// Resizes the buffer so that the `len` will equal to the `new_len`.
-    ///
-    /// If `new_len` is greater than `len`, the buffer's length is simply adjusted to be
-    /// the former, optionally extending the capacity. The data between `len` and
-    /// `new_len` will be zeroed out.
-    ///
-    /// If `new_len` is less than `len`, the buffer will be truncated.
-    pub fn resize(&mut self, new_len: usize) -> Result<()> {
+    /// Resizes the buffer, either truncating its contents (with no change in capacity), or
+    /// growing it (potentially reallocating it) and writing `value` in the newly available bytes.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::{Buffer, MutableBuffer};
+    /// let mut buffer = MutableBuffer::new(0);
+    /// buffer.resize(253, 2); // allocates for the first time
+    /// assert_eq!(buffer.as_slice()[252], 2u8);
+    /// ```
+    // For performance reasons, this must be inlined so that the `if` is executed inside the caller, and not as an extra call that just
+    // exits.
+    #[inline(always)]
+    pub fn resize(&mut self, new_len: usize, value: u8) {
         if new_len > self.len {
-            self.reserve(new_len)?;
-        } else {
-            let new_capacity = bit_util::round_upto_multiple_of_64(new_len);
-            if new_capacity < self.capacity {
-                let new_data =
-                    unsafe { memory::reallocate(self.data, self.capacity, new_capacity) };
-                self.data = new_data as *mut u8;
-                self.capacity = new_capacity;
-            }
+            let diff = new_len - self.len;
+            self.reserve(diff);
+            // write the value
+            unsafe { self.data.as_ptr().add(self.len).write_bytes(value, diff) };
         }
+        // this truncates the buffer when new_len < self.len
         self.len = new_len;
-        Ok(())
     }
 
     /// Returns whether this buffer is empty or not.
-    pub fn is_empty(&self) -> bool {
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Returns the length (the number of bytes written) in this buffer.
-    pub fn len(&self) -> usize {
+    /// The invariant `buffer.len() <= buffer.capacity()` is always upheld.
+    #[inline]
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Returns the total capacity in this buffer.
-    pub fn capacity(&self) -> usize {
+    /// The invariant `buffer.len() <= buffer.capacity()` is always upheld.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
         self.capacity
     }
 
@@ -648,44 +883,42 @@ impl MutableBuffer {
     }
 
     /// Returns the data stored in this buffer as a slice.
-    pub fn data(&self) -> &[u8] {
-        if self.data.is_null() {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.raw_data(), self.len()) }
-        }
+    pub fn as_slice(&self) -> &[u8] {
+        self
     }
 
     /// Returns the data stored in this buffer as a mutable slice.
-    pub fn data_mut(&mut self) -> &mut [u8] {
-        if self.data.is_null() {
-            &mut []
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(self.raw_data_mut(), self.len()) }
-        }
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        self
     }
 
-    /// Returns a raw pointer for this buffer.
-    ///
-    /// Note that this should be used cautiously, and the returned pointer should not be
-    /// stored anywhere, to avoid dangling pointers.
+    /// Returns a raw pointer to this buffer's internal memory
+    /// This pointer is guaranteed to be aligned along cache-lines.
     #[inline]
-    pub fn raw_data(&self) -> *const u8 {
-        self.data
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
     }
 
+    /// Returns a mutable raw pointer to this buffer's internal memory
+    /// This pointer is guaranteed to be aligned along cache-lines.
     #[inline]
-    pub fn raw_data_mut(&mut self) -> *mut u8 {
-        self.data
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_ptr()
     }
 
+    #[deprecated(
+        since = "2.0.0",
+        note = "This method is deprecated in favour of `into` from the trait `Into`."
+    )]
     /// Freezes this buffer and return an immutable version of it.
     pub fn freeze(self) -> Buffer {
-        let buffer_data = BufferData {
-            ptr: self.data,
-            len: self.len,
-            capacity: self.capacity,
-            owned: true,
+        self.into_buffer()
+    }
+
+    #[inline]
+    fn into_buffer(self) -> Buffer {
+        let buffer_data = unsafe {
+            Bytes::new(self.data, self.len, Deallocation::Native(self.capacity))
         };
         std::mem::forget(self);
         Buffer {
@@ -694,41 +927,248 @@ impl MutableBuffer {
         }
     }
 
-    /// View buffer as typed slice.
-    pub fn typed_data_mut<T: ArrowNativeType + num::Num>(&mut self) -> &mut [T] {
-        assert_eq!(self.len() % mem::size_of::<T>(), 0);
-        assert!(memory::is_ptr_aligned::<T>(self.raw_data() as *const T));
+    /// View this buffer asa slice of a specific type.
+    /// # Safety
+    /// This function must only be used when this buffer was extended with items of type `T`.
+    /// Failure to do so results in undefined behavior.
+    pub fn typed_data_mut<T: ArrowNativeType>(&mut self) -> &mut [T] {
         unsafe {
-            from_raw_parts_mut(
-                self.raw_data() as *mut T,
-                self.len() / mem::size_of::<T>(),
-            )
+            let (prefix, offsets, suffix) = self.as_slice_mut().align_to_mut::<T>();
+            assert!(prefix.is_empty() && suffix.is_empty());
+            offsets
         }
     }
 
-    /// Writes a byte slice to the underlying buffer and updates the `len`, i.e. the
-    /// number array elements in the buffer.  Also, converts the `io::Result`
-    /// required by the `Write` trait to the Arrow `Result` type.
-    pub fn write_bytes(&mut self, bytes: &[u8], len_added: usize) -> Result<()> {
-        let write_result = self.write(bytes);
-        // `io::Result` has many options one of which we use, so pattern matching is
-        // overkill here
-        if write_result.is_err() {
-            Err(ArrowError::IoError(
-                "Could not write to Buffer, not big enough".to_string(),
-            ))
-        } else {
-            self.len += len_added;
-            Ok(())
+    /// Extends this buffer from a slice of items that can be represented in bytes, increasing its capacity if needed.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::MutableBuffer;
+    /// let mut buffer = MutableBuffer::new(0);
+    /// buffer.extend_from_slice(&[2u32, 0]);
+    /// assert_eq!(buffer.len(), 8) // u32 has 4 bytes
+    /// ```
+    pub fn extend_from_slice<T: ToByteSlice>(&mut self, items: &[T]) {
+        let len = items.len();
+        let additional = len * std::mem::size_of::<T>();
+        self.reserve(additional);
+        unsafe {
+            let dst = self.data.as_ptr().add(self.len);
+            let src = items.as_ptr() as *const u8;
+            std::ptr::copy_nonoverlapping(src, dst, additional)
         }
+        self.len += additional;
+    }
+
+    /// Extends the buffer with a new item, increasing its capacity if needed.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::MutableBuffer;
+    /// let mut buffer = MutableBuffer::new(0);
+    /// buffer.push(256u32);
+    /// assert_eq!(buffer.len(), 4) // u32 has 4 bytes
+    /// ```
+    #[inline]
+    pub fn push<T: ToByteSlice>(&mut self, item: T) {
+        let additional = std::mem::size_of::<T>();
+        self.reserve(additional);
+        unsafe {
+            let dst = self.data.as_ptr().add(self.len) as *mut T;
+            std::ptr::write(dst, item);
+        }
+        self.len += additional;
+    }
+
+    /// Extends the buffer with a new item, without checking for sufficient capacity
+    /// Safety
+    /// Caller must ensure that the capacity()-len()>=size_of<T>()
+    #[inline]
+    unsafe fn push_unchecked<T: ToByteSlice>(&mut self, item: T) {
+        let additional = std::mem::size_of::<T>();
+        let dst = self.data.as_ptr().add(self.len) as *mut T;
+        std::ptr::write(dst, item);
+        self.len += additional;
+    }
+
+    /// Extends the buffer by `additional` bytes equal to `0u8`, incrementing its capacity if needed.
+    #[inline]
+    pub fn extend_zeros(&mut self, additional: usize) {
+        self.resize(self.len + additional, 0);
+    }
+}
+
+/// # Safety
+/// `ptr` must be allocated for `old_capacity`.
+#[inline]
+unsafe fn reallocate(
+    ptr: NonNull<u8>,
+    old_capacity: usize,
+    new_capacity: usize,
+) -> (NonNull<u8>, usize) {
+    let new_capacity = bit_util::round_upto_multiple_of_64(new_capacity);
+    let new_capacity = std::cmp::max(new_capacity, old_capacity * 2);
+    let ptr = memory::reallocate(ptr, old_capacity, new_capacity);
+    (ptr, new_capacity)
+}
+
+impl<A: ArrowNativeType> Extend<A> for MutableBuffer {
+    #[inline]
+    fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T) {
+        let iterator = iter.into_iter();
+        self.extend_from_iter(iterator)
+    }
+}
+
+impl MutableBuffer {
+    #[inline]
+    fn extend_from_iter<T: ArrowNativeType, I: Iterator<Item = T>>(
+        &mut self,
+        mut iterator: I,
+    ) {
+        let size = std::mem::size_of::<T>();
+        let (lower, _) = iterator.size_hint();
+        let additional = lower * size;
+        self.reserve(additional);
+
+        // this is necessary because of https://github.com/rust-lang/rust/issues/32155
+        let mut len = SetLenOnDrop::new(&mut self.len);
+        let mut dst = unsafe { self.data.as_ptr().add(len.local_len) as *mut T };
+        let capacity = self.capacity;
+
+        while len.local_len + size <= capacity {
+            if let Some(item) = iterator.next() {
+                unsafe {
+                    std::ptr::write(dst, item);
+                    dst = dst.add(1);
+                }
+                len.local_len += size;
+            } else {
+                break;
+            }
+        }
+        drop(len);
+
+        iterator.for_each(|item| self.push(item));
+    }
+}
+
+impl Buffer {
+    /// Creates a [`Buffer`] from an [`Iterator`] with a trusted (upper) length.
+    /// Prefer this to `collect` whenever possible, as it is faster ~60% faster.
+    /// # Example
+    /// ```
+    /// # use arrow::buffer::Buffer;
+    /// let v = vec![1u32];
+    /// let iter = v.iter().map(|x| x * 2);
+    /// let buffer = unsafe { Buffer::from_trusted_len_iter(iter) };
+    /// assert_eq!(buffer.len(), 4) // u32 has 4 bytes
+    /// ```
+    /// # Safety
+    /// This method assumes that the iterator's size is correct and is undefined behavior
+    /// to use it on an iterator that reports an incorrect length.
+    // This implementation is required for two reasons:
+    // 1. there is no trait `TrustedLen` in stable rust and therefore
+    //    we can't specialize `extend` for `TrustedLen` like `Vec` does.
+    // 2. `from_trusted_len_iter` is faster.
+    pub unsafe fn from_trusted_len_iter<T: ArrowNativeType, I: Iterator<Item = T>>(
+        iterator: I,
+    ) -> Self {
+        let (_, upper) = iterator.size_hint();
+        let upper = upper.expect("from_trusted_len_iter requires an upper limit");
+        let len = upper * std::mem::size_of::<T>();
+
+        let mut buffer = MutableBuffer::new(len);
+
+        let mut dst = buffer.data.as_ptr() as *mut T;
+        for item in iterator {
+            // note how there is no reserve here (compared with `extend_from_iter`)
+            std::ptr::write(dst, item);
+            dst = dst.add(1);
+        }
+        assert_eq!(
+            dst.offset_from(buffer.data.as_ptr() as *mut T) as usize,
+            upper,
+            "Trusted iterator length was not accurately reported"
+        );
+        buffer.len = len;
+        buffer.into()
+    }
+
+    /// Creates a [`Buffer`] from an [`Iterator`] with a trusted (upper) length or errors
+    /// if any of the items of the iterator is an error.
+    /// Prefer this to `collect` whenever possible, as it is faster ~60% faster.
+    /// # Safety
+    /// This method assumes that the iterator's size is correct and is undefined behavior
+    /// to use it on an iterator that reports an incorrect length.
+    pub unsafe fn try_from_trusted_len_iter<
+        E,
+        T: ArrowNativeType,
+        I: Iterator<Item = std::result::Result<T, E>>,
+    >(
+        iterator: I,
+    ) -> std::result::Result<Self, E> {
+        let (_, upper) = iterator.size_hint();
+        let upper = upper.expect("try_from_trusted_len_iter requires an upper limit");
+        let len = upper * std::mem::size_of::<T>();
+
+        let mut buffer = MutableBuffer::new(len);
+
+        let mut dst = buffer.data.as_ptr() as *mut T;
+        for item in iterator {
+            // note how there is no reserve here (compared with `extend_from_iter`)
+            std::ptr::write(dst, item?);
+            dst = dst.add(1);
+        }
+        assert_eq!(
+            dst.offset_from(buffer.data.as_ptr() as *mut T) as usize,
+            upper,
+            "Trusted iterator length was not accurately reported"
+        );
+        buffer.len = len;
+        Ok(buffer.into())
+    }
+}
+
+impl<T: ArrowNativeType> FromIterator<T> for Buffer {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut iterator = iter.into_iter();
+        let size = std::mem::size_of::<T>();
+
+        // first iteration, which will likely reserve sufficient space for the buffer.
+        let mut buffer = match iterator.next() {
+            None => MutableBuffer::new(0),
+            Some(element) => {
+                let (lower, _) = iterator.size_hint();
+                let mut buffer = MutableBuffer::new(lower.saturating_add(1) * size);
+                unsafe {
+                    std::ptr::write(buffer.as_mut_ptr() as *mut T, element);
+                    buffer.len = size;
+                }
+                buffer
+            }
+        };
+
+        buffer.extend_from_iter(iterator);
+        buffer.into()
+    }
+}
+
+impl std::ops::Deref for MutableBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for MutableBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
     }
 }
 
 impl Drop for MutableBuffer {
     fn drop(&mut self) {
-        if !self.data.is_null() {
-            unsafe { memory::free_aligned(self.data, self.capacity) };
-        }
+        unsafe { memory::free_aligned(self.data, self.capacity) };
     }
 }
 
@@ -740,44 +1180,100 @@ impl PartialEq for MutableBuffer {
         if self.capacity != other.capacity {
             return false;
         }
-        unsafe { memory::memcmp(self.data, other.data, self.len) == 0 }
-    }
-}
-
-impl Write for MutableBuffer {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        let remaining_capacity = self.capacity - self.len;
-        if buf.len() > remaining_capacity {
-            return Err(IoError::new(ErrorKind::Other, "Buffer not big enough"));
-        }
-        unsafe {
-            memory::memcpy(self.data.add(self.len), buf.as_ptr(), buf.len());
-            self.len += buf.len();
-            Ok(buf.len())
-        }
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
+        self.as_slice() == other.as_slice()
     }
 }
 
 unsafe impl Sync for MutableBuffer {}
 unsafe impl Send for MutableBuffer {}
 
+struct SetLenOnDrop<'a> {
+    len: &'a mut usize,
+    local_len: usize,
+}
+
+impl<'a> SetLenOnDrop<'a> {
+    #[inline]
+    fn new(len: &'a mut usize) -> Self {
+        SetLenOnDrop {
+            local_len: *len,
+            len,
+        }
+    }
+}
+
+impl Drop for SetLenOnDrop<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        *self.len = self.local_len;
+    }
+}
+
+/// Creating a `MutableBuffer` instance by setting bits according to the boolean values
+impl std::iter::FromIterator<bool> for MutableBuffer {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = bool>,
+    {
+        let mut iterator = iter.into_iter();
+        let mut result = {
+            let byte_capacity: usize = iterator.size_hint().0.saturating_add(7) / 8;
+            MutableBuffer::new(byte_capacity)
+        };
+
+        loop {
+            let mut exhausted = false;
+            let mut byte_accum: u8 = 0;
+            let mut mask: u8 = 1;
+
+            //collect (up to) 8 bits into a byte
+            while mask != 0 {
+                if let Some(value) = iterator.next() {
+                    byte_accum |= match value {
+                        true => mask,
+                        false => 0,
+                    };
+                    mask <<= 1;
+                } else {
+                    exhausted = true;
+                    break;
+                }
+            }
+
+            // break if the iterator was exhausted before it provided a bool for this byte
+            if exhausted && mask == 1 {
+                break;
+            }
+
+            //ensure we have capacity to write the byte
+            if result.len() == result.capacity() {
+                //no capacity for new byte, allocate 1 byte more (plus however many more the iterator advertises)
+                let additional_byte_capacity = 1usize.saturating_add(
+                    iterator.size_hint().0.saturating_add(7) / 8, //convert bit count to byte count, rounding up
+                );
+                result.reserve(additional_byte_capacity)
+            }
+
+            // Soundness: capacity was allocated above
+            unsafe { result.push_unchecked(byte_accum) };
+            if exhausted {
+                break;
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::util::bit_util;
-    use std::ptr::null_mut;
     use std::thread;
 
     use super::*;
-    use crate::datatypes::ToByteSlice;
 
     #[test]
     fn test_buffer_data_equality() {
         let buf1 = Buffer::from(&[0, 1, 2, 3, 4]);
-        let mut buf2 = Buffer::from(&[0, 1, 2, 3, 4]);
+        let buf2 = Buffer::from(&[0, 1, 2, 3, 4]);
         assert_eq!(buf1, buf2);
 
         // slice with same offset should still preserve equality
@@ -786,45 +1282,46 @@ mod tests {
         let buf4 = buf2.slice(2);
         assert_eq!(buf3, buf4);
 
+        // Different capacities should still preserve equality
+        let mut buf2 = MutableBuffer::new(65);
+        buf2.extend_from_slice(&[0u8, 1, 2, 3, 4]);
+
+        let buf2 = buf2.into();
+        assert_eq!(buf1, buf2);
+
         // unequal because of different elements
-        buf2 = Buffer::from(&[0, 0, 2, 3, 4]);
+        let buf2 = Buffer::from(&[0, 0, 2, 3, 4]);
         assert_ne!(buf1, buf2);
 
         // unequal because of different length
-        buf2 = Buffer::from(&[0, 1, 2, 3]);
+        let buf2 = Buffer::from(&[0, 1, 2, 3]);
         assert_ne!(buf1, buf2);
     }
 
     #[test]
     fn test_from_raw_parts() {
-        let buf = unsafe { Buffer::from_raw_parts(null_mut(), 0, 0) };
-        assert_eq!(0, buf.len());
-        assert_eq!(0, buf.data().len());
-        assert_eq!(0, buf.capacity());
-        assert!(buf.raw_data().is_null());
-
         let buf = Buffer::from(&[0, 1, 2, 3, 4]);
         assert_eq!(5, buf.len());
-        assert!(!buf.raw_data().is_null());
-        assert_eq!([0, 1, 2, 3, 4], buf.data());
+        assert!(!buf.as_ptr().is_null());
+        assert_eq!([0, 1, 2, 3, 4], buf.as_slice());
     }
 
     #[test]
     fn test_from_vec() {
         let buf = Buffer::from(&[0, 1, 2, 3, 4]);
         assert_eq!(5, buf.len());
-        assert!(!buf.raw_data().is_null());
-        assert_eq!([0, 1, 2, 3, 4], buf.data());
+        assert!(!buf.as_ptr().is_null());
+        assert_eq!([0, 1, 2, 3, 4], buf.as_slice());
     }
 
     #[test]
     fn test_copy() {
         let buf = Buffer::from(&[0, 1, 2, 3, 4]);
-        let buf2 = buf.clone();
+        let buf2 = buf;
         assert_eq!(5, buf2.len());
         assert_eq!(64, buf2.capacity());
-        assert!(!buf2.raw_data().is_null());
-        assert_eq!([0, 1, 2, 3, 4], buf2.data());
+        assert!(!buf2.as_ptr().is_null());
+        assert_eq!([0, 1, 2, 3, 4], buf2.as_slice());
     }
 
     #[test]
@@ -832,21 +1329,21 @@ mod tests {
         let buf = Buffer::from(&[2, 4, 6, 8, 10]);
         let buf2 = buf.slice(2);
 
-        assert_eq!([6, 8, 10], buf2.data());
+        assert_eq!([6, 8, 10], buf2.as_slice());
         assert_eq!(3, buf2.len());
-        assert_eq!(unsafe { buf.raw_data().offset(2) }, buf2.raw_data());
+        assert_eq!(unsafe { buf.as_ptr().offset(2) }, buf2.as_ptr());
 
         let buf3 = buf2.slice(1);
-        assert_eq!([8, 10], buf3.data());
+        assert_eq!([8, 10], buf3.as_slice());
         assert_eq!(2, buf3.len());
-        assert_eq!(unsafe { buf.raw_data().offset(3) }, buf3.raw_data());
+        assert_eq!(unsafe { buf.as_ptr().offset(3) }, buf3.as_ptr());
 
         let buf4 = buf.slice(5);
         let empty_slice: [u8; 0] = [];
-        assert_eq!(empty_slice, buf4.data());
+        assert_eq!(empty_slice, buf4.as_slice());
         assert_eq!(0, buf4.len());
         assert!(buf4.is_empty());
-        assert_eq!(buf2.slice(2).data(), &[10]);
+        assert_eq!(buf2.slice(2).as_slice(), &[10]);
     }
 
     #[test]
@@ -861,25 +1358,87 @@ mod tests {
     #[test]
     fn test_with_bitset() {
         let mut_buf = MutableBuffer::new(64).with_bitset(64, false);
-        let buf = mut_buf.freeze();
-        assert_eq!(0, bit_util::count_set_bits(buf.data()));
+        let buf: Buffer = mut_buf.into();
+        assert_eq!(0, buf.count_set_bits());
 
         let mut_buf = MutableBuffer::new(64).with_bitset(64, true);
-        let buf = mut_buf.freeze();
-        assert_eq!(512, bit_util::count_set_bits(buf.data()));
+        let buf: Buffer = mut_buf.into();
+        assert_eq!(512, buf.count_set_bits());
     }
 
     #[test]
     fn test_set_null_bits() {
         let mut mut_buf = MutableBuffer::new(64).with_bitset(64, true);
         mut_buf.set_null_bits(0, 64);
-        let buf = mut_buf.freeze();
-        assert_eq!(0, bit_util::count_set_bits(buf.data()));
+        let buf: Buffer = mut_buf.into();
+        assert_eq!(0, buf.count_set_bits());
 
         let mut mut_buf = MutableBuffer::new(64).with_bitset(64, true);
         mut_buf.set_null_bits(32, 32);
-        let buf = mut_buf.freeze();
-        assert_eq!(256, bit_util::count_set_bits(buf.data()));
+        let buf: Buffer = mut_buf.into();
+        assert_eq!(256, buf.count_set_bits());
+    }
+
+    #[test]
+    fn test_from_iter_bool() {
+        let bits = [
+            false, true, false, false, true, true, false, false, //first byte
+            false, true, true, true, //second byte
+        ];
+        let buffer: Buffer = bits.iter().copied().collect();
+        assert_eq!([0b00110010, 0b00001110], buffer.as_slice()); //bits are set least-significant first, zero padded
+        assert_eq!(64, buffer.capacity()); //allocation rounded up to 64 bytes
+
+        let bits = [false, true, false, false, true, true, false, false];
+        let buffer: Buffer = bits.iter().copied().collect();
+        assert_eq!([0b00110010], buffer.as_slice());
+        assert_eq!(64, buffer.capacity());
+
+        let bits: [bool; 0] = [];
+        let buffer: Buffer = bits.iter().copied().collect();
+        assert_eq!(0, buffer.capacity());
+        assert_eq!(0, buffer.len());
+
+        let bits = [
+            false, true, false, false, true, true, false, false, //first byte
+            false, true, true, true, //second byte
+        ];
+        let hintless_iterator = bits.iter().filter(|_| true).copied();
+        assert_eq!(0, hintless_iterator.size_hint().0); //sanity check of the test input
+        let buffer: Buffer = hintless_iterator.collect();
+        assert_eq!([0b00110010, 0b00001110], buffer.as_slice()); //bits are set least-significant first, zero padded
+        assert_eq!(64, buffer.capacity()); //allocation rounded up to 64 bytes
+    }
+
+    #[test]
+    fn test_mut_from_iter_bool() {
+        let bits = [
+            false, true, false, false, true, true, false, false, //first byte
+            false, true, true, true, //second byte
+        ];
+        let buffer: MutableBuffer = bits.iter().copied().collect();
+        assert_eq!([0b00110010, 0b00001110], buffer.as_slice()); //bits are set least-significant first, zero padded
+        assert_eq!(64, buffer.capacity()); //allocation rounded up to 64 bytes
+
+        let bits = [false, true, false, false, true, true, false, false];
+        let buffer: MutableBuffer = bits.iter().copied().collect();
+        assert_eq!([0b00110010], buffer.as_slice());
+        assert_eq!(64, buffer.capacity());
+
+        let bits: [bool; 0] = [];
+        let buffer: MutableBuffer = bits.iter().copied().collect();
+        assert_eq!(0, buffer.as_slice().len());
+        assert_eq!(0, buffer.capacity());
+
+        let bits = [
+            false, true, false, false, true, true, false, false, //first byte
+            false, true, true, true, //second byte
+        ];
+        let hintless_iterator = bits.iter().filter(|_| true).copied();
+        assert_eq!(0, hintless_iterator.size_hint().0); //sanity check of the test input
+        let buffer: MutableBuffer = hintless_iterator.collect();
+        assert_eq!([0b00110010, 0b00001110], buffer.as_slice()); //bits are set least-significant first, zero padded
+        assert_eq!(64, buffer.capacity()); //allocation rounded up to 64 bytes
     }
 
     #[test]
@@ -919,31 +1478,44 @@ mod tests {
     }
 
     #[test]
-    fn test_mutable_write() {
+    fn test_mutable_extend_from_slice() {
         let mut buf = MutableBuffer::new(100);
-        buf.write("hello".as_bytes()).expect("Ok");
+        buf.extend_from_slice(b"hello");
         assert_eq!(5, buf.len());
-        assert_eq!("hello".as_bytes(), buf.data());
+        assert_eq!(b"hello", buf.as_slice());
 
-        buf.write(" world".as_bytes()).expect("Ok");
+        buf.extend_from_slice(b" world");
         assert_eq!(11, buf.len());
-        assert_eq!("hello world".as_bytes(), buf.data());
+        assert_eq!(b"hello world", buf.as_slice());
 
         buf.clear();
         assert_eq!(0, buf.len());
-        buf.write("hello arrow".as_bytes()).expect("Ok");
+        buf.extend_from_slice(b"hello arrow");
         assert_eq!(11, buf.len());
-        assert_eq!("hello arrow".as_bytes(), buf.data());
+        assert_eq!(b"hello arrow", buf.as_slice());
     }
 
     #[test]
-    #[should_panic(expected = "Buffer not big enough")]
-    fn test_mutable_write_overflow() {
-        let mut buf = MutableBuffer::new(1);
-        assert_eq!(64, buf.capacity());
-        for _ in 0..10 {
-            buf.write(&[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-        }
+    fn mutable_extend_from_iter() {
+        let mut buf = MutableBuffer::new(0);
+        buf.extend(vec![1u32, 2]);
+        assert_eq!(8, buf.len());
+        assert_eq!(&[1u8, 0, 0, 0, 2, 0, 0, 0], buf.as_slice());
+
+        buf.extend(vec![3u32, 4]);
+        assert_eq!(16, buf.len());
+        assert_eq!(
+            &[1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
+            buf.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_from_trusted_len_iter() {
+        let iter = vec![1u32, 2].into_iter();
+        let buf = unsafe { Buffer::from_trusted_len_iter(iter) };
+        assert_eq!(8, buf.len());
+        assert_eq!(&[1u8, 0, 0, 0, 2, 0, 0, 0], buf.as_slice());
     }
 
     #[test]
@@ -952,13 +1524,14 @@ mod tests {
         assert_eq!(64, buf.capacity());
 
         // Reserving a smaller capacity should have no effect.
-        let mut new_cap = buf.reserve(10).expect("reserve should be OK");
-        assert_eq!(64, new_cap);
+        buf.reserve(10);
         assert_eq!(64, buf.capacity());
 
-        new_cap = buf.reserve(100).expect("reserve should be OK");
-        assert_eq!(128, new_cap);
+        buf.reserve(80);
         assert_eq!(128, buf.capacity());
+
+        buf.reserve(129);
+        assert_eq!(256, buf.capacity());
     }
 
     #[test]
@@ -967,40 +1540,39 @@ mod tests {
         assert_eq!(64, buf.capacity());
         assert_eq!(0, buf.len());
 
-        buf.resize(20).expect("resize should be OK");
+        buf.resize(20, 0);
         assert_eq!(64, buf.capacity());
         assert_eq!(20, buf.len());
 
-        buf.resize(10).expect("resize should be OK");
+        buf.resize(10, 0);
         assert_eq!(64, buf.capacity());
         assert_eq!(10, buf.len());
 
-        buf.resize(100).expect("resize should be OK");
+        buf.resize(100, 0);
         assert_eq!(128, buf.capacity());
         assert_eq!(100, buf.len());
 
-        buf.resize(30).expect("resize should be OK");
-        assert_eq!(64, buf.capacity());
+        buf.resize(30, 0);
+        assert_eq!(128, buf.capacity());
         assert_eq!(30, buf.len());
 
-        buf.resize(0).expect("resize should be OK");
-        assert_eq!(0, buf.capacity());
+        buf.resize(0, 0);
+        assert_eq!(128, buf.capacity());
         assert_eq!(0, buf.len());
     }
 
     #[test]
-    fn test_mutable_freeze() {
+    fn test_mutable_into() {
         let mut buf = MutableBuffer::new(1);
-        buf.write("aaaa bbbb cccc dddd".as_bytes())
-            .expect("write should be OK");
+        buf.extend_from_slice(b"aaaa bbbb cccc dddd");
         assert_eq!(19, buf.len());
         assert_eq!(64, buf.capacity());
-        assert_eq!("aaaa bbbb cccc dddd".as_bytes(), buf.data());
+        assert_eq!(b"aaaa bbbb cccc dddd", buf.as_slice());
 
-        let immutable_buf = buf.freeze();
+        let immutable_buf: Buffer = buf.into();
         assert_eq!(19, immutable_buf.len());
         assert_eq!(64, immutable_buf.capacity());
-        assert_eq!("aaaa bbbb cccc dddd".as_bytes(), immutable_buf.data());
+        assert_eq!(b"aaaa bbbb cccc dddd", immutable_buf.as_slice());
     }
 
     #[test]
@@ -1008,14 +1580,14 @@ mod tests {
         let mut buf = MutableBuffer::new(1);
         let mut buf2 = MutableBuffer::new(1);
 
-        buf.write(&[0xaa])?;
-        buf2.write(&[0xaa, 0xbb])?;
+        buf.extend_from_slice(&[0xaa]);
+        buf2.extend_from_slice(&[0xaa, 0xbb]);
         assert!(buf != buf2);
 
-        buf.write(&[0xbb])?;
+        buf.extend_from_slice(&[0xbb]);
         assert_eq!(buf, buf2);
 
-        buf2.reserve(65)?;
+        buf2.reserve(65);
         assert!(buf != buf2);
 
         Ok(())
@@ -1025,11 +1597,11 @@ mod tests {
     fn test_access_concurrently() {
         let buffer = Buffer::from(vec![1, 2, 3, 4, 5]);
         let buffer2 = buffer.clone();
-        assert_eq!([1, 2, 3, 4, 5], buffer.data());
+        assert_eq!([1, 2, 3, 4, 5], buffer.as_slice());
 
         let buffer_copy = thread::spawn(move || {
             // access buffer in another thread.
-            buffer.clone()
+            buffer
         })
         .join();
 
@@ -1039,13 +1611,14 @@ mod tests {
 
     macro_rules! check_as_typed_data {
         ($input: expr, $native_t: ty) => {{
-            let buffer = Buffer::from($input.to_byte_slice());
+            let buffer = Buffer::from_slice_ref($input);
             let slice: &[$native_t] = unsafe { buffer.typed_data::<$native_t>() };
             assert_eq!($input, slice);
         }};
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_as_typed_data() {
         check_as_typed_data!(&[1i8, 3i8, 6i8], i8);
         check_as_typed_data!(&[1u8, 3u8, 6u8], u8);
@@ -1057,5 +1630,90 @@ mod tests {
         check_as_typed_data!(&[1u64, 3u64, 6u64], u64);
         check_as_typed_data!(&[1f32, 3f32, 6f32], f32);
         check_as_typed_data!(&[1f64, 3f64, 6f64], f64);
+    }
+
+    #[test]
+    fn test_count_bits() {
+        assert_eq!(0, Buffer::from(&[0b00000000]).count_set_bits());
+        assert_eq!(8, Buffer::from(&[0b11111111]).count_set_bits());
+        assert_eq!(3, Buffer::from(&[0b00001101]).count_set_bits());
+        assert_eq!(6, Buffer::from(&[0b01001001, 0b01010010]).count_set_bits());
+        assert_eq!(16, Buffer::from(&[0b11111111, 0b11111111]).count_set_bits());
+    }
+
+    #[test]
+    fn test_count_bits_slice() {
+        assert_eq!(
+            0,
+            Buffer::from(&[0b11111111, 0b00000000])
+                .slice(1)
+                .count_set_bits()
+        );
+        assert_eq!(
+            8,
+            Buffer::from(&[0b11111111, 0b11111111])
+                .slice(1)
+                .count_set_bits()
+        );
+        assert_eq!(
+            3,
+            Buffer::from(&[0b11111111, 0b11111111, 0b00001101])
+                .slice(2)
+                .count_set_bits()
+        );
+        assert_eq!(
+            6,
+            Buffer::from(&[0b11111111, 0b01001001, 0b01010010])
+                .slice(1)
+                .count_set_bits()
+        );
+        assert_eq!(
+            16,
+            Buffer::from(&[0b11111111, 0b11111111, 0b11111111, 0b11111111])
+                .slice(2)
+                .count_set_bits()
+        );
+    }
+
+    #[test]
+    fn test_count_bits_offset_slice() {
+        assert_eq!(8, Buffer::from(&[0b11111111]).count_set_bits_offset(0, 8));
+        assert_eq!(3, Buffer::from(&[0b11111111]).count_set_bits_offset(0, 3));
+        assert_eq!(5, Buffer::from(&[0b11111111]).count_set_bits_offset(3, 5));
+        assert_eq!(1, Buffer::from(&[0b11111111]).count_set_bits_offset(3, 1));
+        assert_eq!(0, Buffer::from(&[0b11111111]).count_set_bits_offset(8, 0));
+        assert_eq!(2, Buffer::from(&[0b01010101]).count_set_bits_offset(0, 3));
+        assert_eq!(
+            16,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(0, 16)
+        );
+        assert_eq!(
+            10,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(0, 10)
+        );
+        assert_eq!(
+            10,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(3, 10)
+        );
+        assert_eq!(
+            8,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(8, 8)
+        );
+        assert_eq!(
+            5,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(11, 5)
+        );
+        assert_eq!(
+            0,
+            Buffer::from(&[0b11111111, 0b11111111]).count_set_bits_offset(16, 0)
+        );
+        assert_eq!(
+            2,
+            Buffer::from(&[0b01101101, 0b10101010]).count_set_bits_offset(7, 5)
+        );
+        assert_eq!(
+            4,
+            Buffer::from(&[0b01101101, 0b10101010]).count_set_bits_offset(7, 9)
+        );
     }
 }
