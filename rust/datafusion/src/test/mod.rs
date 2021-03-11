@@ -19,13 +19,10 @@
 
 use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
-use crate::execution::context::ExecutionContext;
-use crate::logical_plan::{Expr, LogicalPlan, LogicalPlanBuilder};
-use crate::physical_plan::ExecutionPlan;
-use arrow::array;
+use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
+use arrow::array::{self, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use std::env;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
@@ -45,24 +42,13 @@ pub fn create_table_dual() -> Box<dyn TableProvider + Send + Sync> {
         ],
     )
     .unwrap();
-    let provider = MemTable::new(dual_schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    let provider = MemTable::try_new(dual_schema, vec![vec![batch]]).unwrap();
     Box::new(provider)
-}
-
-/// Get the value of the ARROW_TEST_DATA environment variable
-pub fn arrow_testdata_path() -> String {
-    env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined")
-}
-
-/// Execute a physical plan and collect the results
-pub fn execute(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
-    let ctx = ExecutionContext::new();
-    ctx.collect(plan)
 }
 
 /// Generated partitioned copy of a CSV file
 pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<String> {
-    let testdata = arrow_testdata_path();
+    let testdata = arrow::util::test_util::arrow_test_data();
     let path = format!("{}/csv/{}", testdata, filename);
 
     let tmp_dir = TempDir::new()?;
@@ -78,24 +64,21 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
 
     let f = File::open(&path)?;
     let f = BufReader::new(f);
-    let mut i = 0;
-    for line in f.lines() {
+    for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
 
         if i == 0 {
             // write header to all partitions
             for w in writers.iter_mut() {
-                w.write(line.as_bytes()).unwrap();
-                w.write(b"\n").unwrap();
+                w.write_all(line.as_bytes()).unwrap();
+                w.write_all(b"\n").unwrap();
             }
         } else {
             // write data line to single partition
             let partition = i % partitions;
-            writers[partition].write(line.as_bytes()).unwrap();
-            writers[partition].write(b"\n").unwrap();
+            writers[partition].write_all(line.as_bytes()).unwrap();
+            writers[partition].write_all(b"\n").unwrap();
         }
-
-        i += 1;
     }
     for w in writers.iter_mut() {
         w.flush().unwrap();
@@ -123,113 +106,14 @@ pub fn aggr_test_schema() -> SchemaRef {
     ]))
 }
 
-/// Format a batch as csv
-pub fn format_batch(batch: &RecordBatch) -> Vec<String> {
-    let mut rows = vec![];
-    for row_index in 0..batch.num_rows() {
-        let mut s = String::new();
-        for column_index in 0..batch.num_columns() {
-            if column_index > 0 {
-                s.push(',');
-            }
-            let array = batch.column(column_index);
-            match array.data_type() {
-                DataType::Int8 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int8Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int16 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int16Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Int64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Int64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt8 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt8Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt16 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt16Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::UInt64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::UInt64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Float32 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Float32Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                DataType::Float64 => s.push_str(&format!(
-                    "{:?}",
-                    array
-                        .as_any()
-                        .downcast_ref::<array::Float64Array>()
-                        .unwrap()
-                        .value(row_index)
-                )),
-                _ => s.push('?'),
-            }
-        }
-        rows.push(s);
-    }
-    rows
-}
-
-/// all tests share a common table
+/// some tests share a common table
 pub fn test_table_scan() -> Result<LogicalPlan> {
     let schema = Schema::new(vec![
         Field::new("a", DataType::UInt32, false),
         Field::new("b", DataType::UInt32, false),
         Field::new("c", DataType::UInt32, false),
     ]);
-    LogicalPlanBuilder::scan("default", "test", &schema, None)?.build()
+    LogicalPlanBuilder::scan_empty("test", &schema, None)?.build()
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -242,18 +126,102 @@ pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
     assert_eq!(actual, expected);
 }
 
-pub fn max(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        name: "MAX".to_owned(),
-        args: vec![expr],
-    }
+/// returns a table with 3 columns of i32 in memory
+pub fn build_table_i32(
+    a: (&str, &Vec<i32>),
+    b: (&str, &Vec<i32>),
+    c: (&str, &Vec<i32>),
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new(a.0, DataType::Int32, false),
+        Field::new(b.0, DataType::Int32, false),
+        Field::new(c.0, DataType::Int32, false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(a.1.clone())),
+            Arc::new(Int32Array::from(b.1.clone())),
+            Arc::new(Int32Array::from(c.1.clone())),
+        ],
+    )
+    .unwrap()
 }
 
-pub fn min(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        name: "MIN".to_owned(),
-        args: vec![expr],
-    }
+/// Returns the column names on the schema
+pub fn columns(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
+pub mod user_defined;
 pub mod variable;
+
+/// Compares formatted output of a record batch with an expected
+/// vector of strings, with the result of pretty formatting record
+/// batches. This is a macro so errors appear on the correct line
+///
+/// Designed so that failure output can be directly copy/pasted
+/// into the test code as expected results.
+///
+/// Expects to be called about like this:
+///
+/// `assert_batch_eq!(expected_lines: &[&str], batches: &[RecordBatch])`
+#[macro_export]
+macro_rules! assert_batches_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let expected_lines: Vec<String> =
+            $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
+
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS).unwrap();
+
+        let actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}
+
+/// Compares formatted output of a record batch with an expected
+/// vector of strings in a way that order does not matter.
+/// This is a macro so errors appear on the correct line
+///
+/// Designed so that failure output can be directly copy/pasted
+/// into the test code as expected results.
+///
+/// Expects to be called about like this:
+///
+/// `assert_batch_sorted_eq!(expected_lines: &[&str], batches: &[RecordBatch])`
+#[macro_export]
+macro_rules! assert_batches_sorted_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let mut expected_lines: Vec<String> =
+            $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
+
+        // sort except for header + footer
+        let num_lines = expected_lines.len();
+        if num_lines > 3 {
+            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS).unwrap();
+        // fix for windows: \r\n -->
+
+        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+        // sort except for header + footer
+        let num_lines = actual_lines.len();
+        if num_lines > 3 {
+            actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}

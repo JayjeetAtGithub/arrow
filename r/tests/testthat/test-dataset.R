@@ -44,7 +44,7 @@ df1 <- tibble(
 second_date <- lubridate::ymd_hms("2017-03-09 07:01:02")
 df2 <- tibble(
   int = 101:110,
-  dbl = as.numeric(51:60),
+  dbl = c(as.numeric(51:59), NaN),
   lgl = rep(c(TRUE, FALSE, NA, TRUE, FALSE), 2),
   chr = letters[10:1],
   fct = factor(LETTERS[10:1]),
@@ -122,13 +122,13 @@ test_that("Simple interface for datasets", {
   )
 })
 
-test_that("dim method returns the correct number of rows and columns",{
+test_that("dim method returns the correct number of rows and columns", {
   ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
   expect_identical(dim(ds), c(20L, 7L))
 })
 
 
-test_that("dim() correctly determine numbers of rows and columns on arrow_dplyr_query object",{
+test_that("dim() correctly determine numbers of rows and columns on arrow_dplyr_query object", {
   ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
 
   expect_warning(
@@ -177,7 +177,7 @@ test_that("dataset from URI", {
 test_that("Simple interface for datasets (custom ParquetFileFormat)", {
   ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()),
                      format = FileFormat$create("parquet", dict_columns = c("chr")))
-  expect_equivalent(ds$schema$GetFieldByName("chr")$type, dictionary())
+  expect_type_equal(ds$schema$GetFieldByName("chr")$type, dictionary())
 })
 
 test_that("Hive partitioning", {
@@ -303,11 +303,65 @@ test_that("Other text delimited dataset", {
       filter(integer > 6) %>%
       summarize(mean = mean(integer))
   )
+})
 
-  # Now with readr option spelling (and omitting format = "text")
-  ds3 <- open_dataset(tsv_dir, partitioning = "part", delim = "\t")
+test_that("readr parse options", {
+  arrow_opts <- names(formals(CsvParseOptions$create))
+  readr_opts <- names(formals(readr_to_csv_parse_options))
+
+  # Arrow and readr parse options must be mutually exclusive, or else the code
+  # in `csv_file_format_parse_options()` will error or behave incorrectly. A
+  # failure of this test indicates that these two sets of option names are not
+  # mutually exclusive.
+  expect_equal(
+    intersect(arrow_opts, readr_opts),
+    character(0)
+  )
+
+  # With not yet supported readr parse options (ARROW-8631)
+  expect_error(
+    open_dataset(tsv_dir, partitioning = "part", delim = "\t", na = "\\N"),
+    "supported"
+  )
+
+  # With unrecognized (garbage) parse options
+  expect_error(
+    open_dataset(
+      tsv_dir,
+      partitioning = "part",
+      format = "text",
+      asdfg = "\\"
+    ),
+    "Unrecognized"
+  )
+
+  # With both Arrow and readr parse options (disallowed)
+  expect_error(
+    open_dataset(
+      tsv_dir,
+      partitioning = "part",
+      format = "text",
+      quote = "\"",
+      quoting = TRUE
+    ),
+    "either"
+  )
+
+  # With ambiguous partial option names (disallowed)
+  expect_error(
+    open_dataset(
+      tsv_dir,
+      partitioning = "part",
+      format = "text",
+      quo = "\"",
+    ),
+    "Ambiguous"
+  )
+
+  # With only readr parse options (and omitting format = "text")
+  ds1 <- open_dataset(tsv_dir, partitioning = "part", delim = "\t")
   expect_equivalent(
-    ds3 %>%
+    ds1 %>%
       select(string = chr, integer = int, part) %>%
       filter(integer > 6 & part == 5) %>%
       collect() %>%
@@ -371,7 +425,7 @@ test_that("Creating UnionDataset", {
   )
 
   # Confirm c() method error handling
-  expect_error(c(ds1, 42), "'x' must be a string or a list of DatasetFactory")
+  expect_error(c(ds1, 42), "string")
 })
 
 test_that("InMemoryDataset", {
@@ -417,6 +471,17 @@ test_that("filter() with is.na()", {
   )
 })
 
+test_that("filter() with is.nan()", {
+  ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
+  expect_equivalent(
+    ds %>%
+      select(part, dbl) %>%
+      filter(!is.nan(dbl), part == 2) %>%
+      collect(),
+    tibble(part = 2L, dbl = df2$dbl[!is.nan(df2$dbl)])
+  )
+})
+
 test_that("filter() with %in%", {
   ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
   expect_equivalent(
@@ -435,6 +500,35 @@ test_that("filter() with %in%", {
       select(names(df2)) %>%
       collect(),
     df2
+  )
+})
+
+test_that("filter() with .data", {
+  ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
+  expect_equivalent(
+    ds %>%
+      select(.data$int, .data$part) %>%
+      filter(.data$int == 3, .data$part == 1) %>%
+      collect(),
+    tibble(int = df1$int[3], part = 1)
+  )
+
+  expect_equivalent(
+    ds %>%
+      select(.data$int, .data$part) %>%
+      filter(.data$int %in% c(6, 4, 3, 103, 107), .data$part == 1) %>%
+      collect(),
+    tibble(int = df1$int[c(3, 4, 6)], part = 1)
+  )
+
+  # and the .env pronoun too!
+  chr <- 1
+  expect_equivalent(
+    ds %>%
+      select(.data$int, .data$part) %>%
+      filter(.data$int %in% c(6, 4, 3, 103, 107), .data$part == .env$chr) %>%
+      collect(),
+    tibble(int = df1$int[c(3, 4, 6)], part = 1)
   )
 })
 
@@ -494,12 +588,119 @@ test_that("filter() on date32 columns", {
   )
 })
 
+test_that("filter() with expressions", {
+  ds <- open_dataset(dataset_dir, partitioning = schema(part = uint8()))
+  expect_is(ds$format, "ParquetFileFormat")
+  expect_is(ds$filesystem, "LocalFileSystem")
+  expect_is(ds, "Dataset")
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl) %>%
+      filter(dbl * 2 > 14 & dbl - 50 < 3L) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[8:10, c("chr", "dbl")],
+      df2[1:2, c("chr", "dbl")]
+    )
+  )
+
+  # check division's special casing.
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl) %>%
+      filter(dbl / 2 > 3.5 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[8:10, c("chr", "dbl")],
+      df2[1:2, c("chr", "dbl")]
+    )
+  )
+
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(int %/% 2L > 3 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[8:10, c("chr", "dbl", "int")],
+      df2[1:2, c("chr", "dbl", "int")]
+    )
+  )
+
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(int %/% 2 > 3 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[8:10, c("chr", "dbl", "int")],
+      df2[1:2, c("chr", "dbl", "int")]
+    )
+  )
+
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(int %% 2L > 0 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[c(1, 3, 5, 7, 9), c("chr", "dbl", "int")],
+      df2[1, c("chr", "dbl", "int")]
+    )
+  )
+
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(int %% 2L > 0 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[c(1, 3, 5, 7, 9), c("chr", "dbl", "int")],
+      df2[1, c("chr", "dbl", "int")]
+    )
+  )
+
+  skip("Implicit casts aren't being inserted everywhere they need to be (ARROW-8919)")
+  # Error: NotImplemented: Function multiply_checked has no kernel matching input types (scalar[double], array[int32])
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(int %% 2 > 0 & dbl < 53) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[c(1, 3, 5, 7, 9), c("chr", "dbl", "int")],
+      df2[1, c("chr", "dbl", "int")]
+    )
+  )
+
+  skip("Implicit casts are only inserted for scalars (ARROW-8919)")
+  # Error: NotImplemented: Function add_checked has no kernel matching input types (array[double], array[int32])
+  expect_equivalent(
+    ds %>%
+      select(chr, dbl, int) %>%
+      filter(dbl + int > 15 & dbl < 53L) %>%
+      collect() %>%
+      arrange(dbl),
+    rbind(
+      df1[8:10, c("chr", "dbl", "int")],
+      df2[1:2, c("chr", "dbl", "int")]
+    )
+  )
+})
+
 test_that("filter scalar validation doesn't crash (ARROW-7772)", {
   expect_error(
     ds %>%
       filter(int == "fff", part == 1) %>%
       collect(),
-    "error parsing 'fff' as scalar of type int32"
+    "Failed to parse string: 'fff' as a scalar of type int32"
   )
 })
 
@@ -654,7 +855,7 @@ test_that("Dataset and query print methods", {
       "lgl: bool",
       "integer: int32",
       "",
-      "* Filter: (int == 6:double)",
+      "* Filter: (int == 6)",
       "* Grouped by lgl",
       "See $.data for the source Arrow object",
       sep = "\n"
@@ -759,6 +960,14 @@ test_that("Writing a dataset: CSV->IPC", {
       filter(integer > 6) %>%
       summarize(mean = mean(integer))
   )
+
+  # Check whether "int" is present in the files or just in the dirs
+  first <- read_feather(
+    dir(dst_dir, pattern = ".feather$", recursive = TRUE, full.names = TRUE)[1],
+    as_data_frame = FALSE
+  )
+  # It shouldn't be there
+  expect_false("int" %in% names(first))
 })
 
 test_that("Writing a dataset: Parquet->IPC", {
@@ -853,6 +1062,18 @@ test_that("Dataset writing: dplyr methods", {
     collect(new_ds) %>% arrange(int),
     rbind(df1[c("chr", "dbl", "int")], df2[c("chr", "dbl", "int")])
   )
+
+  # filter to restrict written rows
+  dst_dir3 <- tempfile()
+  ds %>%
+    filter(int == 4) %>%
+    write_dataset(dst_dir3, format = "feather")
+  new_ds <- open_dataset(dst_dir3, format = "feather")
+
+  expect_equivalent(
+    new_ds %>% select(names(df1)) %>% collect(),
+    df1 %>% filter(int == 4)
+  )
 })
 
 test_that("Dataset writing: non-hive", {
@@ -870,7 +1091,7 @@ test_that("Dataset writing: no partitioning", {
   dst_dir <- tempfile()
   write_dataset(ds, dst_dir, format = "feather", partitioning = NULL)
   expect_true(dir.exists(dst_dir))
-  expect_true(length(dir(dst_dir)) > 1)
+  expect_true(length(dir(dst_dir)) > 0)
 })
 
 test_that("Dataset writing: from data.frame", {
@@ -923,10 +1144,38 @@ test_that("Dataset writing: from RecordBatch", {
   )
 })
 
+test_that("Writing a dataset: Ipc format options & compression", {
+  skip_on_os("windows") # https://issues.apache.org/jira/browse/ARROW-9651
+  ds <- open_dataset(csv_dir, partitioning = "part", format = "csv")
+  dst_dir <- make_temp_dir()
+
+  codec <- NULL
+  if (codec_is_available("zstd")) {
+    codec <- Codec$create("zstd")
+  }
+
+  write_dataset(ds, dst_dir, format = "feather", codec = codec)
+  expect_true(dir.exists(dst_dir))
+
+  new_ds <- open_dataset(dst_dir, format = "feather")
+  expect_equivalent(
+    new_ds %>%
+      select(string = chr, integer = int) %>%
+      filter(integer > 6 & integer < 11) %>%
+      collect() %>%
+      summarize(mean = mean(integer)),
+    df1 %>%
+      select(string = chr, integer = int) %>%
+      filter(integer > 6) %>%
+      summarize(mean = mean(integer))
+  )
+})
+
 test_that("Writing a dataset: Parquet format options", {
   skip_on_os("windows") # https://issues.apache.org/jira/browse/ARROW-9651
   ds <- open_dataset(csv_dir, partitioning = "part", format = "csv")
   dst_dir <- make_temp_dir()
+  dst_dir_no_truncated_timestamps <- make_temp_dir()
 
   # Use trace() to confirm that options are passed in
   trace(
@@ -936,7 +1185,7 @@ test_that("Writing a dataset: Parquet format options", {
     where = write_dataset
   )
   expect_warning(
-    write_dataset(ds, make_temp_dir(), format = "parquet", partitioning = "int"),
+    write_dataset(ds, dst_dir_no_truncated_timestamps, format = "parquet", partitioning = "int"),
     "allow_truncated_timestamps == FALSE"
   )
   expect_warning(
@@ -965,21 +1214,21 @@ test_that("Writing a dataset: Parquet format options", {
 })
 
 test_that("Dataset writing: unsupported features/input validation", {
-  expect_error(write_dataset(4), "'dataset' must be a Dataset")
+  expect_error(write_dataset(4), 'dataset must be a "Dataset"')
 
   ds <- open_dataset(hive_dir)
-
-  expect_error(
-    filter(ds, int == 4) %>% write_dataset(ds),
-    "Writing a filtered dataset is not yet supported"
-  )
   expect_error(
     select(ds, integer = int) %>% write_dataset(ds),
     "Renaming columns when writing a dataset is not yet supported"
   )
-
   expect_error(
     write_dataset(ds, partitioning = c("int", "NOTACOLUMN"), format = "ipc"),
     'Invalid field name: "NOTACOLUMN"'
+  )
+  expect_error(
+    write_dataset(ds, tempfile(), basename_template = "something_without_i")
+  )
+  expect_error(
+    write_dataset(ds, tempfile(), basename_template = NULL)
   )
 })

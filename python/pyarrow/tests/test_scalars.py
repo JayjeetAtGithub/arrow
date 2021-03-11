@@ -43,6 +43,8 @@ import pyarrow as pa
     (np.float16(1.0), pa.float16(), pa.HalfFloatScalar, pa.HalfFloatValue),
     (1.0, pa.float32(), pa.FloatScalar, pa.FloatValue),
     (decimal.Decimal("1.123"), None, pa.Decimal128Scalar, pa.Decimal128Value),
+    (decimal.Decimal("1.1234567890123456789012345678901234567890"),
+     None, pa.Decimal256Scalar, pa.Decimal256Value),
     ("string", None, pa.StringScalar, pa.StringValue),
     (b"bytes", None, pa.BinaryScalar, pa.BinaryValue),
     ("largestring", pa.large_string(), pa.LargeStringScalar,
@@ -176,7 +178,7 @@ def test_numerics():
     assert s.as_py() == 0.5
 
 
-def test_decimal():
+def test_decimal128():
     v = decimal.Decimal("1.123")
     s = pa.scalar(v)
     assert isinstance(s, pa.Decimal128Scalar)
@@ -194,6 +196,24 @@ def test_decimal():
     assert s.as_py() == v
 
 
+def test_decimal256():
+    v = decimal.Decimal("1234567890123456789012345678901234567890.123")
+    s = pa.scalar(v)
+    assert isinstance(s, pa.Decimal256Scalar)
+    assert s.as_py() == v
+    assert s.type == pa.decimal256(43, 3)
+
+    v = decimal.Decimal("1.1234")
+    with pytest.raises(pa.ArrowInvalid):
+        pa.scalar(v, type=pa.decimal256(4, scale=3))
+    with pytest.raises(pa.ArrowInvalid):
+        pa.scalar(v, type=pa.decimal256(5, scale=3))
+
+    s = pa.scalar(v, type=pa.decimal256(5, scale=4))
+    assert isinstance(s, pa.Decimal256Scalar)
+    assert s.as_py() == v
+
+
 def test_date():
     # ARROW-5125
     d1 = datetime.date(3200, 1, 1)
@@ -203,6 +223,15 @@ def test_date():
         for d in [d1, d2]:
             s = pa.scalar(d, type=ty)
             assert s.as_py() == d
+
+
+def test_date_cast():
+    # ARROW-10472 - casting fo scalars doesn't segfault
+    scalar = pa.scalar(datetime.datetime(2012, 1, 1), type=pa.timestamp("us"))
+    expected = datetime.date(2012, 1, 1)
+    for ty in [pa.date32(), pa.date64()]:
+        result = scalar.cast(ty)
+        assert result.as_py() == expected
 
 
 def test_time():
@@ -531,27 +560,28 @@ def test_map():
 
 
 def test_dictionary():
-    indices = [2, 1, 2, 0]
-    dictionary = ['foo', 'bar', 'baz']
+    indices = pa.array([2, None, 1, 2, 0, None])
+    dictionary = pa.array(['foo', 'bar', 'baz'])
 
     arr = pa.DictionaryArray.from_arrays(indices, dictionary)
-    expected = ['baz', 'bar', 'baz', 'foo']
+    expected = ['baz', None, 'bar', 'baz', 'foo', None]
+    assert arr.to_pylist() == expected
 
     for j, (i, v) in enumerate(zip(indices, expected)):
         s = arr[j]
 
         assert s.as_py() == v
         assert s.value.as_py() == v
-        assert s.index.as_py() == i
-        assert s.dictionary.to_pylist() == dictionary
+        assert s.index.equals(i)
+        assert s.dictionary.equals(dictionary)
 
         with pytest.warns(FutureWarning):
-            assert s.index_value.as_py() == i
+            assert s.index_value.equals(i)
         with pytest.warns(FutureWarning):
             assert s.dictionary_value.as_py() == v
 
-    with pytest.raises(pa.ArrowNotImplementedError):
-        pickle.loads(pickle.dumps(s))
+        restored = pickle.loads(pickle.dumps(s))
+        assert restored.equals(s)
 
 
 def test_union():

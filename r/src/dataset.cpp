@@ -21,18 +21,54 @@
 
 #include <arrow/dataset/api.h>
 #include <arrow/filesystem/filesystem.h>
+#include <arrow/ipc/writer.h>
 #include <arrow/table.h>
+#include <arrow/util/checked_cast.h>
 #include <arrow/util/iterator.h>
 
 namespace ds = ::arrow::dataset;
 namespace fs = ::arrow::fs;
+
+namespace cpp11 {
+
+const char* r6_class_name<ds::Dataset>::get(const std::shared_ptr<ds::Dataset>& dataset) {
+  auto type_name = dataset->type_name();
+
+  if (type_name == "union") {
+    return "UnionDataset";
+  } else if (type_name == "filesystem") {
+    return "FileSystemDataset";
+  } else if (type_name == "in-memory") {
+    return "InMemoryDataset";
+  } else {
+    return "Dataset";
+  }
+}
+
+const char* r6_class_name<ds::FileFormat>::get(
+    const std::shared_ptr<ds::FileFormat>& file_format) {
+  auto type_name = file_format->type_name();
+  if (type_name == "parquet") {
+    return "ParquetFileFormat";
+  } else if (type_name == "ipc") {
+    return "IpcFileFormat";
+  } else if (type_name == "csv") {
+    return "CsvFileFormat";
+  } else {
+    return "FileFormat";
+  }
+}
+
+}  // namespace cpp11
 
 // Dataset, UnionDataset, FileSystemDataset
 
 // [[arrow::export]]
 std::shared_ptr<ds::ScannerBuilder> dataset___Dataset__NewScan(
     const std::shared_ptr<ds::Dataset>& ds) {
-  return ValueOrStop(ds->NewScan());
+  auto context = std::make_shared<ds::ScanContext>();
+  context->pool = gc_memory_pool();
+  return ValueOrStop(ds->NewScan(std::move(context)));
 }
 
 // [[arrow::export]]
@@ -54,21 +90,21 @@ std::shared_ptr<ds::Dataset> dataset___Dataset__ReplaceSchema(
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::UnionDataset> dataset___UnionDataset__create(
+std::shared_ptr<ds::Dataset> dataset___UnionDataset__create(
     const ds::DatasetVector& datasets, const std::shared_ptr<arrow::Schema>& schm) {
   return ValueOrStop(ds::UnionDataset::Make(schm, datasets));
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::InMemoryDataset> dataset___InMemoryDataset__create(
+std::shared_ptr<ds::Dataset> dataset___InMemoryDataset__create(
     const std::shared_ptr<arrow::Table>& table) {
   return std::make_shared<ds::InMemoryDataset>(table);
 }
 
 // [[arrow::export]]
-ds::DatasetVector dataset___UnionDataset__children(
+cpp11::list dataset___UnionDataset__children(
     const std::shared_ptr<ds::UnionDataset>& ds) {
-  return ds->children();
+  return arrow::r::to_r_list(ds->children());
 }
 
 // [[arrow::export]]
@@ -125,7 +161,7 @@ std::shared_ptr<ds::DatasetFactory> dataset___UnionDatasetFactory__Make(
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make2(
+std::shared_ptr<ds::FileSystemDatasetFactory> dataset___FileSystemDatasetFactory__Make2(
     const std::shared_ptr<fs::FileSystem>& fs,
     const std::shared_ptr<fs::FileSelector>& selector,
     const std::shared_ptr<ds::FileFormat>& format,
@@ -136,11 +172,12 @@ std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make2(
     options.partitioning = partitioning;
   }
 
-  return ValueOrStop(ds::FileSystemDatasetFactory::Make(fs, *selector, format, options));
+  return arrow::internal::checked_pointer_cast<ds::FileSystemDatasetFactory>(
+      ValueOrStop(ds::FileSystemDatasetFactory::Make(fs, *selector, format, options)));
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make1(
+std::shared_ptr<ds::FileSystemDatasetFactory> dataset___FileSystemDatasetFactory__Make1(
     const std::shared_ptr<fs::FileSystem>& fs,
     const std::shared_ptr<fs::FileSelector>& selector,
     const std::shared_ptr<ds::FileFormat>& format) {
@@ -148,7 +185,7 @@ std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make1(
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make3(
+std::shared_ptr<ds::FileSystemDatasetFactory> dataset___FileSystemDatasetFactory__Make3(
     const std::shared_ptr<fs::FileSystem>& fs,
     const std::shared_ptr<fs::FileSelector>& selector,
     const std::shared_ptr<ds::FileFormat>& format,
@@ -159,7 +196,8 @@ std::shared_ptr<ds::DatasetFactory> dataset___FileSystemDatasetFactory__Make3(
     options.partitioning = factory;
   }
 
-  return ValueOrStop(ds::FileSystemDatasetFactory::Make(fs, *selector, format, options));
+  return arrow::internal::checked_pointer_cast<ds::FileSystemDatasetFactory>(
+      ValueOrStop(ds::FileSystemDatasetFactory::Make(fs, *selector, format, options)));
 }
 
 // FileFormat, ParquetFileFormat, IpcFileFormat
@@ -171,7 +209,13 @@ std::string dataset___FileFormat__type_name(
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::ParquetFileFormat> dataset___ParquetFileFormat__MakeRead(
+std::shared_ptr<ds::FileWriteOptions> dataset___FileFormat__DefaultWriteOptions(
+    const std::shared_ptr<ds::FileFormat>& fmt) {
+  return fmt->DefaultWriteOptions();
+}
+
+// [[arrow::export]]
+std::shared_ptr<ds::ParquetFileFormat> dataset___ParquetFileFormat__Make(
     bool use_buffered_stream, int64_t buffer_size, cpp11::strings dict_columns) {
   auto fmt = std::make_shared<ds::ParquetFileFormat>();
 
@@ -187,15 +231,36 @@ std::shared_ptr<ds::ParquetFileFormat> dataset___ParquetFileFormat__MakeRead(
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::ParquetFileFormat> dataset___ParquetFileFormat__MakeWrite(
+std::string dataset___FileWriteOptions__type_name(
+    const std::shared_ptr<ds::FileWriteOptions>& options) {
+  return options->type_name();
+}
+
+// [[arrow::export]]
+void dataset___ParquetFileWriteOptions__update(
+    const std::shared_ptr<ds::ParquetFileWriteOptions>& options,
     const std::shared_ptr<parquet::WriterProperties>& writer_props,
-    const std::shared_ptr<parquet::ArrowWriterProperties>& arrow_props) {
-  auto fmt = std::make_shared<ds::ParquetFileFormat>();
+    const std::shared_ptr<parquet::ArrowWriterProperties>& arrow_writer_props) {
+  options->writer_properties = writer_props;
+  options->arrow_writer_properties = arrow_writer_props;
+}
 
-  fmt->writer_properties = writer_props;
-  fmt->arrow_writer_properties = arrow_props;
+// [[arrow::export]]
+void dataset___IpcFileWriteOptions__update2(
+    const std::shared_ptr<ds::IpcFileWriteOptions>& ipc_options, bool use_legacy_format,
+    const std::shared_ptr<arrow::util::Codec>& codec,
+    arrow::ipc::MetadataVersion metadata_version) {
+  ipc_options->options->write_legacy_ipc_format = use_legacy_format;
+  ipc_options->options->codec = codec;
+  ipc_options->options->metadata_version = metadata_version;
+}
 
-  return fmt;
+// [[arrow::export]]
+void dataset___IpcFileWriteOptions__update1(
+    const std::shared_ptr<ds::IpcFileWriteOptions>& ipc_options, bool use_legacy_format,
+    arrow::ipc::MetadataVersion metadata_version) {
+  ipc_options->options->write_legacy_ipc_format = use_legacy_format;
+  ipc_options->options->metadata_version = metadata_version;
 }
 
 // [[arrow::export]]
@@ -214,7 +279,7 @@ std::shared_ptr<ds::CsvFileFormat> dataset___CsvFileFormat__Make(
 // DirectoryPartitioning, HivePartitioning
 
 // [[arrow::export]]
-std::shared_ptr<ds::Partitioning> dataset___DirectoryPartitioning(
+std::shared_ptr<ds::DirectoryPartitioning> dataset___DirectoryPartitioning(
     const std::shared_ptr<arrow::Schema>& schm) {
   return std::make_shared<ds::DirectoryPartitioning>(schm);
 }
@@ -226,7 +291,7 @@ std::shared_ptr<ds::PartitioningFactory> dataset___DirectoryPartitioning__MakeFa
 }
 
 // [[arrow::export]]
-std::shared_ptr<ds::Partitioning> dataset___HivePartitioning(
+std::shared_ptr<ds::HivePartitioning> dataset___HivePartitioning(
     const std::shared_ptr<arrow::Schema>& schm) {
   return std::make_shared<ds::HivePartitioning>(schm);
 }
@@ -247,10 +312,7 @@ void dataset___ScannerBuilder__Project(const std::shared_ptr<ds::ScannerBuilder>
 // [[arrow::export]]
 void dataset___ScannerBuilder__Filter(const std::shared_ptr<ds::ScannerBuilder>& sb,
                                       const std::shared_ptr<ds::Expression>& expr) {
-  // Expressions converted from R's expressions are typed with R's native type,
-  // i.e. double, int64_t and bool.
-  auto cast_filter = ValueOrStop(InsertImplicitCasts(*expr, *sb->schema()));
-  StopIfNotOk(sb->Filter(cast_filter));
+  StopIfNotOk(sb->Filter(*expr));
 }
 
 // [[arrow::export]]
@@ -303,8 +365,7 @@ std::shared_ptr<arrow::Table> dataset___Scanner__head(
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<ds::ScanTask>> dataset___Scanner__Scan(
-    const std::shared_ptr<ds::Scanner>& scanner) {
+cpp11::list dataset___Scanner__Scan(const std::shared_ptr<ds::Scanner>& scanner) {
   auto it = ValueOrStop(scanner->Scan());
   std::vector<std::shared_ptr<ds::ScanTask>> out;
   std::shared_ptr<ds::ScanTask> scan_task;
@@ -313,11 +374,18 @@ std::vector<std::shared_ptr<ds::ScanTask>> dataset___Scanner__Scan(
     scan_task = ValueOrStop(st);
     out.push_back(scan_task);
   }
-  return out;
+
+  return arrow::r::to_r_list(out);
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<arrow::RecordBatch>> dataset___ScanTask__get_batches(
+std::shared_ptr<arrow::Schema> dataset___Scanner__schema(
+    const std::shared_ptr<ds::Scanner>& sc) {
+  return sc->schema();
+}
+
+// [[arrow::export]]
+cpp11::list dataset___ScanTask__get_batches(
     const std::shared_ptr<ds::ScanTask>& scan_task) {
   arrow::RecordBatchIterator rbi;
   rbi = ValueOrStop(scan_task->Execute());
@@ -327,22 +395,22 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> dataset___ScanTask__get_batches
     batch = ValueOrStop(b);
     out.push_back(batch);
   }
-  return out;
+  return arrow::r::to_r_list(out);
 }
 
 // [[arrow::export]]
-void dataset___Dataset__Write(const std::shared_ptr<ds::Dataset>& ds,
-                              const std::shared_ptr<arrow::Schema>& schema,
-                              const std::shared_ptr<ds::FileFormat>& format,
-                              const std::shared_ptr<fs::FileSystem>& filesystem,
-                              std::string path,
-                              const std::shared_ptr<ds::Partitioning>& partitioning) {
-  auto frags = ds->GetFragments();
-  auto ctx = std::make_shared<ds::ScanContext>();
-  ctx->use_threads = true;
-  StopIfNotOk(ds::FileSystemDataset::Write(schema, format, filesystem, path, partitioning,
-                                           ctx, std::move(frags)));
-  return;
+void dataset___Dataset__Write(
+    const std::shared_ptr<ds::FileWriteOptions>& file_write_options,
+    const std::shared_ptr<fs::FileSystem>& filesystem, std::string base_dir,
+    const std::shared_ptr<ds::Partitioning>& partitioning, std::string basename_template,
+    const std::shared_ptr<ds::Scanner>& scanner) {
+  ds::FileSystemDatasetWriteOptions opts;
+  opts.file_write_options = file_write_options;
+  opts.filesystem = filesystem;
+  opts.base_dir = base_dir;
+  opts.partitioning = partitioning;
+  opts.basename_template = basename_template;
+  StopIfNotOk(ds::FileSystemDataset::Write(opts, scanner));
 }
 
 #endif

@@ -29,8 +29,8 @@
 
 #include <gtest/gtest.h>
 
-#include "arrow/buffer.h"
-#include "arrow/builder.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_primitive.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/testing/gtest_compat.h"
@@ -108,7 +108,7 @@
   } while (false);
 
 #define ASSIGN_OR_HANDLE_ERROR_IMPL(handle_error, status_name, lhs, rexpr) \
-  auto status_name = (rexpr);                                              \
+  auto&& status_name = (rexpr);                                            \
   handle_error(status_name.status());                                      \
   lhs = std::move(status_name).ValueOrDie();
 
@@ -137,15 +137,16 @@ namespace arrow {
 // ----------------------------------------------------------------------
 // Useful testing::Types declarations
 
-typedef ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type, Int8Type,
-                         Int16Type, Int32Type, Int64Type, FloatType, DoubleType>
-    NumericArrowTypes;
+using NumericArrowTypes =
+    ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type, Int8Type, Int16Type,
+                     Int32Type, Int64Type, FloatType, DoubleType>;
 
-typedef ::testing::Types<FloatType, DoubleType> RealArrowTypes;
+using RealArrowTypes = ::testing::Types<FloatType, DoubleType>;
 
-typedef ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type, Int8Type,
-                         Int16Type, Int32Type, Int64Type>
-    IntegralArrowTypes;
+using IntegralArrowTypes = ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+                                            Int8Type, Int16Type, Int32Type, Int64Type>;
+using TemporalArrowTypes =
+    ::testing::Types<Date32Type, Date64Type, TimestampType, Time32Type, Time64Type>;
 
 class Array;
 class ChunkedArray;
@@ -169,6 +170,9 @@ ARROW_TESTING_EXPORT void AssertArraysApproxEqual(
     const EqualOptions& option = EqualOptions::Defaults());
 // Returns true when values are both null
 ARROW_TESTING_EXPORT void AssertScalarsEqual(
+    const Scalar& expected, const Scalar& actual, bool verbose = false,
+    const EqualOptions& options = EqualOptions::Defaults());
+ARROW_TESTING_EXPORT void AssertScalarsApproxEqual(
     const Scalar& expected, const Scalar& actual, bool verbose = false,
     const EqualOptions& options = EqualOptions::Defaults());
 ARROW_TESTING_EXPORT void AssertBatchesEqual(const RecordBatch& expected,
@@ -221,6 +225,9 @@ ARROW_TESTING_EXPORT void AssertSchemaNotEqual(const std::shared_ptr<Schema>& lh
                                                const std::shared_ptr<Schema>& rhs,
                                                bool check_metadata = false);
 
+ARROW_TESTING_EXPORT Result<util::optional<std::string>> PrintArrayDiff(
+    const ChunkedArray& expected, const ChunkedArray& actual);
+
 ARROW_TESTING_EXPORT void AssertTablesEqual(const Table& expected, const Table& actual,
                                             bool same_chunk_layout = true,
                                             bool flatten = false);
@@ -254,7 +261,7 @@ ARROW_TESTING_EXPORT void TestInitialized(const Array& array);
 
 template <typename BuilderType>
 void FinishAndCheckPadding(BuilderType* builder, std::shared_ptr<Array>* out) {
-  ASSERT_OK(builder->Finish(out));
+  ASSERT_OK_AND_ASSIGN(*out, builder->Finish());
   AssertZeroPadded(**out);
   TestInitialized(**out);
 }
@@ -446,6 +453,17 @@ class ARROW_TESTING_EXPORT LocaleGuard {
   std::unique_ptr<Impl> impl_;
 };
 
+class ARROW_TESTING_EXPORT EnvVarGuard {
+ public:
+  EnvVarGuard(const std::string& name, const std::string& value);
+  ~EnvVarGuard();
+
+ protected:
+  const std::string name_;
+  std::string old_value_;
+  bool was_set_;
+};
+
 #ifndef ARROW_LARGE_MEMORY_TESTS
 #define LARGE_MEMORY_TEST(name) DISABLED_##name
 #else
@@ -453,3 +471,32 @@ class ARROW_TESTING_EXPORT LocaleGuard {
 #endif
 
 }  // namespace arrow
+
+namespace nonstd {
+namespace sv_lite {
+
+// Without this hint, GTest will print string_views as a container of char
+template <class Char, class Traits = std::char_traits<Char>>
+void PrintTo(const basic_string_view<Char, Traits>& view, std::ostream* os) {
+  *os << view;
+}
+
+}  // namespace sv_lite
+
+namespace optional_lite {
+
+template <typename T>
+void PrintTo(const optional<T>& opt, std::ostream* os) {
+  if (opt.has_value()) {
+    *os << "{";
+    ::testing::internal::UniversalPrint(*opt, os);
+    *os << "}";
+  } else {
+    *os << "nullopt";
+  }
+}
+
+inline void PrintTo(const decltype(nullopt)&, std::ostream* os) { *os << "nullopt"; }
+
+}  // namespace optional_lite
+}  // namespace nonstd

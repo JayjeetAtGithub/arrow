@@ -1021,11 +1021,11 @@ class BinaryTask
 
   def available_apt_targets
     [
-      ["debian", "stretch", "main"],
       ["debian", "buster", "main"],
       ["ubuntu", "xenial", "main"],
       ["ubuntu", "bionic", "main"],
       ["ubuntu", "focal", "main"],
+      ["ubuntu", "groovy", "main"],
     ]
   end
 
@@ -1406,7 +1406,6 @@ APT::FTPArchive::Release::Description "#{apt_repository_description}";
 
   def available_yum_targets
     [
-      ["centos", "6"],
       ["centos", "7"],
       ["centos", "8"],
     ]
@@ -1834,7 +1833,7 @@ APT::FTPArchive::Release::Description "#{apt_repository_description}";
                               :python,
                               "#{rc_dir}/python/#{full_version}",
                               "#{release_dir}/python/#{full_version}",
-                              "{conda,wheel}-*/**/*")
+                              "{conda-*,wheel-*,python-sdist}/**/*")
   end
 
   def define_nuget_tasks

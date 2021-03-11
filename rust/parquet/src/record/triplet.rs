@@ -163,7 +163,7 @@ impl TripletIter {
             TripletIter::FixedLenByteArrayTripletIter(ref typed) => {
                 Field::convert_byte_array(
                     typed.column_descr(),
-                    typed.current_value().clone(),
+                    typed.current_value().clone().into(),
                 )
             }
         }
@@ -367,14 +367,7 @@ mod tests {
     fn test_triplet_zero_batch_size() {
         let column_path =
             ColumnPath::from(vec!["b_struct".to_string(), "b_c_int".to_string()]);
-        test_column_in_file(
-            "nulls.snappy.parquet",
-            0,
-            &column_path,
-            &vec![],
-            &vec![],
-            &vec![],
-        );
+        test_column_in_file("nulls.snappy.parquet", 0, &column_path, &[], &[], &[]);
     }
 
     #[test]
