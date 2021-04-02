@@ -57,7 +57,7 @@ class RadosParquetScanTask : public ScanTask {
         options_->filter, options_->partition_expression, options_->projector.schema(),
         options_->dataset_schema, st.st_size, *in));
 
-    s = doa_->Exec(st.st_ino, "scan_op", *in, *out);
+    s = doa_->Exec(st.st_ino, "read_op", *in, *out);
     if (!s.ok()) {
       return Status::ExecutionError(s.message());
     }
@@ -65,12 +65,24 @@ class RadosParquetScanTask : public ScanTask {
     RecordBatchVector batches;
     auto buffer = std::make_shared<Buffer>((uint8_t*)out->c_str(), out->length());
     auto buffer_reader = std::make_shared<io::BufferReader>(buffer);
-    ARROW_ASSIGN_OR_RAISE(auto rb_reader,
-                          arrow::ipc::RecordBatchStreamReader::Open(buffer_reader));
 
-    std::shared_ptr<Table> rtable;
-    rb_reader->ReadAll(&rtable);
-    //std::cerr << rtable->ToString() << "\n";
+    arrow::dataset::FileSource source(buffer_reader);
+
+    auto format = std::make_shared<arrow::dataset::ParquetFileFormat>();
+    ARROW_ASSIGN_OR_RAISE(auto fragment,
+                          format->MakeFragment(source, options_->partition_expression));
+
+    auto ctx = std::make_shared<arrow::dataset::ScanContext>();
+    auto builder =
+        std::make_shared<arrow::dataset::ScannerBuilder>(options_->dataset_schema, fragment, ctx);
+
+    ARROW_RETURN_NOT_OK(builder->Filter(options_->filter));
+    ARROW_RETURN_NOT_OK(builder->Project(options_->projector.schema()->field_names()));
+
+    ARROW_ASSIGN_OR_RAISE(auto scanner, builder->Finish());
+    ARROW_ASSIGN_OR_RAISE(auto table, scanner->ToTable());
+    
+    ARROW_LOG(INFO) << table->ToString() << "\n";
 
     delete out;
     RecordBatchVector dummybatches;

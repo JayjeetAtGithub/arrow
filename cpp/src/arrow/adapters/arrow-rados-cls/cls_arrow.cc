@@ -33,6 +33,7 @@ CLS_NAME(arrow)
 
 cls_handle_t h_class;
 cls_method_handle_t h_scan_op;
+cls_method_handle_t h_read_op;
 
 class RandomAccessObject : public arrow::io::RandomAccessFile {
  public:
@@ -150,6 +151,21 @@ static arrow::Status ScanParquetObject(cls_method_context_t hctx,
   return arrow::Status::OK();
 }
 
+static int read_op(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
+  uint64_t size;
+  int ret = cls_cxx_stat(hctx, &size, NULL);
+  if (ret < 0)
+    return ret;
+  
+  ceph::buffer::list bl;
+  ret = cls_cxx_read(hctx, 0, size, &bl);
+  if (ret < 0)
+    return ret;
+
+  *out = bl;
+  return 0;
+}
+
 static int scan_op(cls_method_context_t hctx, ceph::bufferlist* in, ceph::bufferlist* out) {
   // the components required to construct a ParquetFragment.
   arrow::dataset::Expression filter;
@@ -187,4 +203,5 @@ void __cls_init() {
   cls_register("arrow", &h_class);
 
   cls_register_cxx_method(h_class, "scan_op", CLS_METHOD_RD, scan_op, &h_scan_op);
+  cls_register_cxx_method(h_class, "read_op", CLS_METHOD_RD, read_op, &h_read_op);
 }
