@@ -64,7 +64,7 @@ class RadosParquetScanTask : public ScanTask {
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
     PARQUET_THROW_NOT_OK(
-        parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
+        parquet::arrow::OpenFile(buffer_reader, arrow::default_memory_pool(), &reader));
     std::shared_ptr<arrow::Table> table;
     PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
 
