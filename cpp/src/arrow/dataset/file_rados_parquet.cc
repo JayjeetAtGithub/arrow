@@ -70,6 +70,7 @@ class RadosParquetScanTask : public ScanTask {
 
     std::shared_ptr<Table> rtable;
     rb_reader->ReadAll(&rtable);
+    ARROW_LOG(INFO) << rtable->ToString() << "\n";
     //std::cerr << rtable->ToString() << "\n";
 
     delete out;
