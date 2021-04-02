@@ -53,10 +53,6 @@ class RadosParquetScanTask : public ScanTask {
       return Status::Invalid(s.message());
     }
 
-    ARROW_RETURN_NOT_OK(SerializeScanRequestToBufferlist(
-        options_->filter, options_->partition_expression, options_->projector.schema(),
-        options_->dataset_schema, st.st_size, *in));
-
     s = doa_->Exec(st.st_ino, "read_op", *in, *out);
     if (!s.ok()) {
       return Status::ExecutionError(s.message());
@@ -66,22 +62,12 @@ class RadosParquetScanTask : public ScanTask {
     auto buffer = std::make_shared<Buffer>((uint8_t*)out->c_str(), out->length());
     auto buffer_reader = std::make_shared<io::BufferReader>(buffer);
 
-    arrow::dataset::FileSource source(buffer_reader);
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    PARQUET_THROW_NOT_OK(
+        parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
+    std::shared_ptr<arrow::Table> table;
+    PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
 
-    auto format = std::make_shared<arrow::dataset::ParquetFileFormat>();
-    ARROW_ASSIGN_OR_RAISE(auto fragment,
-                          format->MakeFragment(source, options_->partition_expression));
-
-    auto ctx = std::make_shared<arrow::dataset::ScanContext>();
-    auto builder =
-        std::make_shared<arrow::dataset::ScannerBuilder>(options_->dataset_schema, fragment, ctx);
-
-    ARROW_RETURN_NOT_OK(builder->Filter(options_->filter));
-    ARROW_RETURN_NOT_OK(builder->Project(options_->projector.schema()->field_names()));
-
-    ARROW_ASSIGN_OR_RAISE(auto scanner, builder->Finish());
-    ARROW_ASSIGN_OR_RAISE(auto table, scanner->ToTable());
-    
     ARROW_LOG(INFO) << table->ToString() << "\n";
 
     delete out;
