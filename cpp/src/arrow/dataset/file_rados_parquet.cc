@@ -67,9 +67,8 @@ class RadosParquetScanTask : public ScanTask {
     ARROW_ASSIGN_OR_RAISE(auto rb_reader,
                           arrow::ipc::RecordBatchStreamReader::Open(buffer_reader));
 
-
     // got the result, now either scan or do nothing
-    bool do_scan = true;
+    bool do_scan = false;
     if (do_scan) {
       RecordBatchVector batches;
       rb_reader->ReadAll(&batches);
