@@ -69,6 +69,7 @@ class RadosParquetScanTask : public ScanTask {
 
 
     // got the result, now either scan or do nothing
+    bool do_scan = true;
     if (do_scan) {
       RecordBatchVector batches;
       rb_reader->ReadAll(&batches);
