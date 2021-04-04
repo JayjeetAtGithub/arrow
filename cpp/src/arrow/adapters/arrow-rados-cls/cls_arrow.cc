@@ -170,7 +170,7 @@ static int scan_op(cls_method_context_t hctx, ceph::bufferlist* in, ceph::buffer
   // scan the parquet object
   std::shared_ptr<arrow::Table> table;
   arrow::Status s = ScanParquetObject(hctx, filter, partition_expression,
-                                      projection_schema, dataset_schema, table, file_size, true);
+                                      projection_schema, dataset_schema, table, file_size, false);
   if (!s.ok()) {
     CLS_LOG(0, "error: %s", s.message().c_str());
     return -1;
