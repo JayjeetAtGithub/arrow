@@ -125,7 +125,8 @@ static arrow::Status ScanParquetObject(cls_method_context_t hctx,
                                        std::shared_ptr<arrow::Schema> projection_schema,
                                        std::shared_ptr<arrow::Schema> dataset_schema,
                                        std::shared_ptr<arrow::Table>& t,
-                                       int64_t file_size) {
+                                       int64_t file_size,
+                                       bool do_scan) {
   auto file = std::make_shared<RandomAccessObject>(hctx, file_size);
 
   arrow::dataset::FileSource source(file);
@@ -138,8 +139,10 @@ static arrow::Status ScanParquetObject(cls_method_context_t hctx,
   auto builder =
       std::make_shared<arrow::dataset::ScannerBuilder>(dataset_schema, fragment, ctx);
 
-  ARROW_RETURN_NOT_OK(builder->Filter(filter));
-  ARROW_RETURN_NOT_OK(builder->Project(projection_schema->field_names()));
+  if (do_scan) {
+    ARROW_RETURN_NOT_OK(builder->Filter(filter));
+    ARROW_RETURN_NOT_OK(builder->Project(projection_schema->field_names()));
+  }
 
   ARROW_ASSIGN_OR_RAISE(auto scanner, builder->Finish());
   ARROW_ASSIGN_OR_RAISE(auto table, scanner->ToTable());
@@ -167,7 +170,7 @@ static int scan_op(cls_method_context_t hctx, ceph::bufferlist* in, ceph::buffer
   // scan the parquet object
   std::shared_ptr<arrow::Table> table;
   arrow::Status s = ScanParquetObject(hctx, filter, partition_expression,
-                                      projection_schema, dataset_schema, table, file_size);
+                                      projection_schema, dataset_schema, table, file_size, true);
   if (!s.ok()) {
     CLS_LOG(0, "error: %s", s.message().c_str());
     return -1;

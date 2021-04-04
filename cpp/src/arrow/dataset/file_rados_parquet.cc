@@ -62,16 +62,33 @@ class RadosParquetScanTask : public ScanTask {
       return Status::ExecutionError(s.message());
     }
 
-    RecordBatchVector batches;
     auto buffer = std::make_shared<Buffer>((uint8_t*)out->c_str(), out->length());
     auto buffer_reader = std::make_shared<io::BufferReader>(buffer);
     ARROW_ASSIGN_OR_RAISE(auto rb_reader,
                           arrow::ipc::RecordBatchStreamReader::Open(buffer_reader));
 
-    std::shared_ptr<Table> rtable;
-    rb_reader->ReadAll(&rtable);
-    ARROW_LOG(INFO) << rtable->ToString() << "\n";
-    //std::cerr << rtable->ToString() << "\n";
+
+    // got the result, now either scan or do nothing
+    if (do_scan) {
+      RecordBatchVector batches;
+      rb_reader->ReadAll(&batches);
+
+      std::shared_ptr<ScanContext> scan_context = std::make_shared<ScanContext>();
+      std::shared_ptr<InMemoryFragment> fragment =
+          std::make_shared<InMemoryFragment>(batches);
+      auto batch_schema = batches[0]->schema();
+      std::shared_ptr<ScannerBuilder> builder =
+          std::make_shared<ScannerBuilder>(batch_schema, fragment, scan_context);
+      ARROW_RETURN_NOT_OK(builder->Filter(options_->filter));
+      ARROW_RETURN_NOT_OK(builder->Project(options_->projector.schema()->field_names()));
+      ARROW_ASSIGN_OR_RAISE(auto scanner, builder->Finish());
+      ARROW_ASSIGN_OR_RAISE(auto table, scanner->ToTable());
+      ARROW_LOG(INFO) << table->ToString() << "\n";
+    } else {
+      std::shared_ptr<Table> table;
+      rb_reader->ReadAll(&table);
+      ARROW_LOG(INFO) << table->ToString() << "\n";
+    }
 
     delete out;
     RecordBatchVector dummybatches;
