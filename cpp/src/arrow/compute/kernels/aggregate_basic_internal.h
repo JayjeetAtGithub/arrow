@@ -29,16 +29,6 @@ namespace arrow {
 namespace compute {
 namespace aggregate {
 
-struct ScalarAggregator : public KernelState {
-  virtual void Consume(KernelContext* ctx, const ExecBatch& batch) = 0;
-  virtual void MergeFrom(KernelContext* ctx, const KernelState& src) = 0;
-  virtual void Finalize(KernelContext* ctx, Datum* out) = 0;
-};
-
-void AddAggKernel(std::shared_ptr<KernelSignature> sig, KernelInit init,
-                  ScalarAggregateFunction* func,
-                  SimdLevel::type simd_level = SimdLevel::NONE);
-
 void AddBasicAggKernels(KernelInit init,
                         const std::vector<std::shared_ptr<DataType>>& types,
                         std::shared_ptr<DataType> out_ty, ScalarAggregateFunction* func,
@@ -57,8 +47,6 @@ void AddMinMaxAvx2AggKernels(ScalarAggregateFunction* func);
 void AddSumAvx512AggKernels(ScalarAggregateFunction* func);
 void AddMeanAvx512AggKernels(ScalarAggregateFunction* func);
 void AddMinMaxAvx512AggKernels(ScalarAggregateFunction* func);
-
-std::shared_ptr<ScalarAggregateFunction> AddModeAggKernels();
 
 // ----------------------------------------------------------------------
 // Sum implementation
@@ -260,7 +248,7 @@ struct SumImpl : public ScalarAggregator {
     this->state.Consume(ArrayType(batch[0].array()));
   }
 
-  void MergeFrom(KernelContext*, const KernelState& src) override {
+  void MergeFrom(KernelContext*, KernelState&& src) override {
     const auto& other = checked_cast<const ThisType&>(src);
     this->state += other.state;
   }
@@ -418,7 +406,7 @@ struct MinMaxImpl : public ScalarAggregator {
     local.has_nulls = null_count > 0;
     local.has_values = (arr.length() - null_count) > 0;
 
-    if (local.has_nulls && options.null_handling == MinMaxOptions::OUTPUT_NULL) {
+    if (local.has_nulls && options.null_handling == MinMaxOptions::EMIT_NULL) {
       this->state = local;
       return;
     }
@@ -433,7 +421,7 @@ struct MinMaxImpl : public ScalarAggregator {
     this->state = local;
   }
 
-  void MergeFrom(KernelContext*, const KernelState& src) override {
+  void MergeFrom(KernelContext*, KernelState&& src) override {
     const auto& other = checked_cast<const ThisType&>(src);
     this->state += other.state;
   }
@@ -443,7 +431,7 @@ struct MinMaxImpl : public ScalarAggregator {
 
     std::vector<std::shared_ptr<Scalar>> values;
     if (!state.has_values ||
-        (state.has_nulls && options.null_handling == MinMaxOptions::OUTPUT_NULL)) {
+        (state.has_nulls && options.null_handling == MinMaxOptions::EMIT_NULL)) {
       // (null, null)
       values = {std::make_shared<ScalarType>(), std::make_shared<ScalarType>()};
     } else {
@@ -533,7 +521,7 @@ struct BooleanMinMaxImpl : public MinMaxImpl<BooleanType, SimdLevel> {
 
     local.has_nulls = null_count > 0;
     local.has_values = valid_count > 0;
-    if (local.has_nulls && options.null_handling == MinMaxOptions::OUTPUT_NULL) {
+    if (local.has_nulls && options.null_handling == MinMaxOptions::EMIT_NULL) {
       this->state = local;
       return;
     }
