@@ -39,7 +39,7 @@
 #' - `sink` An `OutputStream`
 #' - `schema` A [Schema] for the data to be written
 #' - `use_legacy_format` logical: write data formatted so that Arrow libraries
-#'   versions 0.14 and lower can read it? Default is `FALSE`. You can also
+#'   versions 0.14 and lower can read it. Default is `FALSE`. You can also
 #'   enable this by setting the environment variable `ARROW_PRE_0_15_IPC_FORMAT=1`.
 #' - `metadata_version`: A string like "V5" or the equivalent integer indicating
 #'   the Arrow IPC MetadataVersion. Default (NULL) will use the latest version,
@@ -130,17 +130,14 @@ RecordBatchStreamWriter$create <- function(sink,
       call. = FALSE
     )
   }
-  use_legacy_format <- use_legacy_format %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1")
   assert_is(sink, "OutputStream")
   assert_is(schema, "Schema")
 
-  shared_ptr(RecordBatchStreamWriter,
-    ipc___RecordBatchStreamWriter__Open(
-      sink,
-      schema,
-      isTRUE(use_legacy_format),
-      get_ipc_metadata_version(metadata_version)
-    )
+  ipc___RecordBatchStreamWriter__Open(
+    sink,
+    schema,
+    get_ipc_use_legacy_format(use_legacy_format),
+    get_ipc_metadata_version(metadata_version)
   )
 }
 
@@ -160,17 +157,14 @@ RecordBatchFileWriter$create <- function(sink,
       call. = FALSE
     )
   }
-  use_legacy_format <- use_legacy_format %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1")
   assert_is(sink, "OutputStream")
   assert_is(schema, "Schema")
 
-  shared_ptr(RecordBatchFileWriter,
-    ipc___RecordBatchFileWriter__Open(
-      sink,
-      schema,
-      isTRUE(use_legacy_format),
-      get_ipc_metadata_version(metadata_version)
-    )
+  ipc___RecordBatchFileWriter__Open(
+    sink,
+    schema,
+    get_ipc_use_legacy_format(use_legacy_format),
+    get_ipc_metadata_version(metadata_version)
   )
 }
 
@@ -195,4 +189,8 @@ get_ipc_metadata_version <- function(x) {
     stop(deparse(input), " is not a valid IPC MetadataVersion", call. = FALSE)
   }
   out
+}
+
+get_ipc_use_legacy_format <- function(x) {
+  isTRUE(x %||% identical(Sys.getenv("ARROW_PRE_0_15_IPC_FORMAT"), "1"))
 }

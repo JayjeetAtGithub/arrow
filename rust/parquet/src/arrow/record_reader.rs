@@ -16,19 +16,15 @@
 // under the License.
 
 use std::cmp::{max, min};
-use std::mem::align_of;
-use std::mem::size_of;
-use std::mem::{replace, swap};
-use std::slice;
+use std::mem::{replace, size_of};
 
 use crate::column::{page::PageReader, reader::ColumnReaderImpl};
 use crate::data_type::DataType;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use arrow::array::{BooleanBufferBuilder, BufferBuilderTrait};
+use arrow::array::BooleanBufferBuilder;
 use arrow::bitmap::Bitmap;
 use arrow::buffer::{Buffer, MutableBuffer};
-use arrow::memory;
 
 const MIN_BATCH_SIZE: usize = 1024;
 
@@ -53,50 +49,12 @@ pub struct RecordReader<T: DataType> {
     in_middle_of_record: bool,
 }
 
-#[derive(Debug)]
-struct FatPtr<'a, T> {
-    ptr: &'a mut [T],
-}
-
-impl<'a, T> FatPtr<'a, T> {
-    fn new(ptr: &'a mut [T]) -> Self {
-        Self { ptr }
-    }
-
-    fn with_offset(buf: &'a mut MutableBuffer, offset: usize) -> Self {
-        FatPtr::<T>::with_offset_and_size(buf, offset, size_of::<T>())
-    }
-
-    fn with_offset_and_size(
-        buf: &'a mut MutableBuffer,
-        offset: usize,
-        type_size: usize,
-    ) -> Self {
-        assert!(align_of::<T>() <= memory::ALIGNMENT);
-        // TODO Prevent this from being called with non primitive types (like `Box<A>`)
-        unsafe {
-            FatPtr::new(slice::from_raw_parts_mut(
-                &mut *(buf.raw_data() as *mut T).add(offset),
-                buf.capacity() / type_size - offset,
-            ))
-        }
-    }
-
-    fn to_slice(&self) -> &[T] {
-        self.ptr
-    }
-
-    fn to_slice_mut(&mut self) -> &mut [T] {
-        self.ptr
-    }
-}
-
 impl<T: DataType> RecordReader<T> {
     pub fn new(column_schema: ColumnDescPtr) -> Self {
         let (def_levels, null_map) = if column_schema.max_def_level() > 0 {
             (
                 Some(MutableBuffer::new(MIN_BATCH_SIZE)),
-                Some(BooleanBufferBuilder::new(MIN_BATCH_SIZE)),
+                Some(BooleanBufferBuilder::new(0)),
             )
         } else {
             (None, None)
@@ -121,26 +79,6 @@ impl<T: DataType> RecordReader<T> {
             values_written: 0,
             in_middle_of_record: false,
         }
-    }
-
-    pub(crate) fn cast<U: DataType>(&mut self) -> &mut RecordReader<U> {
-        trait CastRecordReader<T: DataType, U: DataType> {
-            fn cast(&mut self) -> &mut RecordReader<U>;
-        }
-
-        impl<T: DataType, U: DataType> CastRecordReader<T, U> for RecordReader<T> {
-            default fn cast(&mut self) -> &mut RecordReader<U> {
-                panic!("Attempted to cast RecordReader to the wrong type")
-            }
-        }
-
-        impl<T: DataType> CastRecordReader<T, T> for RecordReader<T> {
-            fn cast(&mut self) -> &mut RecordReader<T> {
-                self
-            }
-        }
-
-        CastRecordReader::<T, U>::cast(self)
     }
 
     /// Set the current page reader.
@@ -218,27 +156,25 @@ impl<T: DataType> RecordReader<T> {
     pub fn consume_def_levels(&mut self) -> Result<Option<Buffer>> {
         let new_buffer = if let Some(ref mut def_levels_buf) = &mut self.def_levels {
             let num_left_values = self.values_written - self.num_values;
-            let mut new_buffer = MutableBuffer::new(
-                size_of::<i16>() * max(MIN_BATCH_SIZE, num_left_values),
-            );
-            new_buffer.resize(num_left_values * size_of::<i16>())?;
+            // create an empty buffer, as it will be resized below
+            let mut new_buffer = MutableBuffer::new(0);
+            let num_bytes = num_left_values * size_of::<i16>();
+            let new_len = self.num_values * size_of::<i16>();
 
-            let mut new_def_levels = FatPtr::<i16>::with_offset(&mut new_buffer, 0);
-            let new_def_levels = new_def_levels.to_slice_mut();
-            let left_def_levels =
-                FatPtr::<i16>::with_offset(def_levels_buf, self.num_values);
-            let left_def_levels = left_def_levels.to_slice();
+            new_buffer.resize(num_bytes, 0);
 
-            new_def_levels[0..num_left_values]
-                .copy_from_slice(&left_def_levels[0..num_left_values]);
+            let new_def_levels = new_buffer.as_slice_mut();
+            let left_def_levels = &def_levels_buf.as_slice_mut()[new_len..];
 
-            def_levels_buf.resize(self.num_values * size_of::<i16>())?;
+            new_def_levels[0..num_bytes].copy_from_slice(&left_def_levels[0..num_bytes]);
+
+            def_levels_buf.resize(new_len, 0);
             Some(new_buffer)
         } else {
             None
         };
 
-        Ok(replace(&mut self.def_levels, new_buffer).map(|x| x.freeze()))
+        Ok(replace(&mut self.def_levels, new_buffer).map(|x| x.into()))
     }
 
     /// Return repetition level data.
@@ -247,28 +183,26 @@ impl<T: DataType> RecordReader<T> {
         // TODO: Optimize to reduce the copy
         let new_buffer = if let Some(ref mut rep_levels_buf) = &mut self.rep_levels {
             let num_left_values = self.values_written - self.num_values;
-            let mut new_buffer = MutableBuffer::new(
-                size_of::<i16>() * max(MIN_BATCH_SIZE, num_left_values),
-            );
-            new_buffer.resize(num_left_values * size_of::<i16>())?;
+            // create an empty buffer, as it will be resized below
+            let mut new_buffer = MutableBuffer::new(0);
+            let num_bytes = num_left_values * size_of::<i16>();
+            let new_len = self.num_values * size_of::<i16>();
 
-            let mut new_rep_levels = FatPtr::<i16>::with_offset(&mut new_buffer, 0);
-            let new_rep_levels = new_rep_levels.to_slice_mut();
-            let left_rep_levels =
-                FatPtr::<i16>::with_offset(rep_levels_buf, self.num_values);
-            let left_rep_levels = left_rep_levels.to_slice();
+            new_buffer.resize(num_bytes, 0);
 
-            new_rep_levels[0..num_left_values]
-                .copy_from_slice(&left_rep_levels[0..num_left_values]);
+            let new_rep_levels = new_buffer.as_slice_mut();
+            let left_rep_levels = &rep_levels_buf.as_slice_mut()[new_len..];
 
-            rep_levels_buf.resize(self.num_values * size_of::<i16>())?;
+            new_rep_levels[0..num_bytes].copy_from_slice(&left_rep_levels[0..num_bytes]);
+
+            rep_levels_buf.resize(new_len, 0);
 
             Some(new_buffer)
         } else {
             None
         };
 
-        Ok(replace(&mut self.rep_levels, new_buffer).map(|x| x.freeze()))
+        Ok(replace(&mut self.rep_levels, new_buffer).map(|x| x.into()))
     }
 
     /// Returns currently stored buffer data.
@@ -276,26 +210,21 @@ impl<T: DataType> RecordReader<T> {
     pub fn consume_record_data(&mut self) -> Result<Buffer> {
         // TODO: Optimize to reduce the copy
         let num_left_values = self.values_written - self.num_values;
-        let mut new_buffer = MutableBuffer::new(max(MIN_BATCH_SIZE, num_left_values));
-        new_buffer.resize(num_left_values * T::get_type_size())?;
+        // create an empty buffer, as it will be resized below
+        let mut new_buffer = MutableBuffer::new(0);
+        let num_bytes = num_left_values * T::get_type_size();
+        let new_len = self.num_values * T::get_type_size();
 
-        let mut new_records =
-            FatPtr::<T::T>::with_offset_and_size(&mut new_buffer, 0, T::get_type_size());
-        let new_records = new_records.to_slice_mut();
-        let mut left_records = FatPtr::<T::T>::with_offset_and_size(
-            &mut self.records,
-            self.num_values,
-            T::get_type_size(),
-        );
-        let left_records = left_records.to_slice_mut();
+        new_buffer.resize(num_bytes, 0);
 
-        for idx in 0..num_left_values {
-            swap(&mut new_records[idx], &mut left_records[idx]);
-        }
+        let new_records = new_buffer.as_slice_mut();
+        let left_records = &mut self.records.as_slice_mut()[new_len..];
 
-        self.records.resize(self.num_values * T::get_type_size())?;
+        new_records[0..num_bytes].copy_from_slice(&left_records[0..num_bytes]);
 
-        Ok(replace(&mut self.records, new_buffer).freeze())
+        self.records.resize(new_len, 0);
+
+        Ok(replace(&mut self.records, new_buffer).into())
     }
 
     /// Returns currently stored null bitmap data.
@@ -320,7 +249,7 @@ impl<T: DataType> RecordReader<T> {
                 self.null_bitmap
                     .as_mut()
                     .unwrap()
-                    .append(old_bitmap.is_set(i))?;
+                    .append(old_bitmap.is_set(i));
             }
 
             Ok(Some(old_bitmap.into_buffer()))
@@ -333,7 +262,7 @@ impl<T: DataType> RecordReader<T> {
     /// Should be called after consuming data, e.g. `consume_rep_levels`,
     /// `consume_rep_levels`, `consume_record_data` and `consume_bitmap_buffer`.
     pub fn reset(&mut self) {
-        self.values_written = self.values_written - self.num_values;
+        self.values_written -= self.num_values;
         self.num_records = 0;
         self.num_values = 0;
         self.values_seen = 0;
@@ -343,79 +272,79 @@ impl<T: DataType> RecordReader<T> {
     /// Returns bitmap data.
     pub fn consume_bitmap(&mut self) -> Result<Option<Bitmap>> {
         self.consume_bitmap_buffer()
-            .map(|buffer| buffer.map(|b| Bitmap::from(b)))
+            .map(|buffer| buffer.map(Bitmap::from))
     }
 
     /// Try to read one batch of data.
     fn read_one_batch(&mut self, batch_size: usize) -> Result<usize> {
         // Reserve spaces
         self.records
-            .reserve(self.records.len() + batch_size * T::get_type_size())?;
+            .resize(self.records.len() + batch_size * T::get_type_size(), 0);
         if let Some(ref mut buf) = self.rep_levels {
-            buf.reserve(buf.len() + batch_size * size_of::<i16>())
-                .map(|_| ())?;
+            buf.resize(buf.len() + batch_size * size_of::<i16>(), 0);
         }
         if let Some(ref mut buf) = self.def_levels {
-            buf.reserve(buf.len() + batch_size * size_of::<i16>())
-                .map(|_| ())?;
+            buf.resize(buf.len() + batch_size * size_of::<i16>(), 0);
         }
 
-        // Convert mutable buffer spaces to mutable slices
-        let mut values_buf = FatPtr::<T::T>::with_offset_and_size(
-            &mut self.records,
-            self.values_written,
-            T::get_type_size(),
-        );
-
         let values_written = self.values_written;
-        let mut def_levels_buf = self
-            .def_levels
-            .as_mut()
-            .map(|buf| FatPtr::<i16>::with_offset(buf, values_written));
 
-        let mut rep_levels_buf = self
-            .rep_levels
-            .as_mut()
-            .map(|buf| FatPtr::<i16>::with_offset(buf, values_written));
+        // Convert mutable buffer spaces to mutable slices
+        let (prefix, values, suffix) =
+            unsafe { self.records.as_slice_mut().align_to_mut::<T::T>() };
+        assert!(prefix.is_empty() && suffix.is_empty());
+        let values = &mut values[values_written..];
 
-        let (values_read, levels_read) =
-            self.column_reader.as_mut().unwrap().read_batch(
-                batch_size,
-                def_levels_buf.as_mut().map(|ptr| ptr.to_slice_mut()),
-                rep_levels_buf.as_mut().map(|ptr| ptr.to_slice_mut()),
-                values_buf.to_slice_mut(),
-            )?;
+        let def_levels = self.def_levels.as_mut().map(|buf| {
+            let (prefix, def_levels, suffix) =
+                unsafe { buf.as_slice_mut().align_to_mut::<i16>() };
+            assert!(prefix.is_empty() && suffix.is_empty());
+            &mut def_levels[values_written..]
+        });
+
+        let rep_levels = self.rep_levels.as_mut().map(|buf| {
+            let (prefix, rep_levels, suffix) =
+                unsafe { buf.as_slice_mut().align_to_mut::<i16>() };
+            assert!(prefix.is_empty() && suffix.is_empty());
+            &mut rep_levels[values_written..]
+        });
+
+        let (values_read, levels_read) = self
+            .column_reader
+            .as_mut()
+            .unwrap()
+            .read_batch(batch_size, def_levels, rep_levels, values)?;
+
+        // get new references for the def levels.
+        let def_levels = self.def_levels.as_ref().map(|buf| {
+            let (prefix, def_levels, suffix) =
+                unsafe { buf.as_slice().align_to::<i16>() };
+            assert!(prefix.is_empty() && suffix.is_empty());
+            &def_levels[values_written..]
+        });
 
         let max_def_level = self.column_desc.max_def_level();
 
         if values_read < levels_read {
-            // This means that there are null values in column data
-            // TODO: Move this into ColumnReader
-
-            let values_buf = values_buf.to_slice_mut();
-
-            let def_levels_buf = def_levels_buf
-                .as_mut()
-                .map(|ptr| ptr.to_slice_mut())
-                .ok_or_else(|| {
-                    general_err!(
-                        "Definition levels should exist when data is less than levels!"
-                    )
-                })?;
+            let def_levels = def_levels.ok_or_else(|| {
+                general_err!(
+                    "Definition levels should exist when data is less than levels!"
+                )
+            })?;
 
             // Fill spaces in column data with default values
             let mut values_pos = values_read;
             let mut level_pos = levels_read;
 
             while level_pos > values_pos {
-                if def_levels_buf[level_pos - 1] == max_def_level {
+                if def_levels[level_pos - 1] == max_def_level {
                     // This values is not empty
                     // We use swap rather than assign here because T::T doesn't
                     // implement Copy
-                    values_buf.swap(level_pos - 1, values_pos - 1);
+                    values.swap(level_pos - 1, values_pos - 1);
                     values_pos -= 1;
                 } else {
-                    values_buf[level_pos - 1] = T::T::default();
+                    values[level_pos - 1] = T::T::default();
                 }
 
                 level_pos -= 1;
@@ -424,17 +353,13 @@ impl<T: DataType> RecordReader<T> {
 
         // Fill in bitmap data
         if let Some(null_buffer) = self.null_bitmap.as_mut() {
-            let def_levels_buf = def_levels_buf
-                .as_mut()
-                .map(|ptr| ptr.to_slice_mut())
-                .ok_or_else(|| {
-                    general_err!(
-                        "Definition levels should exist when data is less than levels!"
-                    )
-                })?;
-            (0..levels_read).try_for_each(|idx| {
-                null_buffer.append(def_levels_buf[idx] == max_def_level)
+            let def_levels = def_levels.ok_or_else(|| {
+                general_err!(
+                    "Definition levels should exist when data is less than levels!"
+                )
             })?;
+            (0..levels_read)
+                .for_each(|idx| null_buffer.append(def_levels[idx] == max_def_level));
         }
 
         let values_read = max(values_read, levels_read);
@@ -445,13 +370,14 @@ impl<T: DataType> RecordReader<T> {
     /// Split values into records according repetition definition and returns number of
     /// records read.
     fn split_records(&mut self, records_to_read: usize) -> Result<usize> {
-        let rep_levels_buf = self
-            .rep_levels
-            .as_mut()
-            .map(|buf| FatPtr::<i16>::with_offset(buf, 0));
-        let rep_levels_buf = rep_levels_buf.as_ref().map(|x| x.to_slice());
+        let rep_levels = self.rep_levels.as_ref().map(|buf| {
+            let (prefix, rep_levels, suffix) =
+                unsafe { buf.as_slice().align_to::<i16>() };
+            assert!(prefix.is_empty() && suffix.is_empty());
+            rep_levels
+        });
 
-        match rep_levels_buf {
+        match rep_levels {
             Some(buf) => {
                 let mut records_read = 0;
 
@@ -487,16 +413,16 @@ impl<T: DataType> RecordReader<T> {
     fn set_values_written(&mut self, new_values_written: usize) -> Result<()> {
         self.values_written = new_values_written;
         self.records
-            .resize(self.values_written * T::get_type_size())?;
+            .resize(self.values_written * T::get_type_size(), 0);
 
         let new_levels_len = self.values_written * size_of::<i16>();
 
         if let Some(ref mut buf) = self.rep_levels {
-            buf.resize(new_levels_len)?
+            buf.resize(new_levels_len, 0)
         };
 
         if let Some(ref mut buf) = self.def_levels {
-            buf.resize(new_levels_len)?
+            buf.resize(new_levels_len, 0)
         };
 
         Ok(())
@@ -514,11 +440,9 @@ mod tests {
     use crate::schema::parser::parse_message_type;
     use crate::schema::types::SchemaDescriptor;
     use crate::util::test_common::page_util::{DataPageBuilder, DataPageBuilderImpl};
-    use arrow::array::{
-        BooleanBufferBuilder, BufferBuilderTrait, Int16BufferBuilder, Int32BufferBuilder,
-    };
+    use arrow::array::{BooleanBufferBuilder, Int16BufferBuilder, Int32BufferBuilder};
     use arrow::bitmap::Bitmap;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     struct TestPageReader {
         pages: Box<Iterator<Item = Page>>,
@@ -547,7 +471,7 @@ mod tests {
         }
         ";
         let desc = parse_message_type(message_type)
-            .map(|t| SchemaDescriptor::new(Rc::new(t)))
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
             .map(|s| s.column(0))
             .unwrap();
 
@@ -592,7 +516,7 @@ mod tests {
         //   leaf: 9
         {
             let values = [8, 9];
-            let mut pb = DataPageBuilderImpl::new(desc.clone(), 2, true);
+            let mut pb = DataPageBuilderImpl::new(desc, 2, true);
             pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
             let page = pb.consume();
 
@@ -604,7 +528,7 @@ mod tests {
         }
 
         let mut bb = Int32BufferBuilder::new(7);
-        bb.append_slice(&[4, 7, 6, 3, 2, 8, 9]).unwrap();
+        bb.append_slice(&[4, 7, 6, 3, 2, 8, 9]);
         let expected_buffer = bb.finish();
         assert_eq!(
             expected_buffer,
@@ -626,7 +550,7 @@ mod tests {
         ";
 
         let desc = parse_message_type(message_type)
-            .map(|t| SchemaDescriptor::new(Rc::new(t)))
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
             .map(|s| s.column(0))
             .unwrap();
 
@@ -678,7 +602,7 @@ mod tests {
             let values = [8];
             //empty, non-empty
             let def_levels = [0i16, 2i16];
-            let mut pb = DataPageBuilderImpl::new(desc.clone(), 2, true);
+            let mut pb = DataPageBuilderImpl::new(desc, 2, true);
             pb.add_def_levels(2, &def_levels);
             pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
             let page = pb.consume();
@@ -692,7 +616,7 @@ mod tests {
 
         // Verify result record data
         let mut bb = Int32BufferBuilder::new(7);
-        bb.append_slice(&[0, 7, 0, 6, 3, 0, 8]).unwrap();
+        bb.append_slice(&[0, 7, 0, 6, 3, 0, 8]);
         let expected_buffer = bb.finish();
         assert_eq!(
             expected_buffer,
@@ -701,8 +625,7 @@ mod tests {
 
         // Verify result def levels
         let mut bb = Int16BufferBuilder::new(7);
-        bb.append_slice(&[1i16, 2i16, 0i16, 2i16, 2i16, 0i16, 2i16])
-            .unwrap();
+        bb.append_slice(&[1i16, 2i16, 0i16, 2i16, 2i16, 0i16, 2i16]);
         let expected_def_levels = bb.finish();
         assert_eq!(
             Some(expected_def_levels),
@@ -711,8 +634,7 @@ mod tests {
 
         // Verify bitmap
         let mut bb = BooleanBufferBuilder::new(7);
-        bb.append_slice(&[false, true, false, true, true, false, true])
-            .unwrap();
+        bb.append_slice(&[false, true, false, true, true, false, true]);
         let expected_bitmap = Bitmap::from(bb.finish());
         assert_eq!(
             Some(expected_bitmap),
@@ -732,7 +654,7 @@ mod tests {
         ";
 
         let desc = parse_message_type(message_type)
-            .map(|t| SchemaDescriptor::new(Rc::new(t)))
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
             .map(|s| s.column(0))
             .unwrap();
 
@@ -786,7 +708,7 @@ mod tests {
             let values = [8, 9];
             let def_levels = [2i16, 2i16];
             let rep_levels = [0i16, 2i16];
-            let mut pb = DataPageBuilderImpl::new(desc.clone(), 2, true);
+            let mut pb = DataPageBuilderImpl::new(desc, 2, true);
             pb.add_rep_levels(2, &rep_levels);
             pb.add_def_levels(2, &def_levels);
             pb.add_values::<Int32Type>(Encoding::PLAIN, &values);
@@ -802,7 +724,7 @@ mod tests {
 
         // Verify result record data
         let mut bb = Int32BufferBuilder::new(9);
-        bb.append_slice(&[4, 0, 0, 7, 6, 3, 2, 8, 9]).unwrap();
+        bb.append_slice(&[4, 0, 0, 7, 6, 3, 2, 8, 9]);
         let expected_buffer = bb.finish();
         assert_eq!(
             expected_buffer,
@@ -811,8 +733,7 @@ mod tests {
 
         // Verify result def levels
         let mut bb = Int16BufferBuilder::new(9);
-        bb.append_slice(&[2i16, 0i16, 1i16, 2i16, 2i16, 2i16, 2i16, 2i16, 2i16])
-            .unwrap();
+        bb.append_slice(&[2i16, 0i16, 1i16, 2i16, 2i16, 2i16, 2i16, 2i16, 2i16]);
         let expected_def_levels = bb.finish();
         assert_eq!(
             Some(expected_def_levels),
@@ -821,8 +742,7 @@ mod tests {
 
         // Verify bitmap
         let mut bb = BooleanBufferBuilder::new(9);
-        bb.append_slice(&[true, false, false, true, true, true, true, true, true])
-            .unwrap();
+        bb.append_slice(&[true, false, false, true, true, true, true, true, true]);
         let expected_bitmap = Bitmap::from(bb.finish());
         assert_eq!(
             Some(expected_bitmap),
@@ -840,7 +760,7 @@ mod tests {
         ";
 
         let desc = parse_message_type(message_type)
-            .map(|t| SchemaDescriptor::new(Rc::new(t)))
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
             .map(|s| s.column(0))
             .unwrap();
 
@@ -855,7 +775,7 @@ mod tests {
                 rep_levels[idx * 5] = 0i16;
             }
 
-            let mut pb = DataPageBuilderImpl::new(desc.clone(), 5000, true);
+            let mut pb = DataPageBuilderImpl::new(desc, 5000, true);
             pb.add_rep_levels(1, &rep_levels);
             pb.add_def_levels(1, &def_levels);
             pb.add_values::<Int32Type>(Encoding::PLAIN, &values);

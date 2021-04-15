@@ -135,16 +135,16 @@ test_binary() {
 }
 
 test_apt() {
-  for target in "debian:stretch" \
-                "arm64v8/debian:stretch" \
-                "debian:buster" \
+  for target in "debian:buster" \
                 "arm64v8/debian:buster" \
                 "ubuntu:xenial" \
                 "arm64v8/ubuntu:xenial" \
                 "ubuntu:bionic" \
                 "arm64v8/ubuntu:bionic" \
                 "ubuntu:focal" \
-                "arm64v8/ubuntu:focal"; do \
+                "arm64v8/ubuntu:focal" \
+                "ubuntu:groovy" \
+                "arm64v8/ubuntu:groovy"; do \
     case "${target}" in
       arm64v8/*)
         if [ "$(arch)" = "aarch64" -o -e /usr/bin/qemu-aarch64-static ]; then
@@ -154,7 +154,7 @@ test_apt() {
         fi
         ;;
     esac
-    if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+    if ! docker run --rm -v "${SOURCE_DIR}"/../..:/arrow:delegated \
            "${target}" \
            /arrow/dev/release/verify-apt.sh \
            "${VERSION}" \
@@ -167,8 +167,7 @@ test_apt() {
 }
 
 test_yum() {
-  for target in "centos:6" \
-                "centos:7" \
+  for target in "centos:7" \
                 "arm64v8/centos:7" \
                 "centos:8" \
                 "arm64v8/centos:8"; do
@@ -181,7 +180,7 @@ test_yum() {
         fi
         ;;
     esac
-    if ! docker run -v "${SOURCE_DIR}"/../..:/arrow:delegated \
+    if ! docker run --rm -v "${SOURCE_DIR}"/../..:/arrow:delegated \
            "${target}" \
            /arrow/dev/release/verify-yum.sh \
            "${VERSION}" \
@@ -213,11 +212,14 @@ setup_tempdir() {
   fi
 }
 
-
 setup_miniconda() {
   # Setup short-lived miniconda for Python and integration tests
   if [ "$(uname)" == "Darwin" ]; then
-    MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+    if [ "$(uname -m)" == "arm64" ]; then
+	MINICONDA_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh
+    else
+        MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+    fi
   else
     MINICONDA_URL=https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh
   fi
@@ -230,16 +232,18 @@ setup_miniconda() {
     bash miniconda.sh -b -p $MINICONDA
     rm -f miniconda.sh
   fi
+  echo "Installed miniconda at ${MINICONDA}"
 
   . $MINICONDA/etc/profile.d/conda.sh
 
   conda create -n arrow-test -y -q -c conda-forge \
-        python=3.6 \
-        nomkl \
-        numpy \
-        pandas \
-        cython
+    python=3.8 \
+    nomkl \
+    numpy \
+    pandas \
+    cython
   conda activate arrow-test
+  echo "Using conda environment ${CONDA_PREFIX}"
 }
 
 # Build and test Java (Requires newer Maven -- I used 3.3.9)
@@ -313,7 +317,7 @@ test_csharp() {
       fi
     fi
   else
-    local dotnet_version=2.2.300
+    local dotnet_version=3.1.405
     local dotnet_platform=
     case "$(uname)" in
       Linux)
@@ -374,7 +378,7 @@ test_python() {
   fi
 
   python setup.py build_ext --inplace
-  py.test pyarrow -v --pdb
+  pytest pyarrow -v --pdb
 
   popd
 }
@@ -414,10 +418,11 @@ test_js() {
   if [ "${INSTALL_NODE}" -gt 0 ]; then
     export NVM_DIR="`pwd`/.nvm"
     mkdir -p $NVM_DIR
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | bash
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | \
+      PROFILE=/dev/null bash
     [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 
-    nvm install node
+    nvm install --lts
   fi
 
   npm install
@@ -610,23 +615,31 @@ test_binary_distribution() {
 }
 
 check_python_imports() {
-  local py_arch=$1
+   python << IMPORT_TESTS
+import platform
 
-  python -c "import pyarrow.parquet"
-  python -c "import pyarrow.plasma"
-  python -c "import pyarrow.fs"
+import pyarrow
+import pyarrow.parquet
+import pyarrow.plasma
+import pyarrow.fs
+import pyarrow._hdfs
+import pyarrow.dataset
+import pyarrow.flight
 
-  if [[ "$py_arch" =~ ^3 ]]; then
-    # Flight, Gandiva and Dataset are only available for py3
-    python -c "import pyarrow.dataset"
-    python -c "import pyarrow.flight"
-    python -c "import pyarrow.gandiva"
-  fi
+if platform.system() == "Darwin":
+    macos_version = tuple(map(int, platform.mac_ver()[0].split('.')))
+    check_s3fs = macos_version >= (10, 13)
+else:
+    check_s3fs = True
+
+if check_s3fs:
+    import pyarrow._s3fs
+IMPORT_TESTS
 }
 
 test_linux_wheels() {
-  local py_arches="3.5m 3.6m 3.7m 3.8"
-  local manylinuxes="1 2010 2014"
+  local py_arches="3.6m 3.7m 3.8 3.9"
+  local manylinuxes="2010 2014"
 
   for py_arch in ${py_arches}; do
     local env=_verify_wheel-${py_arch}
@@ -637,10 +650,11 @@ test_linux_wheels() {
     for ml_spec in ${manylinuxes}; do
       # check the mandatory and optional imports
       pip install python-rc/${VERSION}-rc${RC_NUMBER}/pyarrow-${VERSION}-cp${py_arch//[mu.]/}-cp${py_arch//./}-manylinux${ml_spec}_x86_64.whl
-      check_python_imports py_arch
+      check_python_imports
 
       # install test requirements and execute the tests
       pip install -r ${ARROW_DIR}/python/requirements-test.txt
+      python -c 'import pyarrow; pyarrow.create_library_symlinks()'
       pytest --pyargs pyarrow
     done
 
@@ -649,7 +663,7 @@ test_linux_wheels() {
 }
 
 test_macos_wheels() {
-  local py_arches="3.5m 3.6m 3.7m 3.8"
+  local py_arches="3.6m 3.7m 3.8 3.9"
 
   for py_arch in ${py_arches}; do
     local env=_verify_wheel-${py_arch}
@@ -657,22 +671,13 @@ test_macos_wheels() {
     conda activate ${env}
     pip install -U pip
 
-    macos_suffix=macosx
-    case "${py_arch}" in
-    *m)
-      macos_suffix="${macos_suffix}_10_9_intel"
-      ;;
-    *)
-      macos_suffix="${macos_suffix}_10_9_x86_64"
-      ;;
-    esac
-
     # check the mandatory and optional imports
-    pip install python-rc/${VERSION}-rc${RC_NUMBER}/pyarrow-${VERSION}-cp${py_arch//[m.]/}-cp${py_arch//./}-${macos_suffix}.whl
-    check_python_imports py_arch
+    pip install --find-links python-rc/${VERSION}-rc${RC_NUMBER} pyarrow==${VERSION}
+    check_python_imports
 
     # install test requirements and execute the tests
     pip install -r ${ARROW_DIR}/python/requirements-test.txt
+    python -c 'import pyarrow; pyarrow.create_library_symlinks()'
     pytest --pyargs pyarrow
 
     conda deactivate
@@ -780,15 +785,16 @@ cd ${ARROW_TMPDIR}
 
 if [ ${NEED_MINICONDA} -gt 0 ]; then
   setup_miniconda
-  echo "Using miniconda environment ${MINICONDA}"
 fi
 
 if [ "${ARTIFACT}" == "source" ]; then
   dist_name="apache-arrow-${VERSION}"
   if [ ${TEST_SOURCE} -gt 0 ]; then
     import_gpg_keys
-    fetch_archive ${dist_name}
-    tar xf ${dist_name}.tar.gz
+    if [ ! -d "${dist_name}" ]; then
+      fetch_archive ${dist_name}
+      tar xf ${dist_name}.tar.gz
+    fi
   else
     mkdir -p ${dist_name}
     if [ ! -f ${TEST_ARCHIVE} ]; then

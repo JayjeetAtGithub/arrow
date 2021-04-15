@@ -23,9 +23,11 @@
 #include <utf8proc.h>
 #endif
 
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_nested.h"
+#include "arrow/buffer_builder.h"
 #include "arrow/compute/api_scalar.h"
 #include "arrow/compute/kernels/common.h"
-#include "arrow/compute/kernels/scalar_string_internal.h"
 #include "arrow/util/utf8.h"
 #include "arrow/util/value_parsing.h"
 
@@ -84,25 +86,19 @@ void EnsureLookupTablesFilled() {
   });
 }
 
+#endif  // ARROW_WITH_UTF8PROC
+
+/// Transform string -> string with a reasonable guess on the maximum number of codepoints
 template <typename Type, typename Derived>
-struct UTF8Transform {
+struct StringTransform {
   using offset_type = typename Type::offset_type;
   using ArrayType = typename TypeTraits<Type>::ArrayType;
 
-  static bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
-                        uint8_t* output, offset_type* output_written) {
-    uint8_t* output_start = output;
-    if (ARROW_PREDICT_FALSE(
-            !arrow::util::UTF8Transform(input, input + input_string_ncodeunits, &output,
-                                        Derived::TransformCodepoint))) {
-      return false;
-    }
-    *output_written = static_cast<offset_type>(output - output_start);
-    return true;
-  }
-
+  static int64_t MaxCodeunits(offset_type input_ncodeunits) { return input_ncodeunits; }
   static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
-    EnsureLookupTablesFilled();
+    Derived().Execute(ctx, batch, out);
+  }
+  void Execute(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
     if (batch[0].kind() == Datum::ARRAY) {
       const ArrayData& input = *batch[0].array();
       ArrayType input_boxed(batch[0].array());
@@ -111,14 +107,7 @@ struct UTF8Transform {
       offset_type input_ncodeunits = input_boxed.total_values_length();
       offset_type input_nstrings = static_cast<offset_type>(input.length);
 
-      // Section 5.18 of the Unicode spec claim that the number of codepoints for case
-      // mapping can grow by a factor of 3. This means grow by a factor of 3 in bytes
-      // However, since we don't support all casings (SpecialCasing.txt) the growth
-      // is actually only at max 3/2 (as covered by the unittest).
-      // Note that rounding down the 3/2 is ok, since only codepoints encoded by
-      // two code units (even) can grow to 3 code units.
-
-      int64_t output_ncodeunits_max = static_cast<int64_t>(input_ncodeunits) * 3 / 2;
+      int64_t output_ncodeunits_max = Derived::MaxCodeunits(input_ncodeunits);
       if (output_ncodeunits_max > std::numeric_limits<offset_type>::max()) {
         ctx->SetStatus(Status::CapacityError(
             "Result might not fit in a 32bit utf8 array, convert to large_utf8"));
@@ -129,13 +118,9 @@ struct UTF8Transform {
                              ctx->Allocate(output_ncodeunits_max));
       output->buffers[2] = values_buffer;
 
-      // We could reuse the indices if the data is all ascii, benchmarking showed this
-      // not to matter.
-      //   output->buffers[1] = input.buffers[1];
-      KERNEL_ASSIGN_OR_RAISE(output->buffers[1], ctx,
-                             ctx->Allocate((input_nstrings + 1) * sizeof(offset_type)));
-      uint8_t* output_str = output->buffers[2]->mutable_data();
+      // String offsets are preallocated
       offset_type* output_string_offsets = output->GetMutableValues<offset_type>(1);
+      uint8_t* output_str = output->buffers[2]->mutable_data();
       offset_type output_ncodeunits = 0;
 
       output_string_offsets[0] = 0;
@@ -143,9 +128,9 @@ struct UTF8Transform {
         offset_type input_string_ncodeunits;
         const uint8_t* input_string = input_boxed.GetValue(i, &input_string_ncodeunits);
         offset_type encoded_nbytes = 0;
-        if (ARROW_PREDICT_FALSE(!Derived::Transform(input_string, input_string_ncodeunits,
-                                                    output_str + output_ncodeunits,
-                                                    &encoded_nbytes))) {
+        if (ARROW_PREDICT_FALSE(!static_cast<Derived&>(*this).Transform(
+                input_string, input_string_ncodeunits, output_str + output_ncodeunits,
+                &encoded_nbytes))) {
           ctx->SetStatus(Status::Invalid("Invalid UTF8 sequence in input"));
           return;
         }
@@ -163,8 +148,7 @@ struct UTF8Transform {
         result->is_valid = true;
         offset_type data_nbytes = static_cast<offset_type>(input.value->size());
 
-        // See note above in the Array version explaining the 3 / 2
-        int64_t output_ncodeunits_max = static_cast<int64_t>(data_nbytes) * 3 / 2;
+        int64_t output_ncodeunits_max = Derived::MaxCodeunits(data_nbytes);
         if (output_ncodeunits_max > std::numeric_limits<offset_type>::max()) {
           ctx->SetStatus(Status::CapacityError(
               "Result might not fit in a 32bit utf8 array, convert to large_utf8"));
@@ -174,9 +158,9 @@ struct UTF8Transform {
                                ctx->Allocate(output_ncodeunits_max));
         result->value = value_buffer;
         offset_type encoded_nbytes = 0;
-        if (ARROW_PREDICT_FALSE(!Derived::Transform(input.value->data(), data_nbytes,
-                                                    value_buffer->mutable_data(),
-                                                    &encoded_nbytes))) {
+        if (ARROW_PREDICT_FALSE(!static_cast<Derived&>(*this).Transform(
+                input.value->data(), data_nbytes, value_buffer->mutable_data(),
+                &encoded_nbytes))) {
           ctx->SetStatus(Status::Invalid("Invalid UTF8 sequence in input"));
           return;
         }
@@ -188,8 +172,42 @@ struct UTF8Transform {
   }
 };
 
+#ifdef ARROW_WITH_UTF8PROC
+
+// transforms per codepoint
+template <typename Type, typename Derived>
+struct StringTransformCodepoint : StringTransform<Type, Derived> {
+  using Base = StringTransform<Type, Derived>;
+  using offset_type = typename Base::offset_type;
+
+  bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
+                 uint8_t* output, offset_type* output_written) {
+    uint8_t* output_start = output;
+    if (ARROW_PREDICT_FALSE(
+            !arrow::util::UTF8Transform(input, input + input_string_ncodeunits, &output,
+                                        Derived::TransformCodepoint))) {
+      return false;
+    }
+    *output_written = static_cast<offset_type>(output - output_start);
+    return true;
+  }
+  static int64_t MaxCodeunits(offset_type input_ncodeunits) {
+    // Section 5.18 of the Unicode spec claim that the number of codepoints for case
+    // mapping can grow by a factor of 3. This means grow by a factor of 3 in bytes
+    // However, since we don't support all casings (SpecialCasing.txt) the growth
+    // in bytes iss actually only at max 3/2 (as covered by the unittest).
+    // Note that rounding down the 3/2 is ok, since only codepoints encoded by
+    // two code units (even) can grow to 3 code units.
+    return static_cast<int64_t>(input_ncodeunits) * 3 / 2;
+  }
+  void Execute(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    EnsureLookupTablesFilled();
+    Base::Execute(ctx, batch, out);
+  }
+};
+
 template <typename Type>
-struct UTF8Upper : UTF8Transform<Type, UTF8Upper<Type>> {
+struct UTF8Upper : StringTransformCodepoint<Type, UTF8Upper<Type>> {
   inline static uint32_t TransformCodepoint(uint32_t codepoint) {
     return codepoint <= kMaxCodepointLookup ? lut_upper_codepoint[codepoint]
                                             : utf8proc_toupper(codepoint);
@@ -197,8 +215,8 @@ struct UTF8Upper : UTF8Transform<Type, UTF8Upper<Type>> {
 };
 
 template <typename Type>
-struct UTF8Lower : UTF8Transform<Type, UTF8Lower<Type>> {
-  static uint32_t TransformCodepoint(uint32_t codepoint) {
+struct UTF8Lower : StringTransformCodepoint<Type, UTF8Lower<Type>> {
+  inline static uint32_t TransformCodepoint(uint32_t codepoint) {
     return codepoint <= kMaxCodepointLookup ? lut_lower_codepoint[codepoint]
                                             : utf8proc_tolower(codepoint);
   }
@@ -392,8 +410,15 @@ struct MatchSubstring {
   }
 };
 
+const FunctionDoc match_substring_doc(
+    "Match strings against literal pattern",
+    ("For each string in `strings`, emit true iff it contains a given pattern.\n"
+     "Null inputs emit null.  The pattern must be given in MatchSubstringOptions."),
+    {"strings"}, "MatchSubstringOptions");
+
 void AddMatchSubstring(FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>("match_substring", Arity::Unary());
+  auto func = std::make_shared<ScalarFunction>("match_substring", Arity::Unary(),
+                                               &match_substring_doc);
   auto exec_32 = MatchSubstring<StringType>::Exec;
   auto exec_64 = MatchSubstring<LargeStringType>::Exec;
   DCHECK_OK(func->AddKernel({utf8()}, boolean(), exec_32, MatchSubstringState::Init));
@@ -809,6 +834,386 @@ struct IsUpperAscii : CharacterPredicateAscii<IsUpperAscii> {
   }
 };
 
+// splitting
+
+template <typename Type, typename ListType, typename Options, typename Derived>
+struct SplitBaseTransform {
+  using string_offset_type = typename Type::offset_type;
+  using list_offset_type = typename ListType::offset_type;
+  using ArrayType = typename TypeTraits<Type>::ArrayType;
+  using ArrayListType = typename TypeTraits<ListType>::ArrayType;
+  using ListScalarType = typename TypeTraits<ListType>::ScalarType;
+  using ScalarType = typename TypeTraits<Type>::ScalarType;
+  using BuilderType = typename TypeTraits<Type>::BuilderType;
+  using ListOffsetsBuilderType = TypedBufferBuilder<list_offset_type>;
+  using State = OptionsWrapper<Options>;
+
+  std::vector<util::string_view> parts;
+  Options options;
+
+  explicit SplitBaseTransform(Options options) : options(options) {}
+
+  Status Split(const util::string_view& s, BuilderType* builder) {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(s.data());
+    const uint8_t* end = begin + s.length();
+
+    int64_t max_splits = options.max_splits;
+    // if there is no max splits, reversing does not make sense (and is probably less
+    // efficient), but is useful for testing
+    if (options.reverse) {
+      // note that i points 1 further than the 'current'
+      const uint8_t* i = end;
+      // we will record the parts in reverse order
+      parts.clear();
+      if (max_splits > -1) {
+        parts.reserve(max_splits + 1);
+      }
+      while (max_splits != 0) {
+        const uint8_t *separator_begin, *separator_end;
+        // find with whatever algo the part we will 'cut out'
+        if (static_cast<Derived&>(*this).FindReverse(begin, i, &separator_begin,
+                                                     &separator_end, options)) {
+          parts.emplace_back(reinterpret_cast<const char*>(separator_end),
+                             i - separator_end);
+          i = separator_begin;
+          max_splits--;
+        } else {
+          // if we cannot find a separator, we're done
+          break;
+        }
+      }
+      parts.emplace_back(reinterpret_cast<const char*>(begin), i - begin);
+      // now we do the copying
+      for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        RETURN_NOT_OK(builder->Append(*it));
+      }
+    } else {
+      const uint8_t* i = begin;
+      while (max_splits != 0) {
+        const uint8_t *separator_begin, *separator_end;
+        // find with whatever algo the part we will 'cut out'
+        if (static_cast<Derived&>(*this).Find(i, end, &separator_begin, &separator_end,
+                                              options)) {
+          // the part till the beginning of the 'cut'
+          RETURN_NOT_OK(
+              builder->Append(i, static_cast<string_offset_type>(separator_begin - i)));
+          i = separator_end;
+          max_splits--;
+        } else {
+          // if we cannot find a separator, we're done
+          break;
+        }
+      }
+      // trailing part
+      RETURN_NOT_OK(builder->Append(i, static_cast<string_offset_type>(end - i)));
+    }
+    return Status::OK();
+  }
+
+  static Status CheckOptions(const Options& options) { return Status::OK(); }
+
+  static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    Options options = State::Get(ctx);
+    Derived splitter(options);  // we make an instance to reuse the parts vectors
+    splitter.Split(ctx, batch, out);
+  }
+
+  void Split(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    EnsureLookupTablesFilled();  // only needed for unicode
+    KERNEL_RETURN_IF_ERROR(ctx, Derived::CheckOptions(options));
+
+    if (batch[0].kind() == Datum::ARRAY) {
+      const ArrayData& input = *batch[0].array();
+      ArrayType input_boxed(batch[0].array());
+
+      BuilderType builder(input.type, ctx->memory_pool());
+      // a slight overestimate of the data needed
+      KERNEL_RETURN_IF_ERROR(ctx, builder.ReserveData(input_boxed.total_values_length()));
+      // the minimum amount of strings needed
+      KERNEL_RETURN_IF_ERROR(ctx, builder.Resize(input.length));
+
+      ArrayData* output_list = out->mutable_array();
+      // list offsets were preallocated
+      auto* list_offsets = output_list->GetMutableValues<list_offset_type>(1);
+      DCHECK_NE(list_offsets, nullptr);
+      // initial value
+      *list_offsets++ = 0;
+      KERNEL_RETURN_IF_ERROR(
+          ctx,
+          VisitArrayDataInline<Type>(
+              input,
+              [&](util::string_view s) {
+                RETURN_NOT_OK(Split(s, &builder));
+                if (ARROW_PREDICT_FALSE(builder.length() >
+                                        std::numeric_limits<list_offset_type>::max())) {
+                  return Status::CapacityError("List offset does not fit into 32 bit");
+                }
+                *list_offsets++ = static_cast<list_offset_type>(builder.length());
+                return Status::OK();
+              },
+              [&]() {
+                // null value is already taken from input
+                *list_offsets++ = static_cast<list_offset_type>(builder.length());
+                return Status::OK();
+              }));
+      // assign list child data
+      std::shared_ptr<Array> string_array;
+      KERNEL_RETURN_IF_ERROR(ctx, builder.Finish(&string_array));
+      output_list->child_data.push_back(string_array->data());
+
+    } else {
+      const auto& input = checked_cast<const ScalarType&>(*batch[0].scalar());
+      auto result = checked_pointer_cast<ListScalarType>(MakeNullScalar(out->type()));
+      if (input.is_valid) {
+        result->is_valid = true;
+        BuilderType builder(input.type, ctx->memory_pool());
+        util::string_view s(*input.value);
+        KERNEL_RETURN_IF_ERROR(ctx, Split(s, &builder));
+        KERNEL_RETURN_IF_ERROR(ctx, builder.Finish(&result->value));
+      }
+      out->value = result;
+    }
+  }
+};
+
+template <typename Type, typename ListType>
+struct SplitPatternTransform : SplitBaseTransform<Type, ListType, SplitPatternOptions,
+                                                  SplitPatternTransform<Type, ListType>> {
+  using Base = SplitBaseTransform<Type, ListType, SplitPatternOptions,
+                                  SplitPatternTransform<Type, ListType>>;
+  using ArrayType = typename TypeTraits<Type>::ArrayType;
+  using ScalarType = typename TypeTraits<Type>::ScalarType;
+  using string_offset_type = typename Type::offset_type;
+  using Base::Base;
+
+  static Status CheckOptions(const SplitPatternOptions& options) {
+    if (options.pattern.length() == 0) {
+      return Status::Invalid("Empty separator");
+    }
+    return Status::OK();
+  }
+
+  static bool Find(const uint8_t* begin, const uint8_t* end,
+                   const uint8_t** separator_begin, const uint8_t** separator_end,
+                   const SplitPatternOptions& options) {
+    const uint8_t* pattern = reinterpret_cast<const uint8_t*>(options.pattern.c_str());
+    const int64_t pattern_length = options.pattern.length();
+    const uint8_t* i = begin;
+    // this is O(n*m) complexity, we could use the Knuth-Morris-Pratt algorithm used in
+    // the match kernel
+    while ((i + pattern_length <= end)) {
+      i = std::search(i, end, pattern, pattern + pattern_length);
+      if (i != end) {
+        *separator_begin = i;
+        *separator_end = i + pattern_length;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool FindReverse(const uint8_t* begin, const uint8_t* end,
+                          const uint8_t** separator_begin, const uint8_t** separator_end,
+                          const SplitPatternOptions& options) {
+    const uint8_t* pattern = reinterpret_cast<const uint8_t*>(options.pattern.c_str());
+    const int64_t pattern_length = options.pattern.length();
+    // this is O(n*m) complexity, we could use the Knuth-Morris-Pratt algorithm used in
+    // the match kernel
+    std::reverse_iterator<const uint8_t*> ri(end);
+    std::reverse_iterator<const uint8_t*> rend(begin);
+    std::reverse_iterator<const uint8_t*> pattern_rbegin(pattern + pattern_length);
+    std::reverse_iterator<const uint8_t*> pattern_rend(pattern);
+    while (begin <= ri.base() - pattern_length) {
+      ri = std::search(ri, rend, pattern_rbegin, pattern_rend);
+      if (ri != rend) {
+        *separator_begin = ri.base() - pattern_length;
+        *separator_end = ri.base();
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+const FunctionDoc split_pattern_doc(
+    "Split string according to separator",
+    ("Split each string according to the exact `pattern` defined in\n"
+     "SplitPatternOptions.  The output for each string input is a list\n"
+     "of strings.\n"
+     "\n"
+     "The maximum number of splits and direction of splitting\n"
+     "(forward, reverse) can optionally be defined in SplitPatternOptions."),
+    {"strings"}, "SplitPatternOptions");
+
+const FunctionDoc ascii_split_whitespace_doc(
+    "Split string according to any ASCII whitespace",
+    ("Split each string according any non-zero length sequence of ASCII\n"
+     "whitespace characters.  The output for each string input is a list\n"
+     "of strings.\n"
+     "\n"
+     "The maximum number of splits and direction of splitting\n"
+     "(forward, reverse) can optionally be defined in SplitOptions."),
+    {"strings"}, "SplitOptions");
+
+const FunctionDoc utf8_split_whitespace_doc(
+    "Split string according to any Unicode whitespace",
+    ("Split each string according any non-zero length sequence of Unicode\n"
+     "whitespace characters.  The output for each string input is a list\n"
+     "of strings.\n"
+     "\n"
+     "The maximum number of splits and direction of splitting\n"
+     "(forward, reverse) can optionally be defined in SplitOptions."),
+    {"strings"}, "SplitOptions");
+
+void AddSplitPattern(FunctionRegistry* registry) {
+  auto func = std::make_shared<ScalarFunction>("split_pattern", Arity::Unary(),
+                                               &split_pattern_doc);
+  using t32 = SplitPatternTransform<StringType, ListType>;
+  using t64 = SplitPatternTransform<LargeStringType, ListType>;
+  DCHECK_OK(func->AddKernel({utf8()}, {list(utf8())}, t32::Exec, t32::State::Init));
+  DCHECK_OK(
+      func->AddKernel({large_utf8()}, {list(large_utf8())}, t64::Exec, t64::State::Init));
+  DCHECK_OK(registry->AddFunction(std::move(func)));
+}
+
+template <typename Type, typename ListType>
+struct SplitWhitespaceAsciiTransform
+    : SplitBaseTransform<Type, ListType, SplitOptions,
+                         SplitWhitespaceAsciiTransform<Type, ListType>> {
+  using Base = SplitBaseTransform<Type, ListType, SplitOptions,
+                                  SplitWhitespaceAsciiTransform<Type, ListType>>;
+  using ArrayType = typename TypeTraits<Type>::ArrayType;
+  using ScalarType = typename TypeTraits<Type>::ScalarType;
+  using string_offset_type = typename Type::offset_type;
+  using Base::Base;
+  static bool Find(const uint8_t* begin, const uint8_t* end,
+                   const uint8_t** separator_begin, const uint8_t** separator_end,
+                   const SplitOptions& options) {
+    const uint8_t* i = begin;
+    while ((i < end)) {
+      if (IsSpaceCharacterAscii(*i)) {
+        *separator_begin = i;
+        do {
+          i++;
+        } while (IsSpaceCharacterAscii(*i) && i < end);
+        *separator_end = i;
+        return true;
+      }
+      i++;
+    }
+    return false;
+  }
+  static bool FindReverse(const uint8_t* begin, const uint8_t* end,
+                          const uint8_t** separator_begin, const uint8_t** separator_end,
+                          const SplitOptions& options) {
+    const uint8_t* i = end - 1;
+    while ((i >= begin)) {
+      if (IsSpaceCharacterAscii(*i)) {
+        *separator_end = i + 1;
+        do {
+          i--;
+        } while (IsSpaceCharacterAscii(*i) && i >= begin);
+        *separator_begin = i + 1;
+        return true;
+      }
+      i--;
+    }
+    return false;
+  }
+};
+
+void AddSplitWhitespaceAscii(FunctionRegistry* registry) {
+  static const SplitOptions default_options{};
+  auto func =
+      std::make_shared<ScalarFunction>("ascii_split_whitespace", Arity::Unary(),
+                                       &ascii_split_whitespace_doc, &default_options);
+  using t32 = SplitWhitespaceAsciiTransform<StringType, ListType>;
+  using t64 = SplitWhitespaceAsciiTransform<LargeStringType, ListType>;
+  DCHECK_OK(func->AddKernel({utf8()}, {list(utf8())}, t32::Exec, t32::State::Init));
+  DCHECK_OK(
+      func->AddKernel({large_utf8()}, {list(large_utf8())}, t64::Exec, t64::State::Init));
+  DCHECK_OK(registry->AddFunction(std::move(func)));
+}
+
+#ifdef ARROW_WITH_UTF8PROC
+template <typename Type, typename ListType>
+struct SplitWhitespaceUtf8Transform
+    : SplitBaseTransform<Type, ListType, SplitOptions,
+                         SplitWhitespaceUtf8Transform<Type, ListType>> {
+  using Base = SplitBaseTransform<Type, ListType, SplitOptions,
+                                  SplitWhitespaceUtf8Transform<Type, ListType>>;
+  using ArrayType = typename TypeTraits<Type>::ArrayType;
+  using string_offset_type = typename Type::offset_type;
+  using ScalarType = typename TypeTraits<Type>::ScalarType;
+  using Base::Base;
+  static bool Find(const uint8_t* begin, const uint8_t* end,
+                   const uint8_t** separator_begin, const uint8_t** separator_end,
+                   const SplitOptions& options) {
+    const uint8_t* i = begin;
+    while ((i < end)) {
+      uint32_t codepoint = 0;
+      *separator_begin = i;
+      if (ARROW_PREDICT_FALSE(!arrow::util::UTF8Decode(&i, &codepoint))) {
+        return false;
+      }
+      if (IsSpaceCharacterUnicode(codepoint)) {
+        do {
+          *separator_end = i;
+          if (ARROW_PREDICT_FALSE(!arrow::util::UTF8Decode(&i, &codepoint))) {
+            return false;
+          }
+        } while (IsSpaceCharacterUnicode(codepoint) && i < end);
+        return true;
+      }
+    }
+    return false;
+  }
+  static bool FindReverse(const uint8_t* begin, const uint8_t* end,
+                          const uint8_t** separator_begin, const uint8_t** separator_end,
+                          const SplitOptions& options) {
+    const uint8_t* i = end - 1;
+    while ((i >= begin)) {
+      uint32_t codepoint = 0;
+      *separator_end = i + 1;
+      if (ARROW_PREDICT_FALSE(!arrow::util::UTF8DecodeReverse(&i, &codepoint))) {
+        return false;
+      }
+      if (IsSpaceCharacterUnicode(codepoint)) {
+        do {
+          *separator_begin = i + 1;
+          if (ARROW_PREDICT_FALSE(!arrow::util::UTF8DecodeReverse(&i, &codepoint))) {
+            return false;
+          }
+        } while (IsSpaceCharacterUnicode(codepoint) && i >= begin);
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+void AddSplitWhitespaceUTF8(FunctionRegistry* registry) {
+  static const SplitOptions default_options{};
+  auto func =
+      std::make_shared<ScalarFunction>("utf8_split_whitespace", Arity::Unary(),
+                                       &utf8_split_whitespace_doc, &default_options);
+  using t32 = SplitWhitespaceUtf8Transform<StringType, ListType>;
+  using t64 = SplitWhitespaceUtf8Transform<LargeStringType, ListType>;
+  DCHECK_OK(func->AddKernel({utf8()}, {list(utf8())}, t32::Exec, t32::State::Init));
+  DCHECK_OK(
+      func->AddKernel({large_utf8()}, {list(large_utf8())}, t64::Exec, t64::State::Init));
+  DCHECK_OK(registry->AddFunction(std::move(func)));
+}
+#endif
+
+void AddSplit(FunctionRegistry* registry) {
+  AddSplitPattern(registry);
+  AddSplitWhitespaceAscii(registry);
+#ifdef ARROW_WITH_UTF8PROC
+  AddSplitWhitespaceUTF8(registry);
+#endif
+}
+
 // ----------------------------------------------------------------------
 // strptime string parsing
 
@@ -822,7 +1227,9 @@ struct ParseStrptime {
   int64_t Call(KernelContext* ctx, util::string_view val) const {
     int64_t result = 0;
     if (!(*parser)(val.data(), val.size(), unit, &result)) {
-      ctx->SetStatus(Status::Invalid("Failed to parse string ", val));
+      ctx->SetStatus(Status::Invalid("Failed to parse string: '", val,
+                                     "' as a scalar of type ",
+                                     TimestampType(unit).ToString()));
     }
     return result;
   }
@@ -846,8 +1253,327 @@ Result<ValueDescr> StrptimeResolve(KernelContext* ctx, const std::vector<ValueDe
   return Status::Invalid("strptime does not provide default StrptimeOptions");
 }
 
+#ifdef ARROW_WITH_UTF8PROC
+
+template <typename Type, bool left, bool right, typename Derived>
+struct UTF8TrimWhitespaceBase : StringTransform<Type, Derived> {
+  using Base = StringTransform<Type, Derived>;
+  using offset_type = typename Base::offset_type;
+  bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
+                 uint8_t* output, offset_type* output_written) {
+    const uint8_t* begin = input;
+    const uint8_t* end = input + input_string_ncodeunits;
+    const uint8_t* end_trimmed = end;
+    const uint8_t* begin_trimmed = begin;
+
+    auto predicate = [](uint32_t c) { return !IsSpaceCharacterUnicode(c); };
+    if (left && !ARROW_PREDICT_TRUE(
+                    arrow::util::UTF8FindIf(begin, end, predicate, &begin_trimmed))) {
+      return false;
+    }
+    if (right && (begin_trimmed < end)) {
+      if (!ARROW_PREDICT_TRUE(arrow::util::UTF8FindIfReverse(begin_trimmed, end,
+                                                             predicate, &end_trimmed))) {
+        return false;
+      }
+    }
+    std::copy(begin_trimmed, end_trimmed, output);
+    *output_written = static_cast<offset_type>(end_trimmed - begin_trimmed);
+    return true;
+  }
+  void Execute(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    EnsureLookupTablesFilled();
+    Base::Execute(ctx, batch, out);
+  }
+};
+
+template <typename Type>
+struct UTF8TrimWhitespace
+    : UTF8TrimWhitespaceBase<Type, true, true, UTF8TrimWhitespace<Type>> {};
+
+template <typename Type>
+struct UTF8LTrimWhitespace
+    : UTF8TrimWhitespaceBase<Type, true, false, UTF8LTrimWhitespace<Type>> {};
+
+template <typename Type>
+struct UTF8RTrimWhitespace
+    : UTF8TrimWhitespaceBase<Type, false, true, UTF8RTrimWhitespace<Type>> {};
+
+struct TrimStateUTF8 {
+  TrimOptions options_;
+  std::vector<bool> codepoints_;
+  explicit TrimStateUTF8(KernelContext* ctx, TrimOptions options)
+      : options_(std::move(options)) {
+    if (!ARROW_PREDICT_TRUE(
+            arrow::util::UTF8ForEach(options_.characters, [&](uint32_t c) {
+              codepoints_.resize(
+                  std::max(c + 1, static_cast<uint32_t>(codepoints_.size())));
+              codepoints_.at(c) = true;
+            }))) {
+      ctx->SetStatus(Status::Invalid("Invalid UTF8 sequence in input"));
+    }
+  }
+};
+
+template <typename Type, bool left, bool right, typename Derived>
+struct UTF8TrimBase : StringTransform<Type, Derived> {
+  using Base = StringTransform<Type, Derived>;
+  using offset_type = typename Base::offset_type;
+  using State = KernelStateFromFunctionOptions<TrimStateUTF8, TrimOptions>;
+  TrimStateUTF8 state_;
+
+  explicit UTF8TrimBase(TrimStateUTF8 state) : state_(std::move(state)) {}
+
+  static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    TrimStateUTF8 state = State::Get(ctx);
+    Derived(state).Execute(ctx, batch, out);
+  }
+
+  void Execute(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    EnsureLookupTablesFilled();
+    Base::Execute(ctx, batch, out);
+  }
+
+  bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
+                 uint8_t* output, offset_type* output_written) {
+    const uint8_t* begin = input;
+    const uint8_t* end = input + input_string_ncodeunits;
+    const uint8_t* end_trimmed = end;
+    const uint8_t* begin_trimmed = begin;
+
+    auto predicate = [&](uint32_t c) {
+      bool contains = state_.codepoints_[c];
+      return !contains;
+    };
+    if (left && !ARROW_PREDICT_TRUE(
+                    arrow::util::UTF8FindIf(begin, end, predicate, &begin_trimmed))) {
+      return false;
+    }
+    if (right && (begin_trimmed < end)) {
+      if (!ARROW_PREDICT_TRUE(arrow::util::UTF8FindIfReverse(begin_trimmed, end,
+                                                             predicate, &end_trimmed))) {
+        return false;
+      }
+    }
+    std::copy(begin_trimmed, end_trimmed, output);
+    *output_written = static_cast<offset_type>(end_trimmed - begin_trimmed);
+    return true;
+  }
+};
+template <typename Type>
+struct UTF8Trim : UTF8TrimBase<Type, true, true, UTF8Trim<Type>> {
+  using Base = UTF8TrimBase<Type, true, true, UTF8Trim<Type>>;
+  using Base::Base;
+};
+
+template <typename Type>
+struct UTF8LTrim : UTF8TrimBase<Type, true, false, UTF8LTrim<Type>> {
+  using Base = UTF8TrimBase<Type, true, false, UTF8LTrim<Type>>;
+  using Base::Base;
+};
+
+template <typename Type>
+struct UTF8RTrim : UTF8TrimBase<Type, false, true, UTF8RTrim<Type>> {
+  using Base = UTF8TrimBase<Type, false, true, UTF8RTrim<Type>>;
+  using Base::Base;
+};
+
+#endif
+
+template <typename Type, bool left, bool right, typename Derived>
+struct AsciiTrimWhitespaceBase : StringTransform<Type, Derived> {
+  using offset_type = typename Type::offset_type;
+  bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
+                 uint8_t* output, offset_type* output_written) {
+    const uint8_t* begin = input;
+    const uint8_t* end = input + input_string_ncodeunits;
+    const uint8_t* end_trimmed = end;
+
+    auto predicate = [](unsigned char c) { return !IsSpaceCharacterAscii(c); };
+    const uint8_t* begin_trimmed = left ? std::find_if(begin, end, predicate) : begin;
+    if (right & (begin_trimmed < end)) {
+      std::reverse_iterator<const uint8_t*> rbegin(end);
+      std::reverse_iterator<const uint8_t*> rend(begin_trimmed);
+      end_trimmed = std::find_if(rbegin, rend, predicate).base();
+    }
+    std::copy(begin_trimmed, end_trimmed, output);
+    *output_written = static_cast<offset_type>(end_trimmed - begin_trimmed);
+    return true;
+  }
+};
+
+template <typename Type>
+struct AsciiTrimWhitespace
+    : AsciiTrimWhitespaceBase<Type, true, true, AsciiTrimWhitespace<Type>> {};
+
+template <typename Type>
+struct AsciiLTrimWhitespace
+    : AsciiTrimWhitespaceBase<Type, true, false, AsciiLTrimWhitespace<Type>> {};
+
+template <typename Type>
+struct AsciiRTrimWhitespace
+    : AsciiTrimWhitespaceBase<Type, false, true, AsciiRTrimWhitespace<Type>> {};
+
+template <typename Type, bool left, bool right, typename Derived>
+struct AsciiTrimBase : StringTransform<Type, Derived> {
+  using Base = StringTransform<Type, Derived>;
+  using offset_type = typename Base::offset_type;
+  using State = OptionsWrapper<TrimOptions>;
+  TrimOptions options_;
+  std::vector<bool> characters_;
+
+  explicit AsciiTrimBase(TrimOptions options)
+      : options_(std::move(options)), characters_(256) {
+    std::for_each(options_.characters.begin(), options_.characters.end(),
+                  [&](char c) { characters_[static_cast<unsigned char>(c)] = true; });
+  }
+
+  static void Exec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+    TrimOptions options = State::Get(ctx);
+    Derived(options).Execute(ctx, batch, out);
+  }
+
+  bool Transform(const uint8_t* input, offset_type input_string_ncodeunits,
+                 uint8_t* output, offset_type* output_written) {
+    const uint8_t* begin = input;
+    const uint8_t* end = input + input_string_ncodeunits;
+    const uint8_t* end_trimmed = end;
+    const uint8_t* begin_trimmed;
+
+    auto predicate = [&](unsigned char c) {
+      bool contains = characters_[c];
+      return !contains;
+    };
+
+    begin_trimmed = left ? std::find_if(begin, end, predicate) : begin;
+    if (right & (begin_trimmed < end)) {
+      std::reverse_iterator<const uint8_t*> rbegin(end);
+      std::reverse_iterator<const uint8_t*> rend(begin_trimmed);
+      end_trimmed = std::find_if(rbegin, rend, predicate).base();
+    }
+    std::copy(begin_trimmed, end_trimmed, output);
+    *output_written = static_cast<offset_type>(end_trimmed - begin_trimmed);
+    return true;
+  }
+};
+
+template <typename Type>
+struct AsciiTrim : AsciiTrimBase<Type, true, true, AsciiTrim<Type>> {
+  using Base = AsciiTrimBase<Type, true, true, AsciiTrim<Type>>;
+  using Base::Base;
+};
+
+template <typename Type>
+struct AsciiLTrim : AsciiTrimBase<Type, true, false, AsciiLTrim<Type>> {
+  using Base = AsciiTrimBase<Type, true, false, AsciiLTrim<Type>>;
+  using Base::Base;
+};
+
+template <typename Type>
+struct AsciiRTrim : AsciiTrimBase<Type, false, true, AsciiRTrim<Type>> {
+  using Base = AsciiTrimBase<Type, false, true, AsciiRTrim<Type>>;
+  using Base::Base;
+};
+
+const FunctionDoc utf8_trim_whitespace_doc(
+    "Trim leading and trailing whitespace characters",
+    ("For each string in `strings`, emit a string with leading and trailing whitespace\n"
+     "characters removed, where whitespace characters are defined by the Unicode\n"
+     "standard.  Null values emit null."),
+    {"strings"});
+
+const FunctionDoc utf8_ltrim_whitespace_doc(
+    "Trim leading whitespace characters",
+    ("For each string in `strings`, emit a string with leading whitespace\n"
+     "characters removed, where whitespace characters are defined by the Unicode\n"
+     "standard.  Null values emit null."),
+    {"strings"});
+
+const FunctionDoc utf8_rtrim_whitespace_doc(
+    "Trim trailing whitespace characters",
+    ("For each string in `strings`, emit a string with trailing whitespace\n"
+     "characters removed, where whitespace characters are defined by the Unicode\n"
+     "standard.  Null values emit null."),
+    {"strings"});
+
+const FunctionDoc ascii_trim_whitespace_doc(
+    "Trim leading and trailing ASCII whitespace characters",
+    ("For each string in `strings`, emit a string with leading and trailing ASCII\n"
+     "whitespace characters removed. Use `utf8_trim_whitespace` to trim Unicode\n"
+     "whitespace characters. Null values emit null."),
+    {"strings"});
+
+const FunctionDoc ascii_ltrim_whitespace_doc(
+    "Trim leading ASCII whitespace characters",
+    ("For each string in `strings`, emit a string with leading ASCII whitespace\n"
+     "characters removed.  Use `utf8_ltrim_whitespace` to trim leading Unicode\n"
+     "whitespace characters. Null values emit null."),
+    {"strings"});
+
+const FunctionDoc ascii_rtrim_whitespace_doc(
+    "Trim trailing ASCII whitespace characters",
+    ("For each string in `strings`, emit a string with trailing ASCII whitespace\n"
+     "characters removed. Use `utf8_rtrim_whitespace` to trim trailing Unicode\n"
+     "whitespace characters. Null values emit null."),
+    {"strings"});
+
+const FunctionDoc utf8_trim_doc(
+    "Trim leading and trailing characters present in the `characters` arguments",
+    ("For each string in `strings`, emit a string with leading and trailing\n"
+     "characters removed that are present in the `characters` argument.  Null values\n"
+     "emit null."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc utf8_ltrim_doc(
+    "Trim leading characters present in the `characters` arguments",
+    ("For each string in `strings`, emit a string with leading\n"
+     "characters removed that are present in the `characters` argument.  Null values\n"
+     "emit null."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc utf8_rtrim_doc(
+    "Trim trailing characters present in the `characters` arguments",
+    ("For each string in `strings`, emit a string with leading "
+     "characters removed that are present in the `characters` argument.  Null values\n"
+     "emit null."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc ascii_trim_doc(
+    utf8_trim_doc.summary + "",
+    utf8_trim_doc.description +
+        ("\nBoth the input string as the `characters` argument are interepreted as\n"
+         "ASCII characters, to trim non-ASCII characters, use `utf8_trim`."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc ascii_ltrim_doc(
+    utf8_ltrim_doc.summary + "",
+    utf8_ltrim_doc.description +
+        ("\nBoth the input string as the `characters` argument are interepreted as\n"
+         "ASCII characters, to trim non-ASCII characters, use `utf8_trim`."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc ascii_rtrim_doc(
+    utf8_rtrim_doc.summary + "",
+    utf8_rtrim_doc.description +
+        ("\nBoth the input string as the `characters` argument are interepreted as\n"
+         "ASCII characters, to trim non-ASCII characters, use `utf8_trim`."),
+    {"strings"}, "TrimOptions");
+
+const FunctionDoc strptime_doc(
+    "Parse timestamps",
+    ("For each string in `strings`, parse it as a timestamp.\n"
+     "The timestamp unit and the expected string pattern must be given\n"
+     "in StrptimeOptions.  Null inputs emit null.  If a non-null string\n"
+     "fails parsing, an error is returned."),
+    {"strings"}, "StrptimeOptions");
+
+const FunctionDoc binary_length_doc(
+    "Compute string lengths",
+    ("For each string in `strings`, emit its length.  Null values emit null."),
+    {"strings"});
+
 void AddStrptime(FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>("strptime", Arity::Unary());
+  auto func = std::make_shared<ScalarFunction>("strptime", Arity::Unary(), &strptime_doc);
   DCHECK_OK(func->AddKernel({utf8()}, OutputType(StrptimeResolve),
                             StrptimeExec<StringType>, StrptimeState::Init));
   DCHECK_OK(func->AddKernel({large_utf8()}, OutputType(StrptimeResolve),
@@ -856,7 +1582,8 @@ void AddStrptime(FunctionRegistry* registry) {
 }
 
 void AddBinaryLength(FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>("binary_length", Arity::Unary());
+  auto func = std::make_shared<ScalarFunction>("binary_length", Arity::Unary(),
+                                               &binary_length_doc);
   ArrayKernelExec exec_offset_32 =
       applicator::ScalarUnaryNotNull<Int32Type, StringType, BinaryLength>::Exec;
   ArrayKernelExec exec_offset_64 =
@@ -871,20 +1598,51 @@ void AddBinaryLength(FunctionRegistry* registry) {
 }
 
 template <template <typename> class ExecFunctor>
-void MakeUnaryStringBatchKernel(std::string name, FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary());
-  auto exec_32 = ExecFunctor<StringType>::Exec;
-  auto exec_64 = ExecFunctor<LargeStringType>::Exec;
-  DCHECK_OK(func->AddKernel({utf8()}, utf8(), exec_32));
-  DCHECK_OK(func->AddKernel({large_utf8()}, large_utf8(), exec_64));
+void MakeUnaryStringBatchKernel(
+    std::string name, FunctionRegistry* registry, const FunctionDoc* doc,
+    MemAllocation::type mem_allocation = MemAllocation::PREALLOCATE) {
+  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), doc);
+  {
+    auto exec_32 = ExecFunctor<StringType>::Exec;
+    ScalarKernel kernel{{utf8()}, utf8(), exec_32};
+    kernel.mem_allocation = mem_allocation;
+    DCHECK_OK(func->AddKernel(std::move(kernel)));
+  }
+  {
+    auto exec_64 = ExecFunctor<LargeStringType>::Exec;
+    ScalarKernel kernel{{large_utf8()}, large_utf8(), exec_64};
+    kernel.mem_allocation = mem_allocation;
+    DCHECK_OK(func->AddKernel(std::move(kernel)));
+  }
+  DCHECK_OK(registry->AddFunction(std::move(func)));
+}
+
+template <template <typename> class ExecFunctor>
+void MakeUnaryStringBatchKernelWithState(
+    std::string name, FunctionRegistry* registry, const FunctionDoc* doc,
+    MemAllocation::type mem_allocation = MemAllocation::PREALLOCATE) {
+  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), doc);
+  {
+    using t32 = ExecFunctor<StringType>;
+    ScalarKernel kernel{{utf8()}, utf8(), t32::Exec, t32::State::Init};
+    kernel.mem_allocation = mem_allocation;
+    DCHECK_OK(func->AddKernel(std::move(kernel)));
+  }
+  {
+    using t64 = ExecFunctor<LargeStringType>;
+    ScalarKernel kernel{{large_utf8()}, large_utf8(), t64::Exec, t64::State::Init};
+    kernel.mem_allocation = mem_allocation;
+    DCHECK_OK(func->AddKernel(std::move(kernel)));
+  }
   DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
 #ifdef ARROW_WITH_UTF8PROC
 
 template <template <typename> class Transformer>
-void MakeUnaryStringUTF8TransformKernel(std::string name, FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary());
+void MakeUnaryStringUTF8TransformKernel(std::string name, FunctionRegistry* registry,
+                                        const FunctionDoc* doc) {
+  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), doc);
   ArrayKernelExec exec_32 = Transformer<StringType>::Exec;
   ArrayKernelExec exec_64 = Transformer<LargeStringType>::Exec;
   DCHECK_OK(func->AddKernel({utf8()}, utf8(), exec_32));
@@ -925,8 +1683,9 @@ void ApplyPredicate(KernelContext* ctx, const ExecBatch& batch, StringPredicate 
 }
 
 template <typename Predicate>
-void AddUnaryStringPredicate(std::string name, FunctionRegistry* registry) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary());
+void AddUnaryStringPredicate(std::string name, FunctionRegistry* registry,
+                             const FunctionDoc* doc) {
+  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), doc);
   auto exec_32 = [](KernelContext* ctx, const ExecBatch& batch, Datum* out) {
     ApplyPredicate<StringType>(ctx, batch, Predicate::Call, out);
   };
@@ -938,41 +1697,174 @@ void AddUnaryStringPredicate(std::string name, FunctionRegistry* registry) {
   DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
+FunctionDoc StringPredicateDoc(std::string summary, std::string description) {
+  return FunctionDoc{std::move(summary), std::move(description), {"strings"}};
+}
+
+FunctionDoc StringClassifyDoc(std::string class_summary, std::string class_desc,
+                              bool non_empty) {
+  std::string summary, description;
+  {
+    std::stringstream ss;
+    ss << "Classify strings as " << class_summary;
+    summary = ss.str();
+  }
+  {
+    std::stringstream ss;
+    if (non_empty) {
+      ss
+          << ("For each string in `strings`, emit true iff the string is non-empty\n"
+              "and consists only of ");
+    } else {
+      ss
+          << ("For each string in `strings`, emit true iff the string consists only\n"
+              "of ");
+    }
+    ss << class_desc << ".  Null strings emit null.";
+    description = ss.str();
+  }
+  return StringPredicateDoc(std::move(summary), std::move(description));
+}
+
+const auto string_is_ascii_doc = StringClassifyDoc("ASCII", "ASCII characters", false);
+
+const auto ascii_is_alnum_doc =
+    StringClassifyDoc("ASCII alphanumeric", "alphanumeric ASCII characters", true);
+const auto ascii_is_alpha_doc =
+    StringClassifyDoc("ASCII alphabetic", "alphabetic ASCII characters", true);
+const auto ascii_is_decimal_doc =
+    StringClassifyDoc("ASCII decimal", "decimal ASCII characters", true);
+const auto ascii_is_lower_doc =
+    StringClassifyDoc("ASCII lowercase", "lowercase ASCII characters", true);
+const auto ascii_is_printable_doc =
+    StringClassifyDoc("ASCII printable", "printable ASCII characters", true);
+const auto ascii_is_space_doc =
+    StringClassifyDoc("ASCII whitespace", "whitespace ASCII characters", true);
+const auto ascii_is_upper_doc =
+    StringClassifyDoc("ASCII uppercase", "uppercase ASCII characters", true);
+
+const auto ascii_is_title_doc = StringPredicateDoc(
+    "Classify strings as ASCII titlecase",
+    ("For each string in `strings`, emit true iff the string is title-cased,\n"
+     "i.e. it has at least one cased character, each uppercase character\n"
+     "follows a non-cased character, and each lowercase character follows\n"
+     "an uppercase character.\n"));
+
+const auto utf8_is_alnum_doc =
+    StringClassifyDoc("alphanumeric", "alphanumeric Unicode characters", true);
+const auto utf8_is_alpha_doc =
+    StringClassifyDoc("alphabetic", "alphabetic Unicode characters", true);
+const auto utf8_is_decimal_doc =
+    StringClassifyDoc("decimal", "decimal Unicode characters", true);
+const auto utf8_is_digit_doc = StringClassifyDoc("digits", "Unicode digits", true);
+const auto utf8_is_lower_doc =
+    StringClassifyDoc("lowercase", "lowercase Unicode characters", true);
+const auto utf8_is_numeric_doc =
+    StringClassifyDoc("numeric", "numeric Unicode characters", true);
+const auto utf8_is_printable_doc =
+    StringClassifyDoc("printable", "printable Unicode characters", true);
+const auto utf8_is_space_doc =
+    StringClassifyDoc("whitespace", "whitespace Unicode characters", true);
+const auto utf8_is_upper_doc =
+    StringClassifyDoc("uppercase", "uppercase Unicode characters", true);
+
+const auto utf8_is_title_doc = StringPredicateDoc(
+    "Classify strings as titlecase",
+    ("For each string in `strings`, emit true iff the string is title-cased,\n"
+     "i.e. it has at least one cased character, each uppercase character\n"
+     "follows a non-cased character, and each lowercase character follows\n"
+     "an uppercase character.\n"));
+
+const FunctionDoc ascii_upper_doc(
+    "Transform ASCII input to uppercase",
+    ("For each string in `strings`, return an uppercase version.\n\n"
+     "This function assumes the input is fully ASCII.  It it may contain\n"
+     "non-ASCII characters, use \"utf8_upper\" instead."),
+    {"strings"});
+
+const FunctionDoc ascii_lower_doc(
+    "Transform ASCII input to lowercase",
+    ("For each string in `strings`, return a lowercase version.\n\n"
+     "This function assumes the input is fully ASCII.  It it may contain\n"
+     "non-ASCII characters, use \"utf8_lower\" instead."),
+    {"strings"});
+
+const FunctionDoc utf8_upper_doc(
+    "Transform input to uppercase",
+    ("For each string in `strings`, return an uppercase version."), {"strings"});
+
+const FunctionDoc utf8_lower_doc(
+    "Transform input to lowercase",
+    ("For each string in `strings`, return a lowercase version."), {"strings"});
+
 }  // namespace
 
 void RegisterScalarStringAscii(FunctionRegistry* registry) {
-  MakeUnaryStringBatchKernel<AsciiUpper>("ascii_upper", registry);
-  MakeUnaryStringBatchKernel<AsciiLower>("ascii_lower", registry);
+  // ascii_upper and ascii_lower are able to reuse the original offsets buffer,
+  // so don't preallocate them in the output.
+  MakeUnaryStringBatchKernel<AsciiUpper>("ascii_upper", registry, &ascii_upper_doc,
+                                         MemAllocation::NO_PREALLOCATE);
+  MakeUnaryStringBatchKernel<AsciiLower>("ascii_lower", registry, &ascii_lower_doc,
+                                         MemAllocation::NO_PREALLOCATE);
+  MakeUnaryStringBatchKernel<AsciiTrimWhitespace>("ascii_trim_whitespace", registry,
+                                                  &ascii_trim_whitespace_doc);
+  MakeUnaryStringBatchKernel<AsciiLTrimWhitespace>("ascii_ltrim_whitespace", registry,
+                                                   &ascii_ltrim_whitespace_doc);
+  MakeUnaryStringBatchKernel<AsciiRTrimWhitespace>("ascii_rtrim_whitespace", registry,
+                                                   &ascii_rtrim_whitespace_doc);
+  MakeUnaryStringBatchKernelWithState<AsciiTrim>("ascii_trim", registry,
+                                                 &ascii_lower_doc);
+  MakeUnaryStringBatchKernelWithState<AsciiLTrim>("ascii_ltrim", registry,
+                                                  &ascii_lower_doc);
+  MakeUnaryStringBatchKernelWithState<AsciiRTrim>("ascii_rtrim", registry,
+                                                  &ascii_lower_doc);
 
-  AddUnaryStringPredicate<IsAscii>("string_is_ascii", registry);
+  AddUnaryStringPredicate<IsAscii>("string_is_ascii", registry, &string_is_ascii_doc);
 
-  AddUnaryStringPredicate<IsAlphaNumericAscii>("ascii_is_alnum", registry);
-  AddUnaryStringPredicate<IsAlphaAscii>("ascii_is_alpha", registry);
-  AddUnaryStringPredicate<IsDecimalAscii>("ascii_is_decimal", registry);
+  AddUnaryStringPredicate<IsAlphaNumericAscii>("ascii_is_alnum", registry,
+                                               &ascii_is_alnum_doc);
+  AddUnaryStringPredicate<IsAlphaAscii>("ascii_is_alpha", registry, &ascii_is_alpha_doc);
+  AddUnaryStringPredicate<IsDecimalAscii>("ascii_is_decimal", registry,
+                                          &ascii_is_decimal_doc);
   // no is_digit for ascii, since it is the same as is_decimal
-  AddUnaryStringPredicate<IsLowerAscii>("ascii_is_lower", registry);
+  AddUnaryStringPredicate<IsLowerAscii>("ascii_is_lower", registry, &ascii_is_lower_doc);
   // no is_numeric for ascii, since it is the same as is_decimal
-  AddUnaryStringPredicate<IsPrintableAscii>("ascii_is_printable", registry);
-  AddUnaryStringPredicate<IsSpaceAscii>("ascii_is_space", registry);
-  AddUnaryStringPredicate<IsTitleAscii>("ascii_is_title", registry);
-  AddUnaryStringPredicate<IsUpperAscii>("ascii_is_upper", registry);
+  AddUnaryStringPredicate<IsPrintableAscii>("ascii_is_printable", registry,
+                                            &ascii_is_printable_doc);
+  AddUnaryStringPredicate<IsSpaceAscii>("ascii_is_space", registry, &ascii_is_space_doc);
+  AddUnaryStringPredicate<IsTitleAscii>("ascii_is_title", registry, &ascii_is_title_doc);
+  AddUnaryStringPredicate<IsUpperAscii>("ascii_is_upper", registry, &ascii_is_upper_doc);
 
 #ifdef ARROW_WITH_UTF8PROC
-  MakeUnaryStringUTF8TransformKernel<UTF8Upper>("utf8_upper", registry);
-  MakeUnaryStringUTF8TransformKernel<UTF8Lower>("utf8_lower", registry);
+  MakeUnaryStringUTF8TransformKernel<UTF8Upper>("utf8_upper", registry, &utf8_upper_doc);
+  MakeUnaryStringUTF8TransformKernel<UTF8Lower>("utf8_lower", registry, &utf8_lower_doc);
+  MakeUnaryStringBatchKernel<UTF8TrimWhitespace>("utf8_trim_whitespace", registry,
+                                                 &utf8_trim_whitespace_doc);
+  MakeUnaryStringBatchKernel<UTF8LTrimWhitespace>("utf8_ltrim_whitespace", registry,
+                                                  &utf8_ltrim_whitespace_doc);
+  MakeUnaryStringBatchKernel<UTF8RTrimWhitespace>("utf8_rtrim_whitespace", registry,
+                                                  &utf8_rtrim_whitespace_doc);
+  MakeUnaryStringBatchKernelWithState<UTF8Trim>("utf8_trim", registry, &utf8_trim_doc);
+  MakeUnaryStringBatchKernelWithState<UTF8LTrim>("utf8_ltrim", registry, &utf8_ltrim_doc);
+  MakeUnaryStringBatchKernelWithState<UTF8RTrim>("utf8_rtrim", registry, &utf8_rtrim_doc);
 
-  AddUnaryStringPredicate<IsAlphaNumericUnicode>("utf8_is_alnum", registry);
-  AddUnaryStringPredicate<IsAlphaUnicode>("utf8_is_alpha", registry);
-  AddUnaryStringPredicate<IsDecimalUnicode>("utf8_is_decimal", registry);
-  AddUnaryStringPredicate<IsDigitUnicode>("utf8_is_digit", registry);
-  AddUnaryStringPredicate<IsLowerUnicode>("utf8_is_lower", registry);
-  AddUnaryStringPredicate<IsNumericUnicode>("utf8_is_numeric", registry);
-  AddUnaryStringPredicate<IsPrintableUnicode>("utf8_is_printable", registry);
-  AddUnaryStringPredicate<IsSpaceUnicode>("utf8_is_space", registry);
-  AddUnaryStringPredicate<IsTitleUnicode>("utf8_is_title", registry);
-  AddUnaryStringPredicate<IsUpperUnicode>("utf8_is_upper", registry);
+  AddUnaryStringPredicate<IsAlphaNumericUnicode>("utf8_is_alnum", registry,
+                                                 &utf8_is_alnum_doc);
+  AddUnaryStringPredicate<IsAlphaUnicode>("utf8_is_alpha", registry, &utf8_is_alpha_doc);
+  AddUnaryStringPredicate<IsDecimalUnicode>("utf8_is_decimal", registry,
+                                            &utf8_is_decimal_doc);
+  AddUnaryStringPredicate<IsDigitUnicode>("utf8_is_digit", registry, &utf8_is_digit_doc);
+  AddUnaryStringPredicate<IsLowerUnicode>("utf8_is_lower", registry, &utf8_is_lower_doc);
+  AddUnaryStringPredicate<IsNumericUnicode>("utf8_is_numeric", registry,
+                                            &utf8_is_numeric_doc);
+  AddUnaryStringPredicate<IsPrintableUnicode>("utf8_is_printable", registry,
+                                              &utf8_is_printable_doc);
+  AddUnaryStringPredicate<IsSpaceUnicode>("utf8_is_space", registry, &utf8_is_space_doc);
+  AddUnaryStringPredicate<IsTitleUnicode>("utf8_is_title", registry, &utf8_is_title_doc);
+  AddUnaryStringPredicate<IsUpperUnicode>("utf8_is_upper", registry, &utf8_is_upper_doc);
 #endif
 
+  AddSplit(registry);
   AddBinaryLength(registry);
   AddMatchSubstring(registry);
   AddStrptime(registry);

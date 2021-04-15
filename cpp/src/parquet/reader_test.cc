@@ -28,6 +28,7 @@
 #include "arrow/io/file.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
+#include "arrow/util/checked_cast.h"
 
 #include "parquet/column_reader.h"
 #include "parquet/column_scanner.h"
@@ -38,8 +39,9 @@
 #include "parquet/printer.h"
 #include "parquet/test_util.h"
 
-namespace parquet {
+using arrow::internal::checked_pointer_cast;
 
+namespace parquet {
 using schema::GroupNode;
 using schema::PrimitiveNode;
 
@@ -56,6 +58,36 @@ std::string alltypes_plain() { return data_file("alltypes_plain.parquet"); }
 
 std::string nation_dict_truncated_data_page() {
   return data_file("nation.dict-malformed.parquet");
+}
+
+// Compressed using custom Hadoop LZ4 format (block LZ4 format + custom header)
+std::string hadoop_lz4_compressed() { return data_file("hadoop_lz4_compressed.parquet"); }
+
+// Compressed using block LZ4 format
+std::string non_hadoop_lz4_compressed() {
+  return data_file("non_hadoop_lz4_compressed.parquet");
+}
+
+// Larger data compressed using custom Hadoop LZ4 format (several frames)
+std::string hadoop_lz4_compressed_larger() {
+  return data_file("hadoop_lz4_compressed_larger.parquet");
+}
+
+// TODO: Assert on definition and repetition levels
+template <typename DType, typename ValueType>
+void AssertColumnValues(std::shared_ptr<TypedColumnReader<DType>> col, int64_t batch_size,
+                        int64_t expected_levels_read,
+                        std::vector<ValueType>& expected_values,
+                        int64_t expected_values_read) {
+  std::vector<ValueType> values(batch_size);
+  int64_t values_read;
+
+  auto levels_read =
+      col->ReadBatch(batch_size, nullptr, nullptr, values.data(), &values_read);
+  ASSERT_EQ(expected_levels_read, levels_read);
+
+  ASSERT_EQ(expected_values, values);
+  ASSERT_EQ(expected_values_read, values_read);
 }
 
 class TestAllTypesPlain : public ::testing::Test {
@@ -423,22 +455,22 @@ TEST(TestFileReader, BufferedReads) {
   std::shared_ptr<WriterProperties> writer_props =
       WriterProperties::Builder().write_batch_size(64)->data_pagesize(128)->build();
 
-  ASSERT_OK_AND_ASSIGN(auto out_file, arrow::io::BufferOutputStream::Create());
+  ASSERT_OK_AND_ASSIGN(auto out_file, ::arrow::io::BufferOutputStream::Create());
   std::shared_ptr<ParquetFileWriter> file_writer =
       ParquetFileWriter::Open(out_file, schema, writer_props);
 
   RowGroupWriter* rg_writer = file_writer->AppendRowGroup();
 
-  std::vector<std::shared_ptr<arrow::Array>> column_data;
+  ::arrow::ArrayVector column_data;
   ::arrow::random::RandomArrayGenerator rag(0);
 
   // Scratch space for reads
-  std::vector<std::shared_ptr<Buffer>> scratch_space;
+  ::arrow::BufferVector scratch_space;
 
   // write columns
   for (int col_index = 0; col_index < num_columns; ++col_index) {
     DoubleWriter* writer = static_cast<DoubleWriter*>(rg_writer->NextColumn());
-    std::shared_ptr<arrow::Array> col = rag.Float64(num_rows, 0, 100);
+    std::shared_ptr<::arrow::Array> col = rag.Float64(num_rows, 0, 100);
     const auto& col_typed = static_cast<const ::arrow::DoubleArray&>(*col);
     writer->WriteBatch(num_rows, nullptr, nullptr, col_typed.raw_values());
     column_data.push_back(col);
@@ -452,7 +484,7 @@ TEST(TestFileReader, BufferedReads) {
 
   // Open the reader
   ASSERT_OK_AND_ASSIGN(auto file_buf, out_file->Finish());
-  auto in_file = std::make_shared<arrow::io::BufferReader>(file_buf);
+  auto in_file = std::make_shared<::arrow::io::BufferReader>(file_buf);
 
   ReaderProperties reader_props;
   reader_props.enable_buffered_stream();
@@ -486,5 +518,73 @@ TEST(TestFileReader, BufferedReads) {
         scratch_space[col_index]->Equals(*column_data[col_index]->data()->buffers[1]));
   }
 }
+
+class TestCodec : public ::testing::TestWithParam<std::string> {
+ protected:
+  const std::string& GetDataFile() { return GetParam(); }
+};
+
+TEST_P(TestCodec, FileMetadataAndValues) {
+  std::unique_ptr<ParquetFileReader> reader_ = ParquetFileReader::OpenFile(GetDataFile());
+  std::shared_ptr<RowGroupReader> group = reader_->RowGroup(0);
+
+  // This file only has 4 rows
+  ASSERT_EQ(4, reader_->metadata()->num_rows());
+  // This file only has 3 columns
+  ASSERT_EQ(3, reader_->metadata()->num_columns());
+  // This file only has 1 row group
+  ASSERT_EQ(1, reader_->metadata()->num_row_groups());
+  // This row group must have 4 rows
+  ASSERT_EQ(4, group->metadata()->num_rows());
+
+  // column 0, c0
+  auto col0 = checked_pointer_cast<Int64Reader>(group->Column(0));
+  std::vector<int64_t> expected_values = {1593604800, 1593604800, 1593604801, 1593604801};
+  AssertColumnValues(col0, 4, 4, expected_values, 4);
+
+  // column 1, c1
+  std::vector<ByteArray> expected_byte_arrays = {ByteArray("abc"), ByteArray("def"),
+                                                 ByteArray("abc"), ByteArray("def")};
+  auto col1 = checked_pointer_cast<ByteArrayReader>(group->Column(1));
+  AssertColumnValues(col1, 4, 4, expected_byte_arrays, 4);
+
+  // column 2, v11
+  std::vector<double> expected_double_values = {42.0, 7.7, 42.125, 7.7};
+  auto col2 = checked_pointer_cast<DoubleReader>(group->Column(2));
+  AssertColumnValues(col2, 4, 4, expected_double_values, 4);
+}
+
+#ifdef ARROW_WITH_LZ4
+INSTANTIATE_TEST_SUITE_P(Lz4CodecTests, TestCodec,
+                         ::testing::Values(hadoop_lz4_compressed(),
+                                           non_hadoop_lz4_compressed()));
+
+TEST(TestLz4HadoopCodec, TestSeveralFrames) {
+  // ARROW-9177: Hadoop can compress a data block in several LZ4 "frames"
+  auto file = ParquetFileReader::OpenFile(hadoop_lz4_compressed_larger());
+  auto group = file->RowGroup(0);
+
+  const int64_t kNumRows = 10000;
+
+  ASSERT_EQ(kNumRows, file->metadata()->num_rows());
+  ASSERT_EQ(1, file->metadata()->num_columns());
+  ASSERT_EQ(1, file->metadata()->num_row_groups());
+  ASSERT_EQ(kNumRows, group->metadata()->num_rows());
+
+  // column 0 ("a")
+  auto col = checked_pointer_cast<ByteArrayReader>(group->Column(0));
+
+  std::vector<ByteArray> values(kNumRows);
+  int64_t values_read;
+  auto levels_read =
+      col->ReadBatch(kNumRows, nullptr, nullptr, values.data(), &values_read);
+  ASSERT_EQ(kNumRows, levels_read);
+  ASSERT_EQ(kNumRows, values_read);
+  ASSERT_EQ(values[0], ByteArray("c7ce6bef-d5b0-4863-b199-8ea8c7fb117b"));
+  ASSERT_EQ(values[1], ByteArray("e8fb9197-cb9f-4118-b67f-fbfa65f61843"));
+  ASSERT_EQ(values[kNumRows - 2], ByteArray("ab52a0cc-c6bb-4d61-8a8f-166dc4b8b13c"));
+  ASSERT_EQ(values[kNumRows - 1], ByteArray("85440778-460a-41ac-aa2e-ac3ee41696bf"));
+}
+#endif
 
 }  // namespace parquet

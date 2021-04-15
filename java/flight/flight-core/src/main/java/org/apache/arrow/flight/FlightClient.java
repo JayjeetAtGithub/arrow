@@ -22,6 +22,7 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -33,7 +34,12 @@ import org.apache.arrow.flight.auth.BasicClientAuthHandler;
 import org.apache.arrow.flight.auth.ClientAuthHandler;
 import org.apache.arrow.flight.auth.ClientAuthInterceptor;
 import org.apache.arrow.flight.auth.ClientAuthWrapper;
+import org.apache.arrow.flight.auth2.BasicAuthCredentialWriter;
+import org.apache.arrow.flight.auth2.ClientBearerHeaderHandler;
+import org.apache.arrow.flight.auth2.ClientHandshakeWrapper;
+import org.apache.arrow.flight.auth2.ClientIncomingAuthHeaderMiddleware;
 import org.apache.arrow.flight.grpc.ClientInterceptorAdapter;
+import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.flight.grpc.StatusUtils;
 import org.apache.arrow.flight.impl.Flight;
 import org.apache.arrow.flight.impl.Flight.Empty;
@@ -62,6 +68,7 @@ import io.grpc.stub.StreamObserver;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 /**
  * Client for Flight services.
@@ -79,6 +86,7 @@ public class FlightClient implements AutoCloseable {
   private final MethodDescriptor<Flight.Ticket, ArrowMessage> doGetDescriptor;
   private final MethodDescriptor<ArrowMessage, Flight.PutResult> doPutDescriptor;
   private final MethodDescriptor<ArrowMessage, ArrowMessage> doExchangeDescriptor;
+  private final List<FlightClientMiddleware.Factory> middleware;
 
   /**
    * Create a Flight client from an allocator and a gRPC channel.
@@ -87,6 +95,7 @@ public class FlightClient implements AutoCloseable {
       List<FlightClientMiddleware.Factory> middleware) {
     this.allocator = incomingAllocator.newChildAllocator("flight-client", 0, Long.MAX_VALUE);
     this.channel = channel;
+    this.middleware = middleware;
 
     final ClientInterceptor[] interceptors;
     interceptors = new ClientInterceptor[]{authInterceptor, new ClientInterceptorAdapter(middleware)};
@@ -173,6 +182,32 @@ public class FlightClient implements AutoCloseable {
     Preconditions.checkArgument(!authInterceptor.hasAuthHandler(), "Auth already completed.");
     ClientAuthWrapper.doClientAuth(handler, CallOptions.wrapStub(asyncStub, options));
     authInterceptor.setAuthHandler(handler);
+  }
+
+  /**
+   * Authenticates with a username and password.
+   *
+   * @param username the username.
+   * @param password the password.
+   * @return a CredentialCallOption containing a bearer token if the server emitted one, or
+   *     empty if no bearer token was returned. This can be used in subsequent API calls.
+   */
+  public Optional<CredentialCallOption> authenticateBasicToken(String username, String password) {
+    final ClientIncomingAuthHeaderMiddleware.Factory clientAuthMiddleware =
+            new ClientIncomingAuthHeaderMiddleware.Factory(new ClientBearerHeaderHandler());
+    middleware.add(clientAuthMiddleware);
+    handshake(new CredentialCallOption(new BasicAuthCredentialWriter(username, password)));
+
+    return Optional.ofNullable(clientAuthMiddleware.getCredentialCallOption());
+  }
+
+  /**
+   * Executes the handshake against the Flight service.
+   *
+   * @param options RPC-layer hints for this call.
+   */
+  public void handshake(CallOption... options) {
+    ClientHandshakeWrapper.doClientHandshake(CallOptions.wrapStub(asyncStub, options));
   }
 
   /**
@@ -321,7 +356,7 @@ public class FlightClient implements AutoCloseable {
       final ClientCallStreamObserver<ArrowMessage> observer = (ClientCallStreamObserver<ArrowMessage>)
               ClientCalls.asyncBidiStreamingCall(call, stream.asObserver());
       final ClientStreamListener writer = new PutObserver(
-          descriptor, observer, stream.completed::isDone,
+          descriptor, observer, stream.cancelled::isDone,
           () -> {
             try {
               stream.completed.get();
@@ -380,6 +415,9 @@ public class FlightClient implements AutoCloseable {
     }
   }
 
+  /**
+   * A stream observer for Flight.PutResult
+   */
   private static class SetStreamObserver implements StreamObserver<Flight.PutResult> {
     private final BufferAllocator allocator;
     private final StreamListener<PutResult> listener;
@@ -523,7 +561,6 @@ public class FlightClient implements AutoCloseable {
    * A builder for Flight clients.
    */
   public static final class Builder {
-
     private BufferAllocator allocator;
     private Location location;
     private boolean forceTls = false;
@@ -533,6 +570,7 @@ public class FlightClient implements AutoCloseable {
     private InputStream clientKey = null;
     private String overrideHostname = null;
     private List<FlightClientMiddleware.Factory> middleware = new ArrayList<>();
+    private boolean verifyServer = true;
 
     private Builder() {
     }
@@ -592,6 +630,11 @@ public class FlightClient implements AutoCloseable {
       return this;
     }
 
+    public Builder verifyServer(boolean verifyServer) {
+      this.verifyServer = verifyServer;
+      return this;
+    }
+
     /**
      * Create the client from this builder.
      */
@@ -637,19 +680,29 @@ public class FlightClient implements AutoCloseable {
       if (this.forceTls || LocationSchemes.GRPC_TLS.equals(location.getUri().getScheme())) {
         builder.useTransportSecurity();
 
-        if (this.trustedCertificates != null || this.clientCertificate != null || this.clientKey != null) {
-          final SslContextBuilder sslContextBuilder = GrpcSslContexts.forClient();
+        final boolean hasTrustedCerts = this.trustedCertificates != null;
+        final boolean hasKeyCertPair = this.clientCertificate != null && this.clientKey != null;
+        if (!this.verifyServer && (hasTrustedCerts || hasKeyCertPair)) {
+          throw new IllegalArgumentException("FlightClient has been configured to disable server verification, " +
+              "but certificate options have been specified.");
+        }
+
+        final SslContextBuilder sslContextBuilder = GrpcSslContexts.forClient();
+
+        if (!this.verifyServer) {
+          sslContextBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE);
+        } else if (this.trustedCertificates != null || this.clientCertificate != null || this.clientKey != null) {
           if (this.trustedCertificates != null) {
             sslContextBuilder.trustManager(this.trustedCertificates);
           }
           if (this.clientCertificate != null && this.clientKey != null) {
             sslContextBuilder.keyManager(this.clientCertificate, this.clientKey);
           }
-          try {
-            builder.sslContext(sslContextBuilder.build());
-          } catch (SSLException e) {
-            throw new RuntimeException(e);
-          }
+        }
+        try {
+          builder.sslContext(sslContextBuilder.build());
+        } catch (SSLException e) {
+          throw new RuntimeException(e);
         }
 
         if (this.overrideHostname != null) {

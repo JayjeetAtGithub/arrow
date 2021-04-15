@@ -123,7 +123,7 @@ can be useful to skip the build phases:
 
     # if the second run tries the build the image again and none of the files
     # referenced in the relevant dockerfile have changed, then it indicates a
-    # cache miss caused by the issue desribed above
+    # cache miss caused by the issue described above
     archery docker run conda-python
 
     # since the image is properly built with the first command, there is no
@@ -209,6 +209,7 @@ responsible for. Like:
 - ``integration_dask.sh``: execute the dask integration tests.
 - ``integration_pandas.sh``: execute the pandas integration tests.
 - ``install_minio.sh``: install minio server for multiple platforms.
+- ``install_ceph.sh``: install ceph (currently only for ubuntu).
 - ``install_conda.sh``: install miniconda for multiple platforms.
 
 The parametrization (like the C++ CMake options) is achieved via environment

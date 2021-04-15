@@ -36,6 +36,7 @@ from pyarrow.lib cimport (_Weakrefable, Buffer, Array, Schema,
                           pyarrow_wrap_schema,
                           pyarrow_wrap_table,
                           pyarrow_wrap_buffer,
+                          pyarrow_wrap_batch,
                           NativeFile, get_reader, get_writer)
 
 from pyarrow.lib import (ArrowException, NativeFile, BufferOutputStream,
@@ -46,17 +47,8 @@ cimport cpython as cp
 
 
 cdef class Statistics(_Weakrefable):
-    cdef:
-        shared_ptr[CStatistics] statistics
-        ColumnChunkMetaData parent
-
     def __cinit__(self):
         pass
-
-    cdef init(self, const shared_ptr[CStatistics]& statistics,
-              ColumnChunkMetaData parent):
-        self.statistics = statistics
-        self.parent = parent
 
     def __repr__(self):
         return """{}
@@ -98,14 +90,7 @@ cdef class Statistics(_Weakrefable):
             return NotImplemented
 
     def equals(self, Statistics other):
-        # TODO(kszucs): implement native Equals method for Statistics
-        return (self.has_min_max == other.has_min_max and
-                self.min == other.min and
-                self.max == other.max and
-                self.null_count == other.null_count and
-                self.distinct_count == other.distinct_count and
-                self.num_values == other.num_values and
-                self.physical_type == other.physical_type)
+        return self.statistics.get().Equals(deref(other.statistics.get()))
 
     @property
     def has_min_max(self):
@@ -177,7 +162,7 @@ cdef class ParquetLogicalType(_Weakrefable):
         self.type = type
 
     def __str__(self):
-        return frombytes(self.type.get().ToString())
+        return frombytes(self.type.get().ToString(), safe=True)
 
     def to_json(self):
         return frombytes(self.type.get().ToJSON())
@@ -297,18 +282,8 @@ cdef _box_flba(ParquetFLBA val, uint32_t len):
 
 
 cdef class ColumnChunkMetaData(_Weakrefable):
-    cdef:
-        unique_ptr[CColumnChunkMetaData] up_metadata
-        CColumnChunkMetaData* metadata
-        RowGroupMetaData parent
-
     def __cinit__(self):
         pass
-
-    cdef init(self, RowGroupMetaData parent, int i):
-        self.up_metadata = parent.metadata.ColumnChunk(i)
-        self.metadata = self.up_metadata.get()
-        self.parent = parent
 
     def __repr__(self):
         statistics = indent(repr(self.statistics), 4 * ' ')
@@ -344,6 +319,7 @@ cdef class ColumnChunkMetaData(_Weakrefable):
                                           self.total_uncompressed_size)
 
     def to_dict(self):
+        statistics = self.statistics.to_dict() if self.is_stats_set else None
         d = dict(
             file_offset=self.file_offset,
             file_path=self.file_path,
@@ -351,7 +327,7 @@ cdef class ColumnChunkMetaData(_Weakrefable):
             num_values=self.num_values,
             path_in_schema=self.path_in_schema,
             is_stats_set=self.is_stats_set,
-            statistics=self.statistics.to_dict(),
+            statistics=statistics,
             compression=self.compression,
             encodings=self.encodings,
             has_dictionary_page=self.has_dictionary_page,
@@ -369,21 +345,7 @@ cdef class ColumnChunkMetaData(_Weakrefable):
             return NotImplemented
 
     def equals(self, ColumnChunkMetaData other):
-        # TODO(kszucs): implement native Equals method for CColumnChunkMetaData
-        return (self.file_offset == other.file_offset and
-                self.file_path == other.file_path and
-                self.physical_type == other.physical_type and
-                self.num_values == other.num_values and
-                self.path_in_schema == other.path_in_schema and
-                self.is_stats_set == other.is_stats_set and
-                self.statistics == other.statistics and
-                self.compression == other.compression and
-                self.encodings == other.encodings and
-                self.has_dictionary_page == other.has_dictionary_page and
-                self.dictionary_page_offset == other.dictionary_page_offset and
-                self.data_page_offset == other.data_page_offset and
-                self.total_compressed_size == other.total_compressed_size and
-                self.total_uncompressed_size == other.total_uncompressed_size)
+        return self.metadata.Equals(deref(other.metadata))
 
     @property
     def file_offset(self):
@@ -459,12 +421,6 @@ cdef class ColumnChunkMetaData(_Weakrefable):
 
 
 cdef class RowGroupMetaData(_Weakrefable):
-    cdef:
-        int index  # for pickling support
-        unique_ptr[CRowGroupMetaData] up_metadata
-        CRowGroupMetaData* metadata
-        FileMetaData parent
-
     def __cinit__(self, FileMetaData parent, int index):
         if index < 0 or index >= parent.num_row_groups:
             raise IndexError('{0} out of bounds'.format(index))
@@ -483,16 +439,7 @@ cdef class RowGroupMetaData(_Weakrefable):
             return NotImplemented
 
     def equals(self, RowGroupMetaData other):
-        if not (self.num_columns == other.num_columns and
-                self.num_rows == other.num_rows and
-                self.total_byte_size == other.total_byte_size):
-            return False
-
-        for i in range(self.num_columns):
-            if self.column(i) != other.column(i):
-                return False
-
-        return True
+        return self.metadata.Equals(deref(other.metadata))
 
     def column(self, int i):
         if i < 0 or i >= self.num_columns:
@@ -547,17 +494,8 @@ def _reconstruct_filemetadata(Buffer serialized):
 
 
 cdef class FileMetaData(_Weakrefable):
-    cdef:
-        shared_ptr[CFileMetaData] sp_metadata
-        CFileMetaData* _metadata
-        ParquetSchema _schema
-
     def __cinit__(self):
         pass
-
-    cdef init(self, const shared_ptr[CFileMetaData]& metadata):
-        self.sp_metadata = metadata
-        self._metadata = metadata.get()
 
     def __reduce__(self):
         cdef:
@@ -604,13 +542,7 @@ cdef class FileMetaData(_Weakrefable):
             return NotImplemented
 
     def equals(self, FileMetaData other):
-        # TODO(kszucs): use native method after ARROW-4970 is implemented
-        for prop in ('schema', 'serialized_size', 'num_columns', 'num_rows',
-                     'num_row_groups', 'format_version', 'created_by',
-                     'metadata'):
-            if getattr(self, prop) != getattr(other, prop):
-                return False
-        return True
+        return self._metadata.Equals(deref(other._metadata))
 
     @property
     def schema(self):
@@ -706,17 +638,14 @@ cdef class FileMetaData(_Weakrefable):
 
 
 cdef class ParquetSchema(_Weakrefable):
-    cdef:
-        FileMetaData parent  # the FileMetaData owning the SchemaDescriptor
-        const SchemaDescriptor* schema
-
     def __cinit__(self, FileMetaData container):
         self.parent = container
         self.schema = container._metadata.schema()
 
     def __repr__(self):
-        return """{0}
-{1}""".format(object.__repr__(self), frombytes(self.schema.ToString()))
+        return "{0}\n{1}".format(
+            object.__repr__(self),
+            frombytes(self.schema.ToString(), safe=True))
 
     def __reduce__(self):
         return ParquetSchema, (self.parent,)
@@ -1074,6 +1003,54 @@ cdef class ParquetReader(_Weakrefable):
     def set_use_threads(self, bint use_threads):
         self.reader.get().set_use_threads(use_threads)
 
+    def set_batch_size(self, int64_t batch_size):
+        self.reader.get().set_batch_size(batch_size)
+
+    def iter_batches(self, int64_t batch_size, row_groups, column_indices=None,
+                     bint use_threads=True):
+        cdef:
+            vector[int] c_row_groups
+            vector[int] c_column_indices
+            shared_ptr[CRecordBatch] record_batch
+            shared_ptr[TableBatchReader] batch_reader
+            unique_ptr[CRecordBatchReader] recordbatchreader
+
+        self.set_batch_size(batch_size)
+
+        if use_threads:
+            self.set_use_threads(use_threads)
+
+        for row_group in row_groups:
+            c_row_groups.push_back(row_group)
+
+        if column_indices is not None:
+            for index in column_indices:
+                c_column_indices.push_back(index)
+            with nogil:
+                check_status(
+                    self.reader.get().GetRecordBatchReader(
+                        c_row_groups, c_column_indices, &recordbatchreader
+                    )
+                )
+        else:
+            with nogil:
+                check_status(
+                    self.reader.get().GetRecordBatchReader(
+                        c_row_groups, &recordbatchreader
+                    )
+                )
+
+        while True:
+            with nogil:
+                check_status(
+                    recordbatchreader.get().ReadNext(&record_batch)
+                )
+
+            if record_batch.get() == NULL:
+                break
+
+            yield pyarrow_wrap_batch(record_batch)
+
     def read_row_group(self, int i, column_indices=None,
                        bint use_threads=True):
         return self.read_row_groups([i], column_indices, use_threads)
@@ -1232,7 +1209,7 @@ cdef shared_ptr[WriterProperties] _create_writer_properties(
     elif compression is not None:
         for column, codec in compression.iteritems():
             check_compression_name(codec)
-            props.compression(column, compression_from_name(codec))
+            props.compression(tobytes(column), compression_from_name(codec))
 
     if isinstance(compression_level, int):
         props.compression_level(compression_level)
@@ -1325,6 +1302,7 @@ cdef shared_ptr[ArrowWriterProperties] _create_arrow_writer_properties(
     # writer_engine_version
 
     if writer_engine_version == "V1":
+        warnings.warn("V1 parquet writer engine is a no-op.  Use V2.")
         arrow_props.set_engine_version(ArrowWriterEngineVersion.V1)
     elif writer_engine_version != "V2":
         raise ValueError("Unsupported Writer Engine Version: {0}"

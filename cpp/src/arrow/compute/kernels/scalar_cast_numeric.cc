@@ -17,6 +17,7 @@
 
 // Implementation of casting to integer, floating point, or decimal types
 
+#include "arrow/array/builder_primitive.h"
 #include "arrow/compute/kernels/common.h"
 #include "arrow/compute/kernels/scalar_cast_internal.h"
 #include "arrow/util/bit_block_counter.h"
@@ -281,7 +282,9 @@ struct ParseString {
   OutValue Call(KernelContext* ctx, Arg0Value val) const {
     OutValue result = OutValue(0);
     if (ARROW_PREDICT_FALSE(!ParseValue<OutType>(val.data(), val.size(), &result))) {
-      ctx->SetStatus(Status::Invalid("Failed to parse string: ", val));
+      ctx->SetStatus(Status::Invalid("Failed to parse string: '", val,
+                                     "' as a scalar of type ",
+                                     TypeTraits<OutType>::type_singleton()->ToString()));
     }
     return result;
   }
@@ -590,11 +593,11 @@ std::shared_ptr<CastFunction> GetCastToFloating(std::string name) {
   return func;
 }
 
-std::shared_ptr<CastFunction> GetCastToDecimal() {
+std::shared_ptr<CastFunction> GetCastToDecimal128() {
   OutputType sig_out_ty(ResolveOutputFromOptions);
 
-  auto func = std::make_shared<CastFunction>("cast_decimal", Type::DECIMAL);
-  AddCommonCasts(Type::DECIMAL, sig_out_ty, func.get());
+  auto func = std::make_shared<CastFunction>("cast_decimal", Type::DECIMAL128);
+  AddCommonCasts(Type::DECIMAL128, sig_out_ty, func.get());
 
   // Cast from floating point
   DCHECK_OK(func->AddKernel(Type::FLOAT, {float32()}, sig_out_ty,
@@ -605,8 +608,19 @@ std::shared_ptr<CastFunction> GetCastToDecimal() {
   // Cast from other decimal
   auto exec = CastFunctor<Decimal128Type, Decimal128Type>::Exec;
   // We resolve the output type of this kernel from the CastOptions
-  DCHECK_OK(func->AddKernel(Type::DECIMAL, {InputType::Array(Type::DECIMAL)}, sig_out_ty,
-                            exec));
+  DCHECK_OK(func->AddKernel(Type::DECIMAL128, {InputType::Array(Type::DECIMAL128)},
+                            sig_out_ty, exec));
+  return func;
+}
+
+std::shared_ptr<CastFunction> GetCastToDecimal256() {
+  OutputType sig_out_ty(ResolveOutputFromOptions);
+
+  auto func = std::make_shared<CastFunction>("cast_decimal256", Type::DECIMAL256);
+  // Needed for Parquet conversion. Full implementation is ARROW-10606
+  // tracks full implementation.
+  AddCommonCasts(Type::DECIMAL256, sig_out_ty, func.get());
+
   return func;
 }
 
@@ -618,8 +632,8 @@ std::vector<std::shared_ptr<CastFunction>> GetNumericCasts() {
   // Make a cast to null that does not do much. Not sure why we need to be able
   // to cast from dict<null> -> null but there are unit tests for it
   auto cast_null = std::make_shared<CastFunction>("cast_null", Type::NA);
-  DCHECK_OK(cast_null->AddKernel(Type::DICTIONARY, {InputType::Array(Type::DICTIONARY)},
-                                 null(), OutputAllNull));
+  DCHECK_OK(cast_null->AddKernel(Type::DICTIONARY, {InputType(Type::DICTIONARY)}, null(),
+                                 OutputAllNull));
   functions.push_back(cast_null);
 
   functions.push_back(GetCastToInteger<Int8Type>("cast_int8"));
@@ -653,7 +667,8 @@ std::vector<std::shared_ptr<CastFunction>> GetNumericCasts() {
   functions.push_back(GetCastToFloating<FloatType>("cast_float"));
   functions.push_back(GetCastToFloating<DoubleType>("cast_double"));
 
-  functions.push_back(GetCastToDecimal());
+  functions.push_back(GetCastToDecimal128());
+  functions.push_back(GetCastToDecimal256());
 
   return functions;
 }

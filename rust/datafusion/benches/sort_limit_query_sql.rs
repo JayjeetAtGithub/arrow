@@ -19,8 +19,7 @@
 extern crate criterion;
 use criterion::Criterion;
 
-use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 extern crate arrow;
 extern crate datafusion;
@@ -30,16 +29,17 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::{CsvFile, CsvReadOptions, MemTable};
 use datafusion::execution::context::ExecutionContext;
 
-fn run_query(ctx: &mut ExecutionContext, sql: &str) {
-    // execute the query
-    let df = ctx.sql(&sql).unwrap();
-    let results = df.collect().unwrap();
+use tokio::runtime::Runtime;
 
-    // display the relation
-    for _batch in results {}
+fn query(ctx: Arc<Mutex<ExecutionContext>>, sql: &str) {
+    let rt = Runtime::new().unwrap();
+
+    // execute the query
+    let df = ctx.lock().unwrap().sql(&sql).unwrap();
+    rt.block_on(df.collect()).unwrap();
 }
 
-fn create_context() -> ExecutionContext {
+fn create_context() -> Arc<Mutex<ExecutionContext>> {
     // define schema for data source (csv file)
     let schema = Arc::new(Schema::new(vec![
         Field::new("c1", DataType::Utf8, false),
@@ -57,7 +57,7 @@ fn create_context() -> ExecutionContext {
         Field::new("c13", DataType::Utf8, false),
     ]));
 
-    let testdata = env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::arrow_test_data();
 
     // create CSV data source
     let csv = CsvFile::try_new(
@@ -66,63 +66,77 @@ fn create_context() -> ExecutionContext {
     )
     .unwrap();
 
-    let mem_table = MemTable::load(&csv).unwrap();
+    let rt = Runtime::new().unwrap();
 
-    // create local execution context
-    let mut ctx = ExecutionContext::new();
-    ctx.state.config.concurrency = 1;
-    ctx.register_table("aggregate_test_100", Box::new(mem_table));
+    let ctx_holder: Arc<Mutex<Vec<Arc<Mutex<ExecutionContext>>>>> =
+        Arc::new(Mutex::new(vec![]));
+
+    let partitions = 16;
+
+    rt.block_on(async {
+        let mem_table = MemTable::load(&csv, 16 * 1024, Some(partitions))
+            .await
+            .unwrap();
+
+        // create local execution context
+        let mut ctx = ExecutionContext::new();
+        ctx.state.lock().unwrap().config.concurrency = 1;
+        ctx.register_table("aggregate_test_100", Box::new(mem_table));
+        ctx_holder.lock().unwrap().push(Arc::new(Mutex::new(ctx)))
+    });
+
+    let ctx = ctx_holder.lock().unwrap().get(0).unwrap().clone();
     ctx
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort_and_limit_by_int", |b| {
-        let mut ctx = create_context();
+        let ctx = create_context();
         b.iter(|| {
-            run_query(
-                &mut ctx,
+            query(
+                ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 3
+                 ORDER BY c6
                  LIMIT 10",
             )
         })
     });
 
     c.bench_function("sort_and_limit_by_float", |b| {
-        let mut ctx = create_context();
+        let ctx = create_context();
         b.iter(|| {
-            run_query(
-                &mut ctx,
+            query(
+                ctx.clone(),
                 "SELECT c1, c13, c12 \
                  FROM aggregate_test_100 \
-                 ORDER BY 2
+                 ORDER BY c13
                  LIMIT 10",
             )
         })
     });
 
     c.bench_function("sort_and_limit_lex_by_int", |b| {
-        let mut ctx = create_context();
+        let ctx = create_context();
         b.iter(|| {
-            run_query(
-                &mut ctx,
+            query(
+                ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 3 DESC, 4 DESC
+                 ORDER BY c6 DESC, c10 DESC
                  LIMIT 10",
             )
         })
     });
 
     c.bench_function("sort_and_limit_lex_by_string", |b| {
-        let mut ctx = create_context();
+        let ctx = create_context();
         b.iter(|| {
-            run_query(
-                &mut ctx,
+            query(
+                ctx.clone(),
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
-                 ORDER BY 1, 2
+                 ORDER BY c1, c13
                  LIMIT 10",
             )
         })

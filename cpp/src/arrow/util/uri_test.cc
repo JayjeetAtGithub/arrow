@@ -35,6 +35,12 @@ TEST(UriEscape, Basics) {
   ASSERT_EQ(UriEscape("/El Niño/"), "%2FEl%20Ni%C3%B1o%2F");
 }
 
+TEST(UriEncodeHost, Basics) {
+  ASSERT_EQ(UriEncodeHost("::1"), "[::1]");
+  ASSERT_EQ(UriEscape("arrow.apache.org"), "arrow.apache.org");
+  ASSERT_EQ(UriEscape("192.168.1.1"), "192.168.1.1");
+}
+
 TEST(Uri, Empty) {
   Uri uri;
   ASSERT_EQ(uri.scheme(), "");
@@ -212,6 +218,19 @@ TEST(Uri, ParseUserPass) {
   ASSERT_EQ(uri.host(), "localhost");
   ASSERT_EQ(uri.username(), "someuser");
   ASSERT_EQ(uri.password(), "somepass");
+
+  // With %-encoding
+  ASSERT_OK(uri.Parse("http://some%20user%2Fname:somepass@localhost"));
+  ASSERT_EQ(uri.scheme(), "http");
+  ASSERT_EQ(uri.host(), "localhost");
+  ASSERT_EQ(uri.username(), "some user/name");
+  ASSERT_EQ(uri.password(), "somepass");
+
+  ASSERT_OK(uri.Parse("http://some%20user%2Fname:some%20pass%2Fword@localhost"));
+  ASSERT_EQ(uri.scheme(), "http");
+  ASSERT_EQ(uri.host(), "localhost");
+  ASSERT_EQ(uri.username(), "some user/name");
+  ASSERT_EQ(uri.password(), "some pass/word");
 }
 
 TEST(Uri, FileScheme) {

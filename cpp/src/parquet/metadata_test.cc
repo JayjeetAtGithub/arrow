@@ -203,6 +203,7 @@ TEST(Metadata, TestBuildAccess) {
     f_accessors[loop_index]->set_file_path("/foo/bar/bar.parquet");
     ASSERT_EQ("/foo/bar/bar.parquet", rg2_column1->file_path());
   }
+
   // Test AppendRowGroups
   auto f_accessor_2 = GenerateTableMetaData(schema, props, nrows, stats_int, stats_float);
   f_accessor->AppendRowGroups(*f_accessor_2);
@@ -212,6 +213,14 @@ TEST(Metadata, TestBuildAccess) {
   ASSERT_EQ(ParquetVersion::PARQUET_2_0, f_accessor->version());
   ASSERT_EQ(DEFAULT_CREATED_BY, f_accessor->created_by());
   ASSERT_EQ(3, f_accessor->num_schema_elements());
+
+  // Test Subset
+  auto f_accessor_1 = f_accessor->Subset({2, 3});
+  ASSERT_TRUE(f_accessor_1->Equals(*f_accessor_2));
+
+  f_accessor_1 = f_accessor_2->Subset({0});
+  f_accessor_1->AppendRowGroups(*f_accessor->Subset({0}));
+  ASSERT_TRUE(f_accessor_1->Equals(*f_accessor->Subset({2, 0})));
 }
 
 TEST(Metadata, TestV1Version) {
@@ -237,6 +246,34 @@ TEST(Metadata, TestV1Version) {
 
   // file metadata
   ASSERT_EQ(ParquetVersion::PARQUET_1_0, f_accessor->version());
+}
+
+TEST(Metadata, TestKeyValueMetadata) {
+  parquet::schema::NodeVector fields;
+  parquet::schema::NodePtr root;
+  parquet::SchemaDescriptor schema;
+
+  WriterProperties::Builder prop_builder;
+
+  std::shared_ptr<WriterProperties> props =
+      prop_builder.version(ParquetVersion::PARQUET_1_0)->build();
+
+  fields.push_back(parquet::schema::Int32("int_col", Repetition::REQUIRED));
+  fields.push_back(parquet::schema::Float("float_col", Repetition::REQUIRED));
+  root = parquet::schema::GroupNode::Make("schema", Repetition::REPEATED, fields);
+  schema.Init(root);
+
+  auto kvmeta = std::make_shared<KeyValueMetadata>();
+  kvmeta->Append("test_key", "test_value");
+
+  auto f_builder = FileMetaDataBuilder::Make(&schema, props, kvmeta);
+
+  // Read the metadata
+  auto f_accessor = f_builder->Finish();
+
+  // Key value metadata
+  ASSERT_TRUE(f_accessor->key_value_metadata());
+  EXPECT_TRUE(f_accessor->key_value_metadata()->Equals(*kvmeta));
 }
 
 TEST(ApplicationVersion, Basics) {

@@ -32,7 +32,11 @@ RUN apt-get update -y -q && \
       liblz4-dev \
       libprotobuf-dev \
       libprotoc-dev \
+      libre2-dev \
       libsnappy-dev \
+      libradospp-dev \
+      rados-objclass-dev \
+      python3-rados \
       libthrift-dev \
       libutf8proc-dev \
       libzstd-dev \
