@@ -17,38 +17,63 @@
 
 //! Parquet data source
 
+use std::any::Any;
 use std::string::String;
 use std::sync::Arc;
 
 use arrow::datatypes::*;
 
+use crate::datasource::datasource::Statistics;
 use crate::datasource::TableProvider;
 use crate::error::Result;
+use crate::logical_plan::Expr;
 use crate::physical_plan::parquet::ParquetExec;
 use crate::physical_plan::ExecutionPlan;
+
+use super::datasource::TableProviderFilterPushDown;
 
 /// Table-based representation of a `ParquetFile`.
 pub struct ParquetTable {
     path: String,
     schema: SchemaRef,
+    statistics: Statistics,
+    max_concurrency: usize,
 }
 
 impl ParquetTable {
     /// Attempt to initialize a new `ParquetTable` from a file path.
-    pub fn try_new(path: &str) -> Result<Self> {
-        let parquet_exec = ParquetExec::try_new(path, None, 0)?;
+    pub fn try_new(path: &str, max_concurrency: usize) -> Result<Self> {
+        let parquet_exec = ParquetExec::try_from_path(path, None, None, 0, 1)?;
         let schema = parquet_exec.schema();
         Ok(Self {
             path: path.to_string(),
             schema,
+            statistics: parquet_exec.statistics().to_owned(),
+            max_concurrency,
         })
+    }
+
+    /// Get the path for the Parquet file(s) represented by this ParquetTable instance
+    pub fn path(&self) -> &str {
+        &self.path
     }
 }
 
 impl TableProvider for ParquetTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// Get the schema for this parquet file.
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    fn supports_filter_pushdown(
+        &self,
+        _filter: &Expr,
+    ) -> Result<TableProviderFilterPushDown> {
+        Ok(TableProviderFilterPushDown::Inexact)
     }
 
     /// Scan the file(s), using the provided projection, and return one BatchIterator per
@@ -57,13 +82,37 @@ impl TableProvider for ParquetTable {
         &self,
         projection: &Option<Vec<usize>>,
         batch_size: usize,
+        filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ParquetExec::try_new(
+        let predicate = combine_filters(filters);
+        Ok(Arc::new(ParquetExec::try_from_path(
             &self.path,
             projection.clone(),
+            predicate,
             batch_size,
+            self.max_concurrency,
         )?))
     }
+
+    fn statistics(&self) -> Statistics {
+        self.statistics.clone()
+    }
+}
+
+/// Combines an array of filter expressions into a single filter expression
+/// consisting of the input filter expressions joined with logical AND.
+/// Returns None if the filters array is empty.
+fn combine_filters(filters: &[Expr]) -> Option<Expr> {
+    if filters.is_empty() {
+        return None;
+    }
+    let combined_filter = filters
+        .iter()
+        .skip(1)
+        .fold(filters[0].clone(), |acc, filter| {
+            crate::logical_plan::and(acc, filter.clone())
+        });
+    Some(combined_filter)
 }
 
 #[cfg(test)]
@@ -74,31 +123,36 @@ mod tests {
         TimestampNanosecondArray,
     };
     use arrow::record_batch::RecordBatch;
-    use std::env;
+    use futures::StreamExt;
 
-    #[test]
-    fn read_small_batches() -> Result<()> {
+    #[tokio::test]
+    async fn read_small_batches() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = None;
-        let exec = table.scan(&projection, 2)?;
-        let it = exec.execute(0)?;
-        let mut it = it.lock().unwrap();
+        let exec = table.scan(&projection, 2, &[])?;
+        let stream = exec.execute(0).await?;
 
-        let mut count = 0;
-        while let Some(batch) = it.next_batch()? {
-            assert_eq!(11, batch.num_columns());
-            assert_eq!(2, batch.num_rows());
-            count += 1;
-        }
+        let count = stream
+            .map(|batch| {
+                let batch = batch.unwrap();
+                assert_eq!(11, batch.num_columns());
+                assert_eq!(2, batch.num_rows());
+            })
+            .fold(0, |acc, _| async move { acc + 1i32 })
+            .await;
 
         // we should have seen 4 batches of 2 rows
         assert_eq!(4, count);
 
+        // test metadata
+        assert_eq!(table.statistics().num_rows, Some(8));
+        assert_eq!(table.statistics().total_byte_size, Some(671));
+
         Ok(())
     }
 
-    #[test]
-    fn read_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
 
         let x: Vec<String> = table
@@ -124,7 +178,7 @@ mod tests {
         );
 
         let projection = None;
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(11, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -132,11 +186,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_bool_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_bool_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![1]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -159,11 +213,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_i32_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_i32_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![0]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -183,11 +237,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_i96_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_i96_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![10]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -207,11 +261,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_f32_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_f32_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![6]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -234,11 +288,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_f64_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_f64_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![7]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -261,11 +315,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_binary_alltypes_plain_parquet() -> Result<()> {
+    #[tokio::test]
+    async fn read_binary_alltypes_plain_parquet() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = Some(vec![9]);
-        let batch = get_first_batch(table, &projection)?;
+        let batch = get_first_batch(table, &projection).await?;
 
         assert_eq!(1, batch.num_columns());
         assert_eq!(8, batch.num_rows());
@@ -289,22 +343,46 @@ mod tests {
     }
 
     fn load_table(name: &str) -> Result<Box<dyn TableProvider>> {
-        let testdata =
-            env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+        let testdata = arrow::util::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, name);
-        let table = ParquetTable::try_new(&filename)?;
+        let table = ParquetTable::try_new(&filename, 2)?;
         Ok(Box::new(table))
     }
 
-    fn get_first_batch(
+    async fn get_first_batch(
         table: Box<dyn TableProvider>,
         projection: &Option<Vec<usize>>,
     ) -> Result<RecordBatch> {
-        let exec = table.scan(projection, 1024)?;
-        let it = exec.execute(0)?;
-        let mut it = it.lock().expect("failed to lock mutex");
-        Ok(it
-            .next_batch()?
-            .expect("should have received at least one batch"))
+        let exec = table.scan(projection, 1024, &[])?;
+        let mut it = exec.execute(0).await?;
+        it.next()
+            .await
+            .expect("should have received at least one batch")
+            .map_err(|e| e.into())
+    }
+
+    #[test]
+    fn combine_zero_filters() {
+        let result = combine_filters(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn combine_one_filter() {
+        use crate::logical_plan::{binary_expr, col, lit, Operator};
+        let filter = binary_expr(col("c1"), Operator::Lt, lit(1));
+        let result = combine_filters(&[filter.clone()]);
+        assert_eq!(result, Some(filter));
+    }
+
+    #[test]
+    fn combine_multiple_filters() {
+        use crate::logical_plan::{and, binary_expr, col, lit, Operator};
+        let filter1 = binary_expr(col("c1"), Operator::Lt, lit(1));
+        let filter2 = binary_expr(col("c2"), Operator::Lt, lit(2));
+        let filter3 = binary_expr(col("c3"), Operator::Lt, lit(3));
+        let result =
+            combine_filters(&[filter1.clone(), filter2.clone(), filter3.clone()]);
+        assert_eq!(result, Some(and(and(filter1, filter2), filter3)));
     }
 }

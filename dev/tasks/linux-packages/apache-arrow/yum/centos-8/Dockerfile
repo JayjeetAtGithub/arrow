@@ -25,13 +25,14 @@ ARG DEBUG
 RUN \
   quiet=$([ "${DEBUG}" = "yes" ] || echo "--quiet") && \
   dnf install -y ${quiet} epel-release && \
-  dnf install --enablerepo=PowerTools -y ${quiet} \
+  dnf install --enablerepo=powertools -y ${quiet} \
     bison \
     boost-devel \
     brotli-devel \
     bzip2-devel \
     clang \
     cmake \
+    curl-devel \
     flex \
     gcc-c++ \
     gflags-devel \

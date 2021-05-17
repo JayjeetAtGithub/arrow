@@ -28,12 +28,12 @@
 #include "arrow/csv/reader.h"
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/file_base.h"
-#include "arrow/dataset/filter.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
 #include "arrow/result.h"
 #include "arrow/type.h"
 #include "arrow/util/iterator.h"
+#include "arrow/util/logging.h"
 
 namespace arrow {
 namespace dataset {
@@ -65,7 +65,7 @@ Result<std::unordered_set<std::string>> GetColumnNames(
   RETURN_NOT_OK(
       parser.VisitLastRow([&](const uint8_t* data, uint32_t size, bool quoted) -> Status {
         util::string_view view{reinterpret_cast<const char*>(data), size};
-        if (column_names.emplace(view.to_string()).second) {
+        if (column_names.emplace(std::string(view)).second) {
           return Status::OK();
         }
         return Status::Invalid("CSV file contained multiple columns named ", view);
@@ -90,13 +90,18 @@ static inline Result<csv::ConvertOptions> GetConvertOptions(
   }
 
   // FIXME(bkietz) also acquire types of fields materialized but not projected.
-  for (auto&& name : FieldsInExpression(scan_options->filter)) {
-    ARROW_ASSIGN_OR_RAISE(auto match,
-                          FieldRef(name).FindOneOrNone(*scan_options->schema()));
-    if (match.indices().empty()) {
-      convert_options.include_columns.push_back(std::move(name));
+  // (This will require that scan_options include the full dataset schema, not just
+  // the projected schema).
+  for (const FieldRef& ref : FieldsInExpression(scan_options->filter)) {
+    DCHECK(ref.name());
+    ARROW_ASSIGN_OR_RAISE(auto match, ref.FindOneOrNone(*scan_options->schema()));
+
+    if (match.empty()) {
+      // a field was filtered but not in the projected schema; be sure it is included
+      convert_options.include_columns.push_back(*ref.name());
     }
   }
+
   return convert_options;
 }
 
@@ -156,6 +161,22 @@ class CsvScanTask : public ScanTask {
   std::shared_ptr<const CsvFileFormat> format_;
   FileSource source_;
 };
+
+bool CsvFileFormat::Equals(const FileFormat& format) const {
+  if (type_name() != format.type_name()) return false;
+
+  const auto& other_parse_options =
+      checked_cast<const CsvFileFormat&>(format).parse_options;
+
+  return parse_options.delimiter == other_parse_options.delimiter &&
+         parse_options.quoting == other_parse_options.quoting &&
+         parse_options.quote_char == other_parse_options.quote_char &&
+         parse_options.double_quote == other_parse_options.double_quote &&
+         parse_options.escaping == other_parse_options.escaping &&
+         parse_options.escape_char == other_parse_options.escape_char &&
+         parse_options.newlines_in_values == other_parse_options.newlines_in_values &&
+         parse_options.ignore_empty_lines == other_parse_options.ignore_empty_lines;
+}
 
 Result<bool> CsvFileFormat::IsSupported(const FileSource& source) const {
   RETURN_NOT_OK(source.Open().status());

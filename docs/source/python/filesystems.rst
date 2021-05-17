@@ -43,7 +43,7 @@ and Amazon S3-compatible storage (:class:`S3FileSystem`).
 Usage
 -----
 
-A FileSystem object can be created with one of the constuctors (and check the
+A FileSystem object can be created with one of the constructors (and check the
 respective constructor for its options)::
 
    >>> from pyarrow import fs
@@ -150,7 +150,7 @@ Hadoop File System (HDFS)
 
 PyArrow comes with bindings to the Hadoop File System (based on C++ bindings
 using ``libhdfs``, a JNI-based interface to the Java Hadoop client). You connect
-using the :class:`HadoopFileSystem` constructor::
+using the :class:`HadoopFileSystem` constructor:
 
 .. code-block:: python
 

@@ -73,6 +73,10 @@ struct ScalarFromArraySlotImpl {
     return Finish(Decimal128(a.GetValue(index_)));
   }
 
+  Status Visit(const Decimal256Array& a) {
+    return Finish(Decimal256(a.GetValue(index_)));
+  }
+
   template <typename T>
   Status Visit(const BaseBinaryArray<T>& a) {
     return Finish(a.GetString(index_));
@@ -161,7 +165,13 @@ struct ScalarFromArraySlotImpl {
     }
 
     if (array_.IsNull(index_)) {
-      return MakeNullScalar(array_.type());
+      auto null = MakeNullScalar(array_.type());
+      if (is_dictionary(array_.type()->id())) {
+        auto& dict_null = checked_cast<DictionaryScalar&>(*null);
+        const auto& dict_array = checked_cast<const DictionaryArray&>(array_);
+        dict_null.value.dictionary = dict_array.dictionary();
+      }
+      return null;
     }
 
     RETURN_NOT_OK(VisitArrayInline(array_, this));
@@ -212,29 +222,31 @@ bool Array::ApproxEquals(const std::shared_ptr<Array>& arr,
 }
 
 bool Array::RangeEquals(const Array& other, int64_t start_idx, int64_t end_idx,
-                        int64_t other_start_idx) const {
-  return ArrayRangeEquals(*this, other, start_idx, end_idx, other_start_idx);
+                        int64_t other_start_idx, const EqualOptions& opts) const {
+  return ArrayRangeEquals(*this, other, start_idx, end_idx, other_start_idx, opts);
 }
 
 bool Array::RangeEquals(const std::shared_ptr<Array>& other, int64_t start_idx,
-                        int64_t end_idx, int64_t other_start_idx) const {
+                        int64_t end_idx, int64_t other_start_idx,
+                        const EqualOptions& opts) const {
   if (!other) {
     return false;
   }
-  return ArrayRangeEquals(*this, *other, start_idx, end_idx, other_start_idx);
+  return ArrayRangeEquals(*this, *other, start_idx, end_idx, other_start_idx, opts);
 }
 
 bool Array::RangeEquals(int64_t start_idx, int64_t end_idx, int64_t other_start_idx,
-                        const Array& other) const {
-  return ArrayRangeEquals(*this, other, start_idx, end_idx, other_start_idx);
+                        const Array& other, const EqualOptions& opts) const {
+  return ArrayRangeEquals(*this, other, start_idx, end_idx, other_start_idx, opts);
 }
 
 bool Array::RangeEquals(int64_t start_idx, int64_t end_idx, int64_t other_start_idx,
-                        const std::shared_ptr<Array>& other) const {
+                        const std::shared_ptr<Array>& other,
+                        const EqualOptions& opts) const {
   if (!other) {
     return false;
   }
-  return ArrayRangeEquals(*this, *other, start_idx, end_idx, other_start_idx);
+  return ArrayRangeEquals(*this, *other, start_idx, end_idx, other_start_idx, opts);
 }
 
 std::shared_ptr<Array> Array::Slice(int64_t offset, int64_t length) const {
@@ -290,7 +302,7 @@ Status Array::Validate() const { return internal::ValidateArray(*this); }
 
 Status Array::ValidateFull() const {
   RETURN_NOT_OK(internal::ValidateArray(*this));
-  return internal::ValidateArrayData(*this);
+  return internal::ValidateArrayFull(*this);
 }
 
 }  // namespace arrow

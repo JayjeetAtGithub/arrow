@@ -410,6 +410,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
                 .expect("Decoder for dict should have been set")
         } else {
             // Search cache for data page decoder
+            #[allow(clippy::map_entry)]
             if !self.decoders.contains_key(&encoding) {
                 // Initialize decoder for this page
                 let data_decoder = get_decoder::<T>(self.descr.clone(), encoding)?;
@@ -466,7 +467,7 @@ impl<T: DataType> ColumnReaderImpl<T> {
         let current_decoder = self
             .decoders
             .get_mut(&encoding)
-            .expect(format!("decoder for encoding {} should be set", encoding).as_str());
+            .unwrap_or_else(|| panic!("decoder for encoding {} should be set", encoding));
         current_decoder.get(buffer)
     }
 
@@ -504,7 +505,7 @@ mod tests {
     use super::*;
 
     use rand::distributions::uniform::SampleUniform;
-    use std::{collections::VecDeque, rc::Rc, vec::IntoIter};
+    use std::{collections::VecDeque, sync::Arc, vec::IntoIter};
 
     use crate::basic::Type as PhysicalType;
     use crate::column::page::Page;
@@ -560,9 +561,8 @@ mod tests {
      $min:expr, $max:expr) => {
             #[test]
             fn $test_func() {
-                let desc = Rc::new(ColumnDescriptor::new(
-                    Rc::new($pty()),
-                    None,
+                let desc = Arc::new(ColumnDescriptor::new(
+                    Arc::new($pty()),
                     $def_level,
                     $rep_level,
                     ColumnPath::new(Vec::new()),
@@ -902,48 +902,38 @@ mod tests {
 
     #[test]
     fn test_read_batch_values_only() {
-        test_read_batch_int32(16, &mut vec![0; 10], None, None); // < batch_size
-        test_read_batch_int32(16, &mut vec![0; 16], None, None); // == batch_size
-        test_read_batch_int32(16, &mut vec![0; 51], None, None); // > batch_size
+        test_read_batch_int32(16, &mut [0; 10], None, None); // < batch_size
+        test_read_batch_int32(16, &mut [0; 16], None, None); // == batch_size
+        test_read_batch_int32(16, &mut [0; 51], None, None); // > batch_size
     }
 
     #[test]
     fn test_read_batch_values_def_levels() {
-        test_read_batch_int32(16, &mut vec![0; 10], Some(&mut vec![0; 10]), None);
-        test_read_batch_int32(16, &mut vec![0; 16], Some(&mut vec![0; 16]), None);
-        test_read_batch_int32(16, &mut vec![0; 51], Some(&mut vec![0; 51]), None);
+        test_read_batch_int32(16, &mut [0; 10], Some(&mut [0; 10]), None);
+        test_read_batch_int32(16, &mut [0; 16], Some(&mut [0; 16]), None);
+        test_read_batch_int32(16, &mut [0; 51], Some(&mut [0; 51]), None);
     }
 
     #[test]
     fn test_read_batch_values_rep_levels() {
-        test_read_batch_int32(16, &mut vec![0; 10], None, Some(&mut vec![0; 10]));
-        test_read_batch_int32(16, &mut vec![0; 16], None, Some(&mut vec![0; 16]));
-        test_read_batch_int32(16, &mut vec![0; 51], None, Some(&mut vec![0; 51]));
+        test_read_batch_int32(16, &mut [0; 10], None, Some(&mut [0; 10]));
+        test_read_batch_int32(16, &mut [0; 16], None, Some(&mut [0; 16]));
+        test_read_batch_int32(16, &mut [0; 51], None, Some(&mut [0; 51]));
     }
 
     #[test]
     fn test_read_batch_different_buf_sizes() {
-        test_read_batch_int32(
-            16,
-            &mut vec![0; 8],
-            Some(&mut vec![0; 9]),
-            Some(&mut vec![0; 7]),
-        );
-        test_read_batch_int32(
-            16,
-            &mut vec![0; 1],
-            Some(&mut vec![0; 9]),
-            Some(&mut vec![0; 3]),
-        );
+        test_read_batch_int32(16, &mut [0; 8], Some(&mut [0; 9]), Some(&mut [0; 7]));
+        test_read_batch_int32(16, &mut [0; 1], Some(&mut [0; 9]), Some(&mut [0; 3]));
     }
 
     #[test]
     fn test_read_batch_values_def_rep_levels() {
         test_read_batch_int32(
             128,
-            &mut vec![0; 128],
-            Some(&mut vec![0; 128]),
-            Some(&mut vec![0; 128]),
+            &mut [0; 128],
+            Some(&mut [0; 128]),
+            Some(&mut [0; 128]),
         );
     }
 
@@ -956,9 +946,8 @@ mod tests {
         // Note: values are chosen to reproduce the issue.
         //
         let primitive_type = get_test_int32_type();
-        let desc = Rc::new(ColumnDescriptor::new(
-            Rc::new(primitive_type),
-            None,
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive_type),
             1,
             1,
             ColumnPath::new(Vec::new()),
@@ -1074,9 +1063,8 @@ mod tests {
             0
         };
 
-        let desc = Rc::new(ColumnDescriptor::new(
-            Rc::new(primitive_type),
-            None,
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive_type),
             max_def_level,
             max_rep_level,
             ColumnPath::new(Vec::new()),
