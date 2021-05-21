@@ -64,6 +64,10 @@ class ArrowSerializationError(ArrowException):
     pass
 
 
+class ArrowExecutionError(ArrowException):
+    pass
+
+
 class ArrowCancelled(ArrowException):
     def __init__(self, message, signum=None):
         super().__init__(message)
@@ -124,6 +128,8 @@ cdef int check_status(const CStatus& status) nogil except -1:
             raise ArrowIndexError(message)
         elif status.IsSerializationError():
             raise ArrowSerializationError(message)
+        elif status.IsExecutionError():
+            raise ArrowExecutionError(message)
         elif status.IsCancelled():
             signum = SignalFromStatus(status)
             if signum > 0:

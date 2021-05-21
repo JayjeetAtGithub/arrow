@@ -125,6 +125,10 @@ TEST(CheckPyError, TestStatus) {
   check_error(st, "'some error'");
   ASSERT_TRUE(st.IsKeyError());
 
+  PyErr_SetString(PyExc_ExecutionError, "some error");
+  check_error(st, "'some error'");
+  ASSERT_TRUE(st.IsExecutionError());
+
   for (PyObject* exc_type : {PyExc_OSError, PyExc_IOError}) {
     PyErr_SetString(exc_type, "some error");
     check_error(st);
