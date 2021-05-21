@@ -68,6 +68,8 @@ StatusCode MapPyError(PyObject* exc_type) {
     code = StatusCode::IndexError;
   } else if (PyErr_GivenExceptionMatches(exc_type, PyExc_KeyError)) {
     code = StatusCode::KeyError;
+  } else if (PyErr_GivenExceptionMatches(exc_type, PyExc_ExecutionError)) {
+    code = StatusCode::ExecutionError;
   } else if (PyErr_GivenExceptionMatches(exc_type, PyExc_TypeError)) {
     code = StatusCode::TypeError;
   } else if (PyErr_GivenExceptionMatches(exc_type, PyExc_ValueError) ||
