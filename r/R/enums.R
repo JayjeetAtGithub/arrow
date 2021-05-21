@@ -66,18 +66,19 @@ Type <- enum("Type::type",
   INTERVAL_MONTHS = 21L,
   INTERVAL_DAY_TIME = 22L,
   DECIMAL = 23L,
-  LIST = 24L,
-  STRUCT = 25L,
-  SPARSE_UNION = 26L,
-  DENSE_UNION = 27L,
-  DICTIONARY = 28L,
-  MAP = 29L,
-  EXTENSION = 30L,
-  FIXED_SIZE_LIST = 31L,
-  DURATION = 32L,
-  LARGE_STRING = 33L,
-  LARGE_BINARY = 34L,
-  LARGE_LIST = 35L
+  DECIMAL256 = 24L,
+  LIST = 25L,
+  STRUCT = 26L,
+  SPARSE_UNION = 27L,
+  DENSE_UNION = 28L,
+  DICTIONARY = 29L,
+  MAP = 30L,
+  EXTENSION = 31L,
+  FIXED_SIZE_LIST = 32L,
+  DURATION = 33L,
+  LARGE_STRING = 34L,
+  LARGE_BINARY = 35L,
+  LARGE_LIST = 36L
 )
 
 #' @rdname enums
@@ -126,4 +127,16 @@ ParquetVersionType <- enum("ParquetVersionType",
 #' @rdname enums
 MetadataVersion <- enum("MetadataVersion",
   V1 = 0L, V2 = 1L, V3 = 2L, V4 = 3L, V5 = 4L
+)
+
+#' @export
+#' @rdname enums
+QuantileInterpolation <- enum("QuantileInterpolation",
+  LINEAR = 0L, LOWER = 1L, HIGHER = 2L, NEAREST = 3L, MIDPOINT = 4L
+)
+
+#' @export
+#' @rdname enums
+NullEncodingBehavior <- enum("NullEncodingBehavior",
+  ENCODE = 0L, MASK = 1L
 )

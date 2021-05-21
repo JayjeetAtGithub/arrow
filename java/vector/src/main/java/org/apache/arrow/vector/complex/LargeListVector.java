@@ -822,7 +822,7 @@ public class LargeListVector extends BaseValueVector implements RepeatedValueVec
    * @return Object at given position
    */
   @Override
-  public Object getObject(int index) {
+  public List<?> getObject(int index) {
     if (isSet(index) == 0) {
       return null;
     }
@@ -918,6 +918,24 @@ public class LargeListVector extends BaseValueVector implements RepeatedValueVec
     }
     BitVectorHelper.setBit(validityBuffer, index);
     lastSet = index;
+  }
+
+  /**
+   * Sets list at index to be null.
+   * @param index position in vector
+   */
+  public void setNull(int index) {
+    while (index >= getValidityAndOffsetValueCapacity()) {
+      reallocValidityAndOffsetBuffers();
+    }
+    if (lastSet >= index) {
+      lastSet = index - 1;
+    }
+    for (int i = lastSet + 1; i <= index; i++) {
+      final int currentOffset = offsetBuffer.getInt(i * OFFSET_WIDTH);
+      offsetBuffer.setInt((i + 1) * OFFSET_WIDTH, currentOffset);
+    }
+    BitVectorHelper.unsetBit(validityBuffer, index);
   }
 
   /**

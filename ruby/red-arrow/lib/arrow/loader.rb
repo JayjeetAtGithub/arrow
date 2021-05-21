@@ -56,11 +56,17 @@ module Arrow
       require "arrow/decimal128-array"
       require "arrow/decimal128-array-builder"
       require "arrow/decimal128-data-type"
+      require "arrow/decimal256"
+      require "arrow/decimal256-array"
+      require "arrow/decimal256-array-builder"
+      require "arrow/decimal256-data-type"
       require "arrow/dense-union-data-type"
       require "arrow/dictionary-array"
       require "arrow/dictionary-data-type"
       require "arrow/field"
       require "arrow/file-output-stream"
+      require "arrow/fixed-size-binary-array"
+      require "arrow/fixed-size-binary-array-builder"
       require "arrow/group"
       require "arrow/list-array-builder"
       require "arrow/list-data-type"
@@ -76,6 +82,8 @@ module Arrow
       require "arrow/rolling-window"
       require "arrow/schema"
       require "arrow/slicer"
+      require "arrow/sort-key"
+      require "arrow/sort-options"
       require "arrow/sparse-union-data-type"
       require "arrow/struct-array"
       require "arrow/struct-array-builder"
@@ -141,12 +149,19 @@ module Arrow
       when "Arrow::Date32Array",
            "Arrow::Date64Array",
            "Arrow::Decimal128Array",
+           "Arrow::Decimal256Array",
            "Arrow::Time32Array",
            "Arrow::Time64Array",
            "Arrow::TimestampArray"
         case method_name
         when "get_value"
           method_name = "get_raw_value"
+        end
+        super(info, klass, method_name)
+      when "Arrow::Decimal128", "Arrow::Decimal256"
+        case method_name
+        when "copy"
+          method_name = "dup"
         end
         super(info, klass, method_name)
       else

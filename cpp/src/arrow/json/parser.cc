@@ -29,11 +29,11 @@
 #include "rapidjson/reader.h"
 
 #include "arrow/array.h"
+#include "arrow/array/builder_binary.h"
 #include "arrow/buffer_builder.h"
-#include "arrow/builder.h"
-#include "arrow/memory_pool.h"
 #include "arrow/type.h"
 #include "arrow/util/bitset_stack.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/make_unique.h"
 #include "arrow/util/string_view.h"
@@ -41,14 +41,15 @@
 #include "arrow/visitor_inline.h"
 
 namespace arrow {
-namespace json {
-
-namespace rj = arrow::rapidjson;
 
 using internal::BitsetStack;
 using internal::checked_cast;
 using internal::make_unique;
 using util::string_view;
+
+namespace json {
+
+namespace rj = arrow::rapidjson;
 
 template <typename... T>
 static Status ParseError(T&&... t) {
@@ -74,8 +75,8 @@ const std::shared_ptr<const KeyValueMetadata>& Kind::Tag(Kind::type kind) {
   return tags[kind];
 }
 
-static internal::Trie MakeFromTagTrie() {
-  internal::TrieBuilder builder;
+static arrow::internal::Trie MakeFromTagTrie() {
+  arrow::internal::TrieBuilder builder;
   for (auto kind : {Kind::kNull, Kind::kBoolean, Kind::kNumber, Kind::kString,
                     Kind::kArray, Kind::kObject}) {
     DCHECK_OK(builder.Append(Kind::Name(kind)));
@@ -86,7 +87,7 @@ static internal::Trie MakeFromTagTrie() {
 }
 
 Kind::type Kind::FromTag(const std::shared_ptr<const KeyValueMetadata>& tag) {
-  static internal::Trie name_to_kind = MakeFromTagTrie();
+  static arrow::internal::Trie name_to_kind = MakeFromTagTrie();
   DCHECK_NE(tag->FindKey("json_kind"), -1);
   util::string_view name = tag->value(tag->FindKey("json_kind"));
   DCHECK_NE(name_to_kind.Find(name), -1);
@@ -155,10 +156,11 @@ struct BuilderPtr {
 
   bool operator!() const { return *this == null; }
 
+  // The static BuilderPtr for null type data
   static const BuilderPtr null;
 };
 
-const BuilderPtr BuilderPtr::null(Kind::kNull, 0, false);
+const BuilderPtr BuilderPtr::null(Kind::kNull, 0, true);
 
 template <>
 class RawArrayBuilder<Kind::kBoolean> {
@@ -372,7 +374,7 @@ class RawArrayBuilder<Kind::kObject> {
       std::shared_ptr<Array> field_values;
       RETURN_NOT_OK(finish_child(field_builders_[i], &field_values));
       child_data[i] = field_values->data();
-      fields[i] = field(field_names[i].to_string(), field_values->type(),
+      fields[i] = field(std::string(field_names[i]), field_values->type(),
                         field_builders_[i].nullable, Kind::Tag(field_builders_[i].kind));
     }
 
@@ -430,7 +432,7 @@ class RawBuilderSet {
 
       case Kind::kArray: {
         RETURN_NOT_OK(MakeBuilder<Kind::kArray>(leading_nulls, builder));
-        const auto& list_type = static_cast<const ListType&>(t);
+        const auto& list_type = checked_cast<const ListType&>(t);
 
         BuilderPtr value_builder;
         RETURN_NOT_OK(MakeBuilder(*list_type.value_type(), 0, &value_builder));
@@ -441,7 +443,7 @@ class RawBuilderSet {
       }
       case Kind::kObject: {
         RETURN_NOT_OK(MakeBuilder<Kind::kObject>(leading_nulls, builder));
-        const auto& struct_type = static_cast<const StructType&>(t);
+        const auto& struct_type = checked_cast<const StructType&>(t);
 
         for (const auto& f : struct_type.fields()) {
           BuilderPtr field_builder;

@@ -16,7 +16,9 @@
  */
 
 import org.apache.arrow.memory.ArrowBuf;
+import org.apache.arrow.vector.complex.writer.Decimal256Writer;
 import org.apache.arrow.vector.complex.writer.DecimalWriter;
+import org.apache.arrow.vector.holders.Decimal256Holder;
 import org.apache.arrow.vector.holders.DecimalHolder;
 
 import java.lang.UnsupportedOperationException;
@@ -170,6 +172,19 @@ public class UnionMapWriter extends UnionListWriter {
   }
 
   @Override
+  public Decimal256Writer decimal256() {
+    switch (mode) {
+      case KEY:
+        return entryWriter.decimal256(MapVector.KEY_NAME);
+      case VALUE:
+        return entryWriter.decimal256(MapVector.VALUE_NAME);
+      default:
+        return this;
+    }
+  }
+
+
+  @Override
   public StructWriter struct() {
     switch (mode) {
       case KEY:
@@ -190,6 +205,18 @@ public class UnionMapWriter extends UnionListWriter {
         return entryWriter.list(MapVector.VALUE_NAME);
       default:
         return super.list();
+    }
+  }
+
+  @Override
+  public MapWriter map(boolean keysSorted) {
+    switch (mode) {
+      case KEY:
+        return entryWriter.map(MapVector.KEY_NAME, keysSorted);
+      case VALUE:
+        return entryWriter.map(MapVector.VALUE_NAME, keysSorted);
+      default:
+        return super.map();
     }
   }
 }

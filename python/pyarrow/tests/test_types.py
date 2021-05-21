@@ -17,6 +17,7 @@
 
 from collections import OrderedDict
 from collections.abc import Iterator
+from functools import partial
 import datetime
 import sys
 
@@ -25,6 +26,7 @@ import pytest
 import pytz
 import hypothesis as h
 import hypothesis.strategies as st
+import hypothesis.extra.pytz as tzst
 import weakref
 
 import numpy as np
@@ -52,6 +54,7 @@ def get_many_types():
         pa.float32(),
         pa.float64(),
         pa.decimal128(19, 4),
+        pa.decimal256(76, 38),
         pa.string(),
         pa.binary(),
         pa.binary(10),
@@ -123,8 +126,21 @@ def test_null_field_may_not_be_non_nullable():
 
 
 def test_is_decimal():
-    assert types.is_decimal(pa.decimal128(19, 4))
-    assert not types.is_decimal(pa.int32())
+    decimal128 = pa.decimal128(19, 4)
+    decimal256 = pa.decimal256(76, 38)
+    int32 = pa.int32()
+
+    assert types.is_decimal(decimal128)
+    assert types.is_decimal(decimal256)
+    assert not types.is_decimal(int32)
+
+    assert types.is_decimal128(decimal128)
+    assert not types.is_decimal128(decimal256)
+    assert not types.is_decimal128(int32)
+
+    assert not types.is_decimal256(decimal128)
+    assert types.is_decimal256(decimal256)
+    assert not types.is_decimal256(int32)
 
 
 def test_is_list():
@@ -258,8 +274,11 @@ def test_is_primitive():
 @pytest.mark.parametrize(('tz', 'expected'), [
     (pytz.utc, 'UTC'),
     (pytz.timezone('Europe/Paris'), 'Europe/Paris'),
+    # StaticTzInfo.tzname returns with '-09' so we need to infer the timezone's
+    # name from the tzinfo.zone attribute
+    (pytz.timezone('Etc/GMT-9'), 'Etc/GMT-9'),
     (pytz.FixedOffset(180), '+03:00'),
-    (datetime.timezone.utc, '+00:00'),
+    (datetime.timezone.utc, 'UTC'),
     (datetime.timezone(datetime.timedelta(hours=1, minutes=30)), '+01:30')
 ])
 def test_tzinfo_to_string(tz, expected):
@@ -278,6 +297,13 @@ def test_tzinfo_to_string_errors():
         msg = "Offset must represent whole number of minutes"
         with pytest.raises(ValueError, match=msg):
             pa.lib.tzinfo_to_string(tz)
+
+
+@h.given(tzst.timezones())
+def test_pytz_timezone_roundtrip(tz):
+    timezone_string = pa.lib.tzinfo_to_string(tz)
+    timezone_tzinfo = pa.lib.string_to_tzinfo(timezone_string)
+    assert timezone_tzinfo == tz
 
 
 def test_convert_custom_tzinfo_objects_to_string():
@@ -417,6 +443,7 @@ def test_list_type():
     ty = pa.list_(pa.int64())
     assert isinstance(ty, pa.ListType)
     assert ty.value_type == pa.int64()
+    assert ty.value_field == pa.field("item", pa.int64(), nullable=True)
 
     with pytest.raises(TypeError):
         pa.list_(None)
@@ -426,6 +453,7 @@ def test_large_list_type():
     ty = pa.large_list(pa.utf8())
     assert isinstance(ty, pa.LargeListType)
     assert ty.value_type == pa.utf8()
+    assert ty.value_field == pa.field("item", pa.utf8(), nullable=True)
 
     with pytest.raises(TypeError):
         pa.large_list(None)
@@ -447,6 +475,7 @@ def test_fixed_size_list_type():
     ty = pa.list_(pa.float64(), 2)
     assert isinstance(ty, pa.FixedSizeListType)
     assert ty.value_type == pa.float64()
+    assert ty.value_field == pa.field("item", pa.float64(), nullable=True)
     assert ty.list_size == 2
 
     with pytest.raises(ValueError):
@@ -533,31 +562,45 @@ def test_union_type():
               pa.field('y', pa.binary())]
     type_codes = [5, 9]
 
-    for mode in ('sparse', pa.lib.UnionMode_SPARSE):
-        ty = pa.union(fields, mode=mode)
-        assert ty.mode == 'sparse'
-        check_fields(ty, fields)
-        assert ty.type_codes == [0, 1]
-        ty = pa.union(fields, mode=mode, type_codes=type_codes)
-        assert ty.mode == 'sparse'
-        check_fields(ty, fields)
-        assert ty.type_codes == type_codes
-        # Invalid number of type codes
-        with pytest.raises(ValueError):
-            pa.union(fields, mode=mode, type_codes=type_codes[1:])
+    sparse_factories = [
+        partial(pa.union, mode='sparse'),
+        partial(pa.union, mode=pa.lib.UnionMode_SPARSE),
+        pa.sparse_union,
+    ]
 
-    for mode in ('dense', pa.lib.UnionMode_DENSE):
-        ty = pa.union(fields, mode=mode)
+    dense_factories = [
+        partial(pa.union, mode='dense'),
+        partial(pa.union, mode=pa.lib.UnionMode_DENSE),
+        pa.dense_union,
+    ]
+
+    for factory in sparse_factories:
+        ty = factory(fields)
+        assert isinstance(ty, pa.SparseUnionType)
+        assert ty.mode == 'sparse'
+        check_fields(ty, fields)
+        assert ty.type_codes == [0, 1]
+        ty = factory(fields, type_codes=type_codes)
+        assert ty.mode == 'sparse'
+        check_fields(ty, fields)
+        assert ty.type_codes == type_codes
+        # Invalid number of type codes
+        with pytest.raises(ValueError):
+            factory(fields, type_codes=type_codes[1:])
+
+    for factory in dense_factories:
+        ty = factory(fields)
+        assert isinstance(ty, pa.DenseUnionType)
         assert ty.mode == 'dense'
         check_fields(ty, fields)
         assert ty.type_codes == [0, 1]
-        ty = pa.union(fields, mode=mode, type_codes=type_codes)
+        ty = factory(fields, type_codes=type_codes)
         assert ty.mode == 'dense'
         check_fields(ty, fields)
         assert ty.type_codes == type_codes
         # Invalid number of type codes
         with pytest.raises(ValueError):
-            pa.union(fields, mode=mode, type_codes=type_codes[1:])
+            factory(fields, type_codes=type_codes[1:])
 
     for mode in ('unknown', 2):
         with pytest.raises(ValueError, match='Invalid union mode'):
@@ -684,6 +727,7 @@ def test_bit_width():
                          (pa.uint32(), 32),
                          (pa.float16(), 16),
                          (pa.decimal128(19, 4), 128),
+                         (pa.decimal256(76, 38), 256),
                          (pa.binary(42), 42 * 8)]:
         assert ty.bit_width == expected
     for ty in [pa.binary(), pa.string(), pa.list_(pa.int16())]:
@@ -701,6 +745,10 @@ def test_decimal_properties():
     assert ty.byte_width == 16
     assert ty.precision == 19
     assert ty.scale == 4
+    ty = pa.decimal256(76, 38)
+    assert ty.byte_width == 32
+    assert ty.precision == 76
+    assert ty.scale == 38
 
 
 def test_decimal_overflow():
@@ -708,7 +756,13 @@ def test_decimal_overflow():
     pa.decimal128(38, 0)
     for i in (0, -1, 39):
         with pytest.raises(ValueError):
-            pa.decimal128(39, 0)
+            pa.decimal128(i, 0)
+
+    pa.decimal256(1, 0)
+    pa.decimal256(76, 0)
+    for i in (0, -1, 77):
+        with pytest.raises(ValueError):
+            pa.decimal256(i, 0)
 
 
 def test_type_equality_operators():

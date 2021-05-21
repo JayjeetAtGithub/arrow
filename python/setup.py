@@ -27,12 +27,14 @@ import shlex
 import shutil
 import sys
 
+if sys.version_info >= (3, 10):
+    import sysconfig
+else:
+    # Get correct EXT_SUFFIX on Windows (https://bugs.python.org/issue39825)
+    from distutils import sysconfig
+
 import pkg_resources
 from setuptools import setup, Extension, Distribution
-
-from distutils.command.clean import clean as _clean
-from distutils.util import strtobool
-from distutils import sysconfig
 
 from Cython.Distutils import build_ext as _build_ext
 import Cython
@@ -45,11 +47,7 @@ if Cython.__version__ < '0.29':
 
 setup_dir = os.path.abspath(os.path.dirname(__file__))
 
-
 ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
-if ext_suffix is None:
-    # https://bugs.python.org/issue19555
-    ext_suffix = sysconfig.get_config_var('SO')
 
 
 @contextlib.contextmanager
@@ -62,15 +60,21 @@ def changed_dir(dirname):
         os.chdir(oldcwd)
 
 
-class clean(_clean):
+def strtobool(val):
+    """Convert a string representation of truth to true (1) or false (0).
 
-    def run(self):
-        _clean.run(self)
-        for x in []:
-            try:
-                os.remove(x)
-            except OSError:
-                pass
+    True values are 'y', 'yes', 't', 'true', 'on', and '1'; false values
+    are 'n', 'no', 'f', 'false', 'off', and '0'.  Raises ValueError if
+    'val' is anything else.
+    """
+    # Copied from distutils
+    val = val.lower()
+    if val in ('y', 'yes', 't', 'true', 'on', '1'):
+        return 1
+    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+        return 0
+    else:
+        raise ValueError("invalid truth value %r" % (val,))
 
 
 class build_ext(_build_ext):
@@ -106,6 +110,7 @@ class build_ext(_build_ext):
                      ('with-flight', None, 'build the Flight extension'),
                      ('with-dataset', None, 'build the Dataset extension'),
                      ('with-parquet', None, 'build the Parquet extension'),
+                     ('with-s3', None, 'build the Amazon S3 extension'),
                      ('with-static-parquet', None, 'link parquet statically'),
                      ('with-static-boost', None, 'link boost statically'),
                      ('with-plasma', None, 'build the Plasma extension'),
@@ -121,7 +126,11 @@ class build_ext(_build_ext):
                       'bundle generated Cython C++ code '
                       '(used for code coverage)'),
                      ('bundle-arrow-cpp', None,
-                      'bundle the Arrow C++ libraries')] +
+                      'bundle the Arrow C++ libraries'),
+                     ('bundle-arrow-cpp-headers', None,
+                      'bundle the Arrow C++ headers'),
+                     ('bundle-plasma-executable', None,
+                      'bundle the plasma-store-server executable')] +
                     _build_ext.user_options)
 
     def initialize_options(self):
@@ -175,6 +184,10 @@ class build_ext(_build_ext):
             os.environ.get('PYARROW_BUNDLE_CYTHON_CPP', '0'))
         self.bundle_boost = strtobool(
             os.environ.get('PYARROW_BUNDLE_BOOST', '0'))
+        self.bundle_arrow_cpp_headers = strtobool(
+            os.environ.get('PYARROW_BUNDLE_ARROW_CPP_HEADERS', '1'))
+        self.bundle_plasma_executable = strtobool(
+            os.environ.get('PYARROW_BUNDLE_PLASMA_EXECUTABLE', '1'))
 
     CYTHON_MODULE_NAMES = [
         'lib',
@@ -185,11 +198,13 @@ class build_ext(_build_ext):
         '_cuda',
         '_flight',
         '_dataset',
+        '_feather',
         '_parquet',
         '_orc',
         '_plasma',
         '_s3fs',
         '_hdfs',
+        '_hdfsio',
         'gandiva']
 
     def _run_cmake(self):
@@ -303,11 +318,12 @@ class build_ext(_build_ext):
             else:
                 build_prefix = self.build_type
 
-            print('Bundling includes: ' + pjoin(build_prefix, 'include'))
-            if os.path.exists(pjoin(build_lib, 'pyarrow', 'include')):
-                shutil.rmtree(pjoin(build_lib, 'pyarrow', 'include'))
-            shutil.move(pjoin(build_prefix, 'include'),
-                        pjoin(build_lib, 'pyarrow'))
+            if self.bundle_arrow_cpp or self.bundle_arrow_cpp_headers:
+                print('Bundling includes: ' + pjoin(build_prefix, 'include'))
+                if os.path.exists(pjoin(build_lib, 'pyarrow', 'include')):
+                    shutil.rmtree(pjoin(build_lib, 'pyarrow', 'include'))
+                shutil.move(pjoin(build_prefix, 'include'),
+                            pjoin(build_lib, 'pyarrow'))
 
             # Move the built C-extension to the place expected by the Python
             # build
@@ -345,7 +361,7 @@ class build_ext(_build_ext):
             if self.bundle_arrow_cpp:
                 self._bundle_arrow_cpp(build_prefix, build_lib)
 
-            if self.with_plasma:
+            if self.with_plasma and self.bundle_plasma_executable:
                 # Move the plasma store
                 source = os.path.join(self.build_type, "plasma-store-server")
                 target = os.path.join(build_lib,
@@ -376,18 +392,6 @@ class build_ext(_build_ext):
                 build_prefix, build_lib,
                 "{}_regex".format(self.boost_namespace),
                 implib_required=False)
-        if sys.platform == 'win32':
-            # zlib uses zlib.dll for Windows
-            zlib_lib_name = 'zlib'
-            move_shared_libs(build_prefix, build_lib, zlib_lib_name,
-                             implib_required=False)
-            if self.with_flight:
-                # DLL dependencies for gRPC / Flight
-                for lib_name in ['cares', 'libprotobuf',
-                                 'libcrypto-1_1-x64',
-                                 'libssl-1_1-x64']:
-                    move_shared_libs(build_prefix, build_lib, lib_name,
-                                     implib_required=False)
 
     def _bundle_cython_cpp(self, name, lib_path):
         cpp_generated_path = self.get_ext_generated_cpp_source(name)
@@ -518,15 +522,11 @@ def _move_shared_libs_unix(build_prefix, build_lib, lib_name):
 
 # If the event of not running from a git clone (e.g. from a git archive
 # or a Python sdist), see if we can set the version number ourselves
-default_version = '2.0.0-SNAPSHOT'
+default_version = '5.0.0-SNAPSHOT'
 if (not os.path.exists('../.git') and
         not os.environ.get('SETUPTOOLS_SCM_PRETEND_VERSION')):
-    if os.path.exists('PKG-INFO'):
-        # We're probably in a Python sdist, setuptools_scm will handle fine
-        pass
-    else:
-        os.environ['SETUPTOOLS_SCM_PRETEND_VERSION'] = \
-            default_version.replace('-SNAPSHOT', 'a0')
+    os.environ['SETUPTOOLS_SCM_PRETEND_VERSION'] = \
+        default_version.replace('-SNAPSHOT', 'a0')
 
 
 # See https://github.com/pypa/setuptools_scm#configuration-parameters
@@ -564,7 +564,7 @@ class BinaryDistribution(Distribution):
 
 
 install_requires = (
-    'numpy >= 1.14',
+    'numpy >= 1.16.6',
 )
 
 
@@ -591,7 +591,6 @@ setup(
     # Dummy extension to trigger build_ext
     ext_modules=[Extension('__dummy__', sources=[])],
     cmdclass={
-        'clean': clean,
         'build_ext': build_ext
     },
     entry_points={
@@ -609,16 +608,16 @@ setup(
     setup_requires=['setuptools_scm', 'cython >= 0.29'] + setup_requires,
     install_requires=install_requires,
     tests_require=['pytest', 'pandas', 'hypothesis'],
-    python_requires='>=3.5',
+    python_requires='>=3.6',
     description='Python library for Apache Arrow',
     long_description=long_description,
     long_description_content_type='text/markdown',
     classifiers=[
         'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
     ],
     license='Apache License, Version 2.0',
     maintainer='Apache Arrow Developers',

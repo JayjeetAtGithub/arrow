@@ -17,8 +17,10 @@
 
 package org.apache.arrow.vector;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.math.BigDecimal;
@@ -35,7 +37,6 @@ import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.util.JsonStringArrayList;
 import org.apache.arrow.vector.util.TransferPair;
 import org.junit.After;
 import org.junit.Assert;
@@ -284,18 +285,18 @@ public class TestFixedSizeListVector {
       int[] values3 = new int[] {7, 8, 9};
 
       //set some values
-      writeListVector(writer1, values1);
-      writeListVector(writer1, values2);
-      writeListVector(writer1, values3);
+      writeListVector(vector1, writer1, values1);
+      writeListVector(vector1, writer1, values2);
+      writeListVector(vector1, writer1, values3);
       writer1.setValueCount(3);
 
       assertEquals(3, vector1.getValueCount());
 
-      int[] realValue1 = convertListToIntArray((JsonStringArrayList) vector1.getObject(0));
+      int[] realValue1 = convertListToIntArray(vector1.getObject(0));
       assertTrue(Arrays.equals(values1, realValue1));
-      int[] realValue2 = convertListToIntArray((JsonStringArrayList) vector1.getObject(1));
+      int[] realValue2 = convertListToIntArray(vector1.getObject(1));
       assertTrue(Arrays.equals(values2, realValue2));
-      int[] realValue3 = convertListToIntArray((JsonStringArrayList) vector1.getObject(2));
+      int[] realValue3 = convertListToIntArray(vector1.getObject(2));
       assertTrue(Arrays.equals(values3, realValue3));
     }
   }
@@ -359,14 +360,14 @@ public class TestFixedSizeListVector {
       int[] values2 = new int[] {4, 5, 6, 7, 8};
 
       //set some values
-      writeListVector(writer1, values1);
-      writeListVector(writer1, values2);
+      writeListVector(vector1, writer1, values1);
+      writeListVector(vector1, writer1, values2);
       writer1.setValueCount(3);
 
       assertEquals(3, vector1.getValueCount());
-      int[] realValue1 = convertListToIntArray((JsonStringArrayList) vector1.getObject(0));
+      int[] realValue1 = convertListToIntArray(vector1.getObject(0));
       assertTrue(Arrays.equals(values1, realValue1));
-      int[] realValue2 = convertListToIntArray((JsonStringArrayList) vector1.getObject(1));
+      int[] realValue2 = convertListToIntArray(vector1.getObject(1));
       assertTrue(Arrays.equals(values2, realValue2));
     }
   }
@@ -383,9 +384,9 @@ public class TestFixedSizeListVector {
       int[] values3 = new int[] {7, 8, 9};
 
       //set some values
-      writeListVector(writer1, values1);
-      writeListVector(writer1, values2);
-      writeListVector(writer1, values3);
+      writeListVector(vector1, writer1, values1);
+      writeListVector(vector1, writer1, values2);
+      writeListVector(vector1, writer1, values3);
       writer1.setValueCount(3);
 
       TransferPair transferPair = vector1.getTransferPair(allocator);
@@ -393,16 +394,79 @@ public class TestFixedSizeListVector {
       FixedSizeListVector targetVector = (FixedSizeListVector) transferPair.getTo();
 
       assertEquals(2, targetVector.getValueCount());
-      int[] realValue1 = convertListToIntArray((JsonStringArrayList) targetVector.getObject(0));
+      int[] realValue1 = convertListToIntArray(targetVector.getObject(0));
       assertTrue(Arrays.equals(values1, realValue1));
-      int[] realValue2 = convertListToIntArray((JsonStringArrayList) targetVector.getObject(1));
+      int[] realValue2 = convertListToIntArray(targetVector.getObject(1));
       assertTrue(Arrays.equals(values2, realValue2));
 
       targetVector.clear();
     }
   }
 
-  private int[] convertListToIntArray(JsonStringArrayList list) {
+  @Test
+  public void testZeroWidthVector() {
+    try (final FixedSizeListVector vector1 = FixedSizeListVector.empty("vector", 0, allocator)) {
+
+      UnionFixedSizeListWriter writer1 = vector1.getWriter();
+      writer1.allocate();
+
+      int[] values1 = new int[] {};
+      int[] values2 = new int[] {};
+      int[] values3 = null;
+      int[] values4 = new int[] {};
+
+      //set some values
+      writeListVector(vector1, writer1, values1);
+      writeListVector(vector1, writer1, values2);
+      writeListVector(vector1, writer1, values3);
+      writeListVector(vector1, writer1, values4);
+      writer1.setValueCount(4);
+
+      assertEquals(4, vector1.getValueCount());
+
+      int[] realValue1 = convertListToIntArray(vector1.getObject(0));
+      assertArrayEquals(values1, realValue1);
+      int[] realValue2 = convertListToIntArray(vector1.getObject(1));
+      assertArrayEquals(values2, realValue2);
+      assertNull(vector1.getObject(2));
+      int[] realValue4 = convertListToIntArray(vector1.getObject(3));
+      assertArrayEquals(values4, realValue4);
+    }
+  }
+
+  @Test
+  public void testVectorWithNulls() {
+    try (final FixedSizeListVector vector1 = FixedSizeListVector.empty("vector", 4, allocator)) {
+
+      UnionFixedSizeListWriter writer1 = vector1.getWriter();
+      writer1.allocate();
+
+      List<Integer> values1 = Arrays.asList(null, 1, 2, 3);
+      List<Integer> values2 = Arrays.asList(4, null, 5, 6);
+      List<Integer> values3 = null;
+      List<Integer> values4 = Arrays.asList(7, 8, null, 9);
+
+      //set some values
+      writeListVector(vector1, writer1, values1);
+      writeListVector(vector1, writer1, values2);
+      writeListVector(vector1, writer1, values3);
+      writeListVector(vector1, writer1, values4);
+      writer1.setValueCount(4);
+
+      assertEquals(4, vector1.getValueCount());
+
+      List realValue1 = vector1.getObject(0);
+      assertEquals(values1, realValue1);
+      List realValue2 = vector1.getObject(1);
+      assertEquals(values2, realValue2);
+      List realValue3 = vector1.getObject(2);
+      assertEquals(values3, realValue3);
+      List realValue4 = vector1.getObject(3);
+      assertEquals(values4, realValue4);
+    }
+  }
+
+  private int[] convertListToIntArray(List list) {
     int[] values = new int[list.size()];
     for (int i = 0; i < list.size(); i++) {
       values[i] = (int) list.get(i);
@@ -410,10 +474,30 @@ public class TestFixedSizeListVector {
     return values;
   }
 
-  private void writeListVector(UnionFixedSizeListWriter writer, int[] values) throws Exception {
+  private void writeListVector(FixedSizeListVector vector, UnionFixedSizeListWriter writer, int[] values) {
     writer.startList();
-    for (int v: values) {
-      writer.integer().writeInt(v);
+    if (values != null) {
+      for (int v : values) {
+        writer.integer().writeInt(v);
+      }
+    } else {
+      vector.setNull(writer.getPosition());
+    }
+    writer.endList();
+  }
+
+  private void writeListVector(FixedSizeListVector vector, UnionFixedSizeListWriter writer, List<Integer> values) {
+    writer.startList();
+    if (values != null) {
+      for (Integer v : values) {
+        if (v == null) {
+          writer.writeNull();
+        } else {
+          writer.integer().writeInt(v);
+        }
+      }
+    } else {
+      vector.setNull(writer.getPosition());
     }
     writer.endList();
   }

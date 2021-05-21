@@ -44,11 +44,10 @@ the following R6 methods that map onto the underlying C++ methods:
 \itemize{
 \item \verb{$column(i)}: Extract a \code{ChunkedArray} by integer position from the table
 \item \verb{$ColumnNames()}: Get all column names (called by \code{names(tab)})
+\item \verb{$RenameColumns(value)}: Set all column names (called by \code{names(tab) <- value})
 \item \verb{$GetColumnByName(name)}: Extract a \code{ChunkedArray} by string name
 \item \verb{$field(i)}: Extract a \code{Field} from the table schema by integer position
-\item \verb{$select(spec)}: Return a new table with a selection of columns.
-This supports the usual \code{character}, \code{numeric}, and \code{logical} selection
-methods as well as "tidy select" expressions.
+\item \verb{$SelectColumns(indices)}: Return new \code{Table} with specified columns, expressed as 0-based integers.
 \item \verb{$Slice(offset, length = NULL)}: Create a zero-copy view starting at the
 indicated integer offset and going for the given length, or to the end
 of the table if \code{NULL}, the default.
@@ -57,6 +56,11 @@ integers \code{i}. If \code{i} is an Arrow \code{Array} or \code{ChunkedArray}, 
 coerced to an R vector before taking.
 \item \verb{$Filter(i, keep_na = TRUE)}: return an \code{Table} with rows at positions where logical
 vector or Arrow boolean-type \verb{(Chunked)Array} \code{i} is \code{TRUE}.
+\item \verb{$SortIndices(names, descending = FALSE)}: return an \code{Array} of integer row
+positions that can be used to rearrange the \code{Table} in ascending or descending
+order by the first named column, breaking ties with further named columns.
+\code{descending} can be a logical vector of length one or of the same length as
+\code{names}.
 \item \verb{$serialize(output_stream, ...)}: Write the table to the given
 \link{OutputStream}
 \item \verb{$cast(target_schema, safe = TRUE, options = cast_options(safe))}: Alter
@@ -70,7 +74,7 @@ There are also some active bindings:
 \item \verb{$schema}
 \item \verb{$metadata}: Returns the key-value metadata of the \code{Schema} as a named list.
 Modify or replace by assigning in (\code{tab$metadata <- new_metadata}).
-All list elements are coerced to string.
+All list elements are coerced to string. See \code{schema()} for more information.
 \item \verb{$columns}: Returns a list of \code{ChunkedArray}s
 }
 }

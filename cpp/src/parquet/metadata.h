@@ -24,7 +24,6 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/util/key_value_metadata.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/schema.h"
@@ -58,16 +57,6 @@ class PARQUET_EXPORT ApplicationVersion {
   static const ApplicationVersion& PARQUET_816_FIXED_VERSION();
   static const ApplicationVersion& PARQUET_CPP_FIXED_STATS_VERSION();
   static const ApplicationVersion& PARQUET_MR_FIXED_STATS_VERSION();
-  // Regular expression for the version format
-  // major . minor . patch unknown - prerelease.x + build info
-  // Eg: 1.5.0ab-cdh5.5.0+cd
-  static constexpr char const* VERSION_FORMAT =
-      "^(\\d+)\\.(\\d+)\\.(\\d+)([^-+]*)?(?:-([^+]*))?(?:\\+(.*))?$";
-  // Regular expression for the application format
-  // application_name version VERSION_FORMAT (build build_name)
-  // Eg: parquet-cpp version 1.5.0ab-xyz5.5.0+cd (build abcd)
-  static constexpr char const* APPLICATION_FORMAT =
-      "(.*?)\\s*(?:(version\\s*(?:([^(]*?)\\s*(?:\\(\\s*build\\s*([^)]*?)\\s*\\))?)?)?)";
 
   // Application that wrote the file. e.g. "IMPALA"
   std::string application_;
@@ -77,9 +66,8 @@ class PARQUET_EXPORT ApplicationVersion {
   // Version of the application that wrote the file, expressed as
   // (<major>.<minor>.<patch>). Unmatched parts default to 0.
   // "1.2.3"    => {1, 2, 3}
-  // "1.2"      => {0, 0, 0}
-  // "1.2-cdh5" => {0, 0, 0}
-  // TODO (majetideepak): Implement support for pre_release
+  // "1.2"      => {1, 2, 0}
+  // "1.2-cdh5" => {1, 2, 0}
   struct {
     int major;
     int minor;
@@ -89,9 +77,9 @@ class PARQUET_EXPORT ApplicationVersion {
     std::string build_info;
   } version;
 
-  ApplicationVersion() {}
+  ApplicationVersion() = default;
   explicit ApplicationVersion(const std::string& created_by);
-  ApplicationVersion(const std::string& application, int major, int minor, int patch);
+  ApplicationVersion(std::string application, int major, int minor, int patch);
 
   // Returns true if version is strictly less than other_version
   bool VersionLt(const ApplicationVersion& other_version) const;
@@ -108,6 +96,8 @@ class PARQUET_EXPORT ColumnCryptoMetaData {
  public:
   static std::unique_ptr<ColumnCryptoMetaData> Make(const uint8_t* metadata);
   ~ColumnCryptoMetaData();
+
+  bool Equals(const ColumnCryptoMetaData& other) const;
 
   std::shared_ptr<schema::ColumnPath> path_in_schema() const;
   bool encrypted_with_footer_key() const;
@@ -138,6 +128,8 @@ class PARQUET_EXPORT ColumnChunkMetaData {
       std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
 
   ~ColumnChunkMetaData();
+
+  bool Equals(const ColumnChunkMetaData& other) const;
 
   // column chunk
   int64_t file_offset() const;
@@ -190,6 +182,8 @@ class PARQUET_EXPORT RowGroupMetaData {
 
   ~RowGroupMetaData();
 
+  bool Equals(const RowGroupMetaData& other) const;
+
   /// \brief The number of columns in this row group. The order must match the
   /// parent's column ordering.
   int num_columns() const;
@@ -210,6 +204,12 @@ class PARQUET_EXPORT RowGroupMetaData {
 
   /// \brief Total byte size of all the uncompressed column data in this row group.
   int64_t total_byte_size() const;
+
+  /// \brief Total byte size of all the compressed (and potentially encrypted)
+  /// column data in this row group.
+  ///
+  /// This information is optional and may be 0 if omitted.
+  int64_t total_compressed_size() const;
 
   /// \brief Byte offset from beginning of file to first page (data or
   /// dictionary) in this row group
@@ -243,6 +243,8 @@ class PARQUET_EXPORT FileMetaData {
       std::shared_ptr<InternalFileDecryptor> file_decryptor = NULLPTR);
 
   ~FileMetaData();
+
+  bool Equals(const FileMetaData& other) const;
 
   /// \brief The number of top-level columns in the schema.
   ///
@@ -333,6 +335,10 @@ class PARQUET_EXPORT FileMetaData {
   ///
   /// \throws ParquetException if schemas are not equal.
   void AppendRowGroups(const FileMetaData& other);
+
+  /// \brief Return a FileMetaData containing a subset of the row groups in this
+  /// FileMetaData.
+  std::shared_ptr<FileMetaData> Subset(const std::vector<int>& row_groups) const;
 
  private:
   friend FileMetaDataBuilder;

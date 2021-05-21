@@ -163,6 +163,34 @@ def test_python_file_readinto():
         assert len(dst_buf) == length
 
 
+def test_python_file_read_buffer():
+    length = 10
+    data = b'0123456798'
+    dst_buf = bytearray(data)
+
+    class DuckReader:
+        def close(self):
+            pass
+
+        @property
+        def closed(self):
+            return False
+
+        def read_buffer(self, nbytes):
+            assert nbytes == length
+            return memoryview(dst_buf)[:nbytes]
+
+    duck_reader = DuckReader()
+    with pa.PythonFile(duck_reader, mode='r') as f:
+        buf = f.read_buffer(length)
+        assert len(buf) == length
+        assert memoryview(buf).tobytes() == dst_buf[:length]
+        # buf should point to the same memory, so modyfing it
+        memoryview(buf)[0] = ord(b'x')
+        # should modify the original
+        assert dst_buf[0] == ord(b'x')
+
+
 def test_python_file_correct_abc():
     with pa.PythonFile(BytesIO(b''), mode='r') as f:
         assert isinstance(f, BufferedIOBase)
@@ -573,7 +601,7 @@ def test_compress_decompress(compression):
     INPUT_SIZE = 10000
     test_data = (np.random.randint(0, 255, size=INPUT_SIZE)
                  .astype(np.uint8)
-                 .tostring())
+                 .tobytes())
     test_buf = pa.py_buffer(test_data)
 
     compressed_buf = pa.compress(test_buf, codec=compression)
@@ -975,6 +1003,22 @@ def test_native_file_modes(tmpdir):
         assert f.readable()
         assert f.writable()
         assert f.seekable()
+
+
+def test_native_file_permissions(tmpdir):
+    # ARROW-10124: permissions of created files should follow umask
+    cur_umask = os.umask(0o002)
+    os.umask(cur_umask)
+
+    path = os.path.join(str(tmpdir), guid())
+    with pa.OSFile(path, mode='w'):
+        pass
+    assert os.stat(path).st_mode & 0o777 == 0o666 & ~cur_umask
+
+    path = os.path.join(str(tmpdir), guid())
+    with pa.memory_map(path, 'w'):
+        pass
+    assert os.stat(path).st_mode & 0o777 == 0o666 & ~cur_umask
 
 
 def test_native_file_raises_ValueError_after_close(tmpdir):

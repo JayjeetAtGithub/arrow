@@ -53,13 +53,13 @@
 #include "arrow/util/bit_util.h"
 #include "arrow/util/logging.h"
 
-namespace pb = arrow::flight::protocol;
-
 static constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
 
 namespace arrow {
 namespace flight {
 namespace internal {
+
+namespace pb = arrow::flight::protocol;
 
 using arrow::ipc::IpcPayload;
 
@@ -374,7 +374,13 @@ grpc::Status FlightDataDeserialize(ByteBuffer* buffer, FlightData* out) {
   buffer->Clear();
 
   // TODO(wesm): Where and when should we verify that the FlightData is not
-  // malformed or missing components?
+  // malformed?
+
+  // Set the default value for an unspecified FlightData body. The other
+  // fields can be null if they're unspecified.
+  if (out->body == nullptr) {
+    out->body = std::make_shared<Buffer>(nullptr, 0);
+  }
 
   return grpc::Status::OK;
 }

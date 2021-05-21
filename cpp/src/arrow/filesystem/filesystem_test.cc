@@ -188,6 +188,16 @@ TEST(PathUtil, RemoveLeadingSlash) {
   ASSERT_EQ("abc/def/", std::string(RemoveLeadingSlash("//abc/def/")));
 }
 
+TEST(PathUtil, IsAncestorOf) {
+  ASSERT_TRUE(IsAncestorOf("", ""));
+  ASSERT_TRUE(IsAncestorOf("", "/hello"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello"));
+  ASSERT_FALSE(IsAncestorOf("/hello", "/world"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello/world"));
+  ASSERT_TRUE(IsAncestorOf("/hello", "/hello/world/how/are/you"));
+  ASSERT_FALSE(IsAncestorOf("/hello/w", "/hello/world"));
+}
+
 TEST(PathUtil, MakeAbstractPathRelative) {
   ASSERT_OK_AND_EQ("", MakeAbstractPathRelative("/", "/"));
   ASSERT_OK_AND_EQ("foo/bar", MakeAbstractPathRelative("/", "/foo/bar"));
@@ -223,6 +233,21 @@ TEST(PathUtil, AncestorsFromBasePath) {
             V({"foo/bar", "foo/bar/baz"}));
 }
 
+TEST(PathUtil, MinimalCreateDirSet) {
+  using V = std::vector<std::string>;
+
+  ASSERT_EQ(MinimalCreateDirSet({}), V{});
+  ASSERT_EQ(MinimalCreateDirSet({"foo"}), V{"foo"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar"}), V{"foo/bar"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar/baz"}), V{"foo/bar/baz"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar", "foo/bar"}), V{"foo/bar"});
+  ASSERT_EQ(MinimalCreateDirSet({"foo", "foo/bar", "foo", "foo/baz", "foo/baz/quux"}),
+            V({"foo/bar", "foo/baz/quux"}));
+
+  ASSERT_EQ(MinimalCreateDirSet({""}), V{});
+  ASSERT_EQ(MinimalCreateDirSet({"", "/foo"}), V{"/foo"});
+}
+
 TEST(PathUtil, ToBackslashes) {
   ASSERT_EQ(ToBackslashes("foo/bar"), "foo\\bar");
   ASSERT_EQ(ToBackslashes("//foo/bar/"), "\\\\foo\\bar\\");
@@ -242,21 +267,26 @@ TEST(PathUtil, ToSlashes) {
 ////////////////////////////////////////////////////////////////////////////
 // Generic MockFileSystem tests
 
+template <typename MockFileSystemType>
 class TestMockFSGeneric : public ::testing::Test, public GenericFileSystemTest {
  public:
   void SetUp() override {
     time_ = TimePoint(TimePoint::duration(42));
-    fs_ = std::make_shared<MockFileSystem>(time_);
+    fs_ = std::make_shared<MockFileSystemType>(time_);
   }
 
  protected:
   std::shared_ptr<FileSystem> GetEmptyFileSystem() override { return fs_; }
 
   TimePoint time_;
-  std::shared_ptr<MockFileSystem> fs_;
+  std::shared_ptr<FileSystem> fs_;
 };
 
-GENERIC_FS_TEST_FUNCTIONS(TestMockFSGeneric);
+using MockFileSystemTypes = ::testing::Types<MockFileSystem, MockAsyncFileSystem>;
+
+TYPED_TEST_SUITE(TestMockFSGeneric, MockFileSystemTypes);
+
+GENERIC_FS_TYPED_TEST_FUNCTIONS(TestMockFSGeneric);
 
 ////////////////////////////////////////////////////////////////////////////
 // Concrete MockFileSystem tests
@@ -593,6 +623,32 @@ TEST_F(TestSubTreeFileSystem, CopyFile) {
   CheckFiles({{"sub/tree/AB/ef", time_, "data"},
               {"sub/tree/ab", time_, "data"},
               {"sub/tree/cd", time_, "data"}});
+}
+
+TEST_F(TestSubTreeFileSystem, CopyFiles) {
+  ASSERT_OK(subfs_->CreateDir("AB"));
+  ASSERT_OK(subfs_->CreateDir("CD/CD"));
+  ASSERT_OK(subfs_->CreateDir("EF/EF/EF"));
+
+  CreateFile("AB/ab", "ab");
+  CreateFile("CD/CD/cd", "cd");
+  CreateFile("EF/EF/EF/ef", "ef");
+
+  ASSERT_OK(fs_->CreateDir("sub/copy"));
+  auto dest_fs = std::make_shared<SubTreeFileSystem>("sub/copy", fs_);
+
+  FileSelector sel;
+  sel.recursive = true;
+  ASSERT_OK(CopyFiles(subfs_, sel, dest_fs, ""));
+
+  CheckFiles({
+      {"sub/copy/AB/ab", time_, "ab"},
+      {"sub/copy/CD/CD/cd", time_, "cd"},
+      {"sub/copy/EF/EF/EF/ef", time_, "ef"},
+      {"sub/tree/AB/ab", time_, "ab"},
+      {"sub/tree/CD/CD/cd", time_, "cd"},
+      {"sub/tree/EF/EF/EF/ef", time_, "ef"},
+  });
 }
 
 TEST_F(TestSubTreeFileSystem, OpenInputStream) {

@@ -94,12 +94,12 @@
 #' }
 RecordBatchReader <- R6Class("RecordBatchReader", inherit = ArrowObject,
   public = list(
-    read_next_batch = function() {
-      shared_ptr(RecordBatch, RecordBatchReader__ReadNext(self))
-    }
+    read_next_batch = function() RecordBatchReader__ReadNext(self),
+    batches = function() RecordBatchReader__batches(self),
+    read_table = function() Table__from_RecordBatchReader(self)
   ),
   active = list(
-    schema = function() shared_ptr(Schema, RecordBatchReader__schema(self))
+    schema = function() RecordBatchReader__schema(self)
   )
 )
 
@@ -107,12 +107,7 @@ RecordBatchReader <- R6Class("RecordBatchReader", inherit = ArrowObject,
 #' @usage NULL
 #' @format NULL
 #' @export
-RecordBatchStreamReader <- R6Class("RecordBatchStreamReader", inherit = RecordBatchReader,
-  public = list(
-    batches = function() map(ipc___RecordBatchStreamReader__batches(self), shared_ptr, class = RecordBatch),
-    read_table = function() shared_ptr(Table, Table__from_RecordBatchStreamReader(self))
-  )
-)
+RecordBatchStreamReader <- R6Class("RecordBatchStreamReader", inherit = RecordBatchReader)
 RecordBatchStreamReader$create <- function(stream) {
   if (inherits(stream, c("raw", "Buffer"))) {
     # TODO: deprecate this because it doesn't close the connection to the Buffer
@@ -120,7 +115,7 @@ RecordBatchStreamReader$create <- function(stream) {
     stream <- BufferReader$create(stream)
   }
   assert_is(stream, "InputStream")
-  shared_ptr(RecordBatchStreamReader, ipc___RecordBatchStreamReader__Open(stream))
+  ipc___RecordBatchStreamReader__Open(stream)
 }
 
 #' @rdname RecordBatchReader
@@ -128,19 +123,20 @@ RecordBatchStreamReader$create <- function(stream) {
 #' @format NULL
 #' @export
 RecordBatchFileReader <- R6Class("RecordBatchFileReader", inherit = ArrowObject,
-  # Why doesn't this inherit from RecordBatchReader?
+  # Why doesn't this inherit from RecordBatchReader in C++?
+  # Origin: https://github.com/apache/arrow/pull/679
   public = list(
     get_batch = function(i) {
-      shared_ptr(RecordBatch, ipc___RecordBatchFileReader__ReadRecordBatch(self, i))
+      ipc___RecordBatchFileReader__ReadRecordBatch(self, i)
     },
     batches = function() {
-      map(ipc___RecordBatchFileReader__batches(self), shared_ptr, class = RecordBatch)
+      ipc___RecordBatchFileReader__batches(self)
     },
-    read_table = function() shared_ptr(Table, Table__from_RecordBatchFileReader(self))
+    read_table = function() Table__from_RecordBatchFileReader(self)
   ),
   active = list(
     num_record_batches = function() ipc___RecordBatchFileReader__num_record_batches(self),
-    schema = function() shared_ptr(Schema, ipc___RecordBatchFileReader__schema(self))
+    schema = function() ipc___RecordBatchFileReader__schema(self)
   )
 )
 RecordBatchFileReader$create <- function(file) {
@@ -150,5 +146,5 @@ RecordBatchFileReader$create <- function(file) {
     file <- BufferReader$create(file)
   }
   assert_is(file, "InputStream")
-  shared_ptr(RecordBatchFileReader, ipc___RecordBatchFileReader__Open(file))
+  ipc___RecordBatchFileReader__Open(file)
 }

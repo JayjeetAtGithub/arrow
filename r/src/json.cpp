@@ -31,7 +31,7 @@ std::shared_ptr<arrow::json::ReadOptions> json___ReadOptions__initialize(bool us
 }
 
 // [[arrow::export]]
-std::shared_ptr<arrow::json::ParseOptions> json___ParseOptions__initialize(
+std::shared_ptr<arrow::json::ParseOptions> json___ParseOptions__initialize1(
     bool newlines_in_values) {
   auto res =
       std::make_shared<arrow::json::ParseOptions>(arrow::json::ParseOptions::Defaults());
@@ -40,11 +40,21 @@ std::shared_ptr<arrow::json::ParseOptions> json___ParseOptions__initialize(
 }
 
 // [[arrow::export]]
+std::shared_ptr<arrow::json::ParseOptions> json___ParseOptions__initialize2(
+    bool newlines_in_values, const std::shared_ptr<arrow::Schema>& explicit_schema) {
+  auto res =
+      std::make_shared<arrow::json::ParseOptions>(arrow::json::ParseOptions::Defaults());
+  res->newlines_in_values = newlines_in_values;
+  res->explicit_schema = explicit_schema;
+  return res;
+}
+
+// [[arrow::export]]
 std::shared_ptr<arrow::json::TableReader> json___TableReader__Make(
     const std::shared_ptr<arrow::io::InputStream>& input,
     const std::shared_ptr<arrow::json::ReadOptions>& read_options,
     const std::shared_ptr<arrow::json::ParseOptions>& parse_options) {
-  return ValueOrStop(arrow::json::TableReader::Make(arrow::default_memory_pool(), input,
+  return ValueOrStop(arrow::json::TableReader::Make(gc_memory_pool(), input,
                                                     *read_options, *parse_options));
 }
 

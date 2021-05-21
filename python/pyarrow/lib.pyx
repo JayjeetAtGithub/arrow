@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# cython: profile=False
-# distutils: language = c++
+# cython: profile = False
 # cython: embedsignature = True
+# cython: nonecheck = True
+# distutils: language = c++
 
 import datetime
 import decimal as _pydecimal
@@ -73,7 +74,8 @@ Type_INT64 = _Type_INT64
 Type_HALF_FLOAT = _Type_HALF_FLOAT
 Type_FLOAT = _Type_FLOAT
 Type_DOUBLE = _Type_DOUBLE
-Type_DECIMAL = _Type_DECIMAL
+Type_DECIMAL128 = _Type_DECIMAL128
+Type_DECIMAL256 = _Type_DECIMAL256
 Type_DATE32 = _Type_DATE32
 Type_DATE64 = _Type_DATE64
 Type_TIMESTAMP = _Type_TIMESTAMP
@@ -138,13 +140,9 @@ include "tensor.pxi"
 
 # File IO
 include "io.pxi"
-include "io-hdfs.pxi"
 
 # IPC / Messaging
 include "ipc.pxi"
-
-# Feather format
-include "feather.pxi"
 
 # Python serialization
 include "serialization.pxi"

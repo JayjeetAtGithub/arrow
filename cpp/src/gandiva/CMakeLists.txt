@@ -40,6 +40,8 @@ endif()
 
 add_definitions(-DGANDIVA_LLVM_VERSION=${LLVM_VERSION_MAJOR})
 
+find_package(OpenSSLAlt REQUIRED)
+
 # Set the path where the bitcode file generated, see precompiled/CMakeLists.txt
 set(GANDIVA_PRECOMPILED_BC_PATH "${CMAKE_CURRENT_BINARY_DIR}/irhelpers.bc")
 set(GANDIVA_PRECOMPILED_CC_PATH "${CMAKE_CURRENT_BINARY_DIR}/precompiled_bitcode.cc")
@@ -52,6 +54,7 @@ set_source_files_properties(${GANDIVA_PRECOMPILED_CC_PATH} PROPERTIES GENERATED 
 set(SRC_FILES
     annotator.cc
     bitmap_accumulator.cc
+    cache.cc
     cast_time.cc
     configuration.cc
     context_helper.cc
@@ -76,6 +79,7 @@ set(SRC_FILES
     function_registry_timestamp_arithmetic.cc
     function_signature.cc
     gdv_function_stubs.cc
+    hash_utils.cc
     llvm_generator.cc
     llvm_types.cc
     like_holder.cc
@@ -88,9 +92,10 @@ set(SRC_FILES
     random_generator_holder.cc
     ${GANDIVA_PRECOMPILED_CC_PATH})
 
-set(GANDIVA_SHARED_PRIVATE_LINK_LIBS arrow_shared LLVM::LLVM_INTERFACE RE2::re2)
+set(GANDIVA_SHARED_PRIVATE_LINK_LIBS arrow_shared LLVM::LLVM_INTERFACE
+                                     ${GANDIVA_OPENSSL_LIBS})
 
-set(GANDIVA_STATIC_LINK_LIBS arrow_static LLVM::LLVM_INTERFACE RE2::re2)
+set(GANDIVA_STATIC_LINK_LIBS arrow_static LLVM::LLVM_INTERFACE ${GANDIVA_OPENSSL_LIBS})
 
 if(ARROW_GANDIVA_STATIC_LIBSTDCPP
    AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX))
@@ -132,6 +137,7 @@ add_arrow_lib(gandiva
               precompiled
               EXTRA_INCLUDES
               $<TARGET_PROPERTY:LLVM::LLVM_INTERFACE,INTERFACE_INCLUDE_DIRECTORIES>
+              ${GANDIVA_OPENSSL_INCLUDE_DIR}
               SHARED_LINK_FLAGS
               ${GANDIVA_SHARED_LINK_FLAGS}
               SHARED_LINK_LIBS
@@ -154,9 +160,9 @@ add_dependencies(gandiva ${GANDIVA_LIBRARIES})
 
 arrow_install_all_headers("gandiva")
 
-set(GANDIVA_STATIC_TEST_LINK_LIBS gandiva_static RE2::re2 ${ARROW_TEST_LINK_LIBS})
+set(GANDIVA_STATIC_TEST_LINK_LIBS gandiva_static ${ARROW_TEST_LINK_LIBS})
 
-set(GANDIVA_SHARED_TEST_LINK_LIBS gandiva_shared RE2::re2 ${ARROW_TEST_LINK_LIBS})
+set(GANDIVA_SHARED_TEST_LINK_LIBS gandiva_shared ${ARROW_TEST_LINK_LIBS})
 
 function(ADD_GANDIVA_TEST REL_TEST_NAME)
   set(options USE_STATIC_LINKING)
@@ -203,7 +209,8 @@ endfunction()
 
 set(GANDIVA_INTERNALS_TEST_ARGUMENTS)
 if(WIN32)
-  list(APPEND GANDIVA_INTERNALS_TEST_ARGUMENTS EXTRA_LINK_LIBS LLVM::LLVM_INTERFACE)
+  list(APPEND GANDIVA_INTERNALS_TEST_ARGUMENTS EXTRA_LINK_LIBS LLVM::LLVM_INTERFACE
+              ${GANDIVA_OPENSSL_LIBS})
 endif()
 add_gandiva_test(internals-test
                  SOURCES
@@ -224,11 +231,15 @@ add_gandiva_test(internals-test
                  like_holder_test.cc
                  decimal_type_util_test.cc
                  random_generator_holder_test.cc
+                 hash_utils_test.cc
+                 gdv_function_stubs_test.cc
                  EXTRA_DEPENDENCIES
                  LLVM::LLVM_INTERFACE
+                 ${GANDIVA_OPENSSL_LIBS}
                  EXTRA_INCLUDES
                  $<TARGET_PROPERTY:LLVM::LLVM_INTERFACE,INTERFACE_INCLUDE_DIRECTORIES>
-                 ${GANDIVA_INTERNALS_TEST_ARGUMENTS})
+                 ${GANDIVA_INTERNALS_TEST_ARGUMENTS}
+                 ${GANDIVA_OPENSSL_INCLUDE_DIR})
 
 if(ARROW_GANDIVA_JAVA)
   add_subdirectory(jni)

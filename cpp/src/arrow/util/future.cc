@@ -39,6 +39,8 @@ using internal::checked_cast;
 // should ideally not limit scalability.
 static std::mutex global_waiter_mutex;
 
+const double FutureWaiter::kInfinity = HUGE_VAL;
+
 class FutureWaiterImpl : public FutureWaiter {
  public:
   FutureWaiterImpl(Kind kind, std::vector<FutureImpl*> futures)
@@ -73,7 +75,7 @@ class FutureWaiterImpl : public FutureWaiter {
     }
   }
 
-  ~FutureWaiterImpl() {
+  ~FutureWaiterImpl() override {
     for (auto future : futures_) {
       future->RemoveWaiter(this);
     }
@@ -174,9 +176,9 @@ FutureWaiterImpl* GetConcreteWaiter(FutureWaiter* waiter) {
 
 }  // namespace
 
-FutureWaiter::FutureWaiter() {}
+FutureWaiter::FutureWaiter() = default;
 
-FutureWaiter::~FutureWaiter() {}
+FutureWaiter::~FutureWaiter() = default;
 
 std::unique_ptr<FutureWaiter> FutureWaiter::Make(Kind kind,
                                                  std::vector<FutureImpl*> futures) {
@@ -229,6 +231,26 @@ class ConcreteFutureImpl : public FutureImpl {
 
   void DoMarkFailed() { DoMarkFinishedOrFailed(FutureState::FAILURE); }
 
+  void AddCallback(Callback callback) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (IsFutureFinished(state_)) {
+      lock.unlock();
+      std::move(callback)();
+    } else {
+      callbacks_.push_back(std::move(callback));
+    }
+  }
+
+  bool TryAddCallback(const std::function<Callback()>& callback_factory) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (IsFutureFinished(state_)) {
+      return false;
+    } else {
+      callbacks_.push_back(callback_factory());
+      return true;
+    }
+  }
+
   void DoMarkFinishedOrFailed(FutureState state) {
     {
       // Lock the hypothetical waiter first, and the future after.
@@ -243,6 +265,17 @@ class ConcreteFutureImpl : public FutureImpl {
       }
     }
     cv_.notify_all();
+
+    // run callbacks, lock not needed since the future is finsihed by this
+    // point so nothing else can modify the callbacks list and it is safe
+    // to iterate.
+    //
+    // In fact, it is important not to hold the locks because the callback
+    // may be slow or do its own locking on other resources
+    for (auto&& callback : callbacks_) {
+      std::move(callback)();
+    }
+    callbacks_.clear();
   }
 
   void DoWait() {
@@ -277,6 +310,12 @@ std::unique_ptr<FutureImpl> FutureImpl::Make() {
   return std::unique_ptr<FutureImpl>(new ConcreteFutureImpl());
 }
 
+std::unique_ptr<FutureImpl> FutureImpl::MakeFinished(FutureState state) {
+  std::unique_ptr<ConcreteFutureImpl> ptr(new ConcreteFutureImpl());
+  ptr->state_ = state;
+  return std::move(ptr);
+}
+
 FutureImpl::FutureImpl() : state_(FutureState::PENDING) {}
 
 FutureState FutureImpl::SetWaiter(FutureWaiter* w, int future_num) {
@@ -294,5 +333,43 @@ bool FutureImpl::Wait(double seconds) { return GetConcreteFuture(this)->DoWait(s
 void FutureImpl::MarkFinished() { GetConcreteFuture(this)->DoMarkFinished(); }
 
 void FutureImpl::MarkFailed() { GetConcreteFuture(this)->DoMarkFailed(); }
+
+void FutureImpl::AddCallback(Callback callback) {
+  GetConcreteFuture(this)->AddCallback(std::move(callback));
+}
+
+bool FutureImpl::TryAddCallback(const std::function<Callback()>& callback_factory) {
+  return GetConcreteFuture(this)->TryAddCallback(callback_factory);
+}
+
+Future<> AllComplete(const std::vector<Future<>>& futures) {
+  struct State {
+    explicit State(int64_t n_futures) : mutex(), n_remaining(n_futures) {}
+
+    std::mutex mutex;
+    std::atomic<size_t> n_remaining;
+  };
+
+  if (futures.empty()) {
+    return Future<>::MakeFinished();
+  }
+
+  auto state = std::make_shared<State>(futures.size());
+  auto out = Future<>::Make();
+  for (const auto& future : futures) {
+    future.AddCallback([state, out](const Status& status) mutable {
+      if (!status.ok()) {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!out.is_finished()) {
+          out.MarkFinished(status);
+        }
+        return;
+      }
+      if (state->n_remaining.fetch_sub(1) != 1) return;
+      out.MarkFinished();
+    });
+  }
+  return out;
+}
 
 }  // namespace arrow

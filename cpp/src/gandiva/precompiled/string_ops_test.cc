@@ -17,6 +17,9 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <limits>
+
 #include "gandiva/execution_context.h"
 #include "gandiva/precompiled/types.h"
 
@@ -114,12 +117,221 @@ TEST(TestStringOps, TestCharLength) {
   ctx.Reset();
 }
 
-TEST(TestStringOps, TestCastVarhcar) {
+TEST(TestStringOps, TestConvertReplaceInvalidUtf8Char) {
+  gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+
+  // invalid utf8 (xf8 is invalid but x28 is not - x28 = '(')
+  std::string a(
+      "ok-\xf8\x28"
+      "-a");
+  auto a_in_out_len = static_cast<int>(a.length());
+  const char* a_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, a.data(), a_in_out_len, "a", 1, &a_in_out_len);
+  EXPECT_EQ(std::string(a_str, a_in_out_len), "ok-a(-a");
+  EXPECT_FALSE(ctx.has_error());
+
+  // invalid utf8 (xa0 and xa1 are invalid)
+  std::string b("ok-\xa0\xa1-valid");
+  auto b_in_out_len = static_cast<int>(b.length());
+  const char* b_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, b.data(), b_in_out_len, "b", 1, &b_in_out_len);
+  EXPECT_EQ(std::string(b_str, b_in_out_len), "ok-bb-valid");
+  EXPECT_FALSE(ctx.has_error());
+
+  // full valid utf8
+  std::string c("all-valid");
+  auto c_in_out_len = static_cast<int>(c.length());
+  const char* c_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, c.data(), c_in_out_len, "c", 1, &c_in_out_len);
+  EXPECT_EQ(std::string(c_str, c_in_out_len), "all-valid");
+  EXPECT_FALSE(ctx.has_error());
+
+  // valid utf8 (महसुस is 4-char string, each char of which is likely a multibyte char)
+  std::string d("ok-महसुस-valid-new");
+  auto d_in_out_len = static_cast<int>(d.length());
+  const char* d_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, d.data(), d_in_out_len, "d", 1, &d_in_out_len);
+  EXPECT_EQ(std::string(d_str, d_in_out_len), "ok-महसुस-valid-new");
+  EXPECT_FALSE(ctx.has_error());
+
+  // full valid utf8, but invalid replacement char length
+  std::string e("all-valid");
+  auto e_in_out_len = static_cast<int>(e.length());
+  const char* e_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, e.data(), e_in_out_len, "ee", 2, &e_in_out_len);
+  EXPECT_EQ(std::string(e_str, e_in_out_len), "");
+  EXPECT_TRUE(ctx.has_error());
+  ctx.Reset();
+
+  // full valid utf8, but invalid replacement char length
+  std::string f("ok-\xa0\xa1-valid");
+  auto f_in_out_len = static_cast<int>(f.length());
+  const char* f_str = convert_replace_invalid_fromUTF8_binary(
+      ctx_ptr, f.data(), f_in_out_len, "", 0, &f_in_out_len);
+  EXPECT_EQ(std::string(f_str, f_in_out_len), "ok-\xa0\xa1-valid");
+  EXPECT_FALSE(ctx.has_error());
+
+  ctx.Reset();
+}
+
+TEST(TestStringOps, TestCastBoolToVarchar) {
   gandiva::ExecutionContext ctx;
   uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
   gdv_int32 out_len = 0;
 
-  const char* out_str = castVARCHAR_utf8_int64(ctx_ptr, "asdf", 4, 1, &out_len);
+  const char* out_str = castVARCHAR_bool_int64(ctx_ptr, true, 2, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "tr");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_bool_int64(ctx_ptr, true, 7, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "true");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_bool_int64(ctx_ptr, false, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "fals");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_bool_int64(ctx_ptr, false, 5, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "false");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_bool_int64(ctx_ptr, true, -3, &out_len);
+  EXPECT_THAT(ctx.get_error(),
+              ::testing::HasSubstr("Output buffer length can't be negative"));
+  ctx.Reset();
+}
+
+TEST(TestStringOps, TestCastVarchar) {
+  gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+  gdv_int32 out_len = 0;
+
+  // BINARY TESTS
+  const char* out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "a");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 6, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "asdf");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "asd");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "asdf");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 5, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "asdf");
+  EXPECT_FALSE(ctx.has_error());
+
+  // do not truncate if output length is 0
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "asdf", 4, 0, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "asdf");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "", 0, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†", 9, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†", 9, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†", 9, 5, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†", 9, 10, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†", 9, 6, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "abc", 3, -1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
+  EXPECT_THAT(ctx.get_error(),
+              ::testing::HasSubstr("Output buffer length can't be negative"));
+  ctx.Reset();
+
+  std::string z("aa\xc3");
+  out_str = castVARCHAR_binary_int64(ctx_ptr, z.data(), static_cast<int>(z.length()), 2,
+                                     &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "aa");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 16, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "1234567812341234");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 15, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123456781234123");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 12, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123456781234");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 8, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "12345678");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 7, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "1234567");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "1234");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812341234", 16, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "1234567812çåå†123456", 25, 16, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "1234567812çåå†12");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "123456781234çåå†1234", 25, 15, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123456781234çåå");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "12çåå†34567812123456", 25, 16, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "12çåå†3456781212");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†1234567812123456", 25, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "çåå†1234567812123456", 25, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "çåå");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = castVARCHAR_binary_int64(ctx_ptr, "123456781234çåå†", 21, 40, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123456781234çåå†");
+  EXPECT_FALSE(ctx.has_error());
+
+  std::string f("123456781234çåå\xc3");
+  out_str = castVARCHAR_binary_int64(ctx_ptr, f.data(), static_cast<int32_t>(f.length()),
+                                     16, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
+  EXPECT_THAT(ctx.get_error(),
+              ::testing::HasSubstr(
+                  "unexpected byte \\c3 encountered while decoding utf8 string"));
+  ctx.Reset();
+
+  // UTF8 TESTS
+  out_str = castVARCHAR_utf8_int64(ctx_ptr, "asdf", 4, 1, &out_len);
   EXPECT_EQ(std::string(out_str, out_len), "a");
   EXPECT_FALSE(ctx.has_error());
 
@@ -169,6 +381,7 @@ TEST(TestStringOps, TestCastVarhcar) {
   EXPECT_FALSE(ctx.has_error());
 
   out_str = castVARCHAR_utf8_int64(ctx_ptr, "abc", 3, -1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
   EXPECT_THAT(ctx.get_error(),
               ::testing::HasSubstr("Output buffer length can't be negative"));
   ctx.Reset();
@@ -231,8 +444,8 @@ TEST(TestStringOps, TestCastVarhcar) {
   EXPECT_EQ(std::string(out_str, out_len), "123456781234çåå†");
   EXPECT_FALSE(ctx.has_error());
 
-  std::string f("123456781234çåå\xc3");
-  out_str = castVARCHAR_utf8_int64(ctx_ptr, f.data(), static_cast<int32_t>(f.length()),
+  std::string y("123456781234çåå\xc3");
+  out_str = castVARCHAR_utf8_int64(ctx_ptr, y.data(), static_cast<int32_t>(y.length()),
                                    16, &out_len);
   EXPECT_EQ(std::string(out_str, out_len), "");
   EXPECT_THAT(ctx.get_error(),
@@ -356,7 +569,12 @@ TEST(TestStringOps, TestConcat) {
   uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
   gdv_int32 out_len = 0;
 
-  const char* out_str = concatOperator_utf8_utf8(ctx_ptr, "asdf", 4, "jkl", 3, &out_len);
+  const char* out_str =
+      concat_utf8_utf8(ctx_ptr, "abcd", 4, true, "\npq", 3, false, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "abcd");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8(ctx_ptr, "asdf", 4, "jkl", 3, &out_len);
   EXPECT_EQ(std::string(out_str, out_len), "asdfjkl");
   EXPECT_FALSE(ctx.has_error());
 
@@ -374,6 +592,106 @@ TEST(TestStringOps, TestConcat) {
 
   out_str = concatOperator_utf8_utf8(ctx_ptr, "abcd\n", 5, "a", 1, &out_len);
   EXPECT_EQ(std::string(out_str, out_len), "abcd\na");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8(ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3,
+                                  true, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqard");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str =
+      concatOperator_utf8_utf8_utf8(ctx_ptr, "abcd\n", 5, "a", 1, "bcd", 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "abcd\nabcd");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8(ctx_ptr, "abcd", 4, "a", 1, "", 0, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "abcda");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8(ctx_ptr, "", 0, "a", 1, "pqrs", 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "apqrs");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8(ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard",
+                                       3, true, "uvw", 3, false, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqard");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8(ctx_ptr, "pqrs", 4, "", 0, "\nabc", 4, "y",
+                                               1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrs\nabcy");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8(ctx_ptr, "abcd", 4, false, "\npq", 3, true,
+                                            "ard", 3, true, "uvw", 3, false, "abc\n", 4,
+                                            true, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\n");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8(ctx_ptr, "pqrs", 4, "", 0, "\nabc", 4,
+                                                    "y", 1, "", 0, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrs\nabcy");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3, true, "uvw", 3, false,
+      "abc\n", 4, true, "sdfgs", 5, true, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\nsdfgs");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "pqrs", 4, "", 0, "\nabc", 4, "y", 1, "", 0, "\nbcd", 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrs\nabcy\nbcd");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3, true, "uvw", 3, false,
+      "abc\n", 4, true, "sdfgs", 5, true, "wfw", 3, false, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\nsdfgs");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "", 0, "pqrs", 4, "abc\n", 4, "y", 1, "", 0, "asdf", 4, "jkl", 3,
+      &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrsabc\nyasdfjkl");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3, true, "uvw", 3, false,
+      "abc\n", 4, true, "sdfgs", 5, true, "wfw", 3, false, "", 0, true, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\nsdfgs");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "", 0, "pqrs", 4, "abc\n", 4, "y", 1, "", 0, "asdf", 4, "jkl", 3, "", 0,
+      &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrsabc\nyasdfjkl");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3, true, "uvw", 3, false,
+      "abc\n", 4, true, "sdfgs", 5, true, "wfw", 3, false, "", 0, true, "qwert|n", 7,
+      true, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\nsdfgsqwert|n");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "", 0, "pqrs", 4, "abc\n", 4, "y", 1, "", 0, "asdf", 4, "jkl", 3, "", 0,
+      "sfl\n", 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrsabc\nyasdfjklsfl\n");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "abcd", 4, false, "\npq", 3, true, "ard", 3, true, "uvw", 3, false,
+      "abc\n", 4, true, "sdfgs", 5, true, "wfw", 3, false, "", 0, true, "qwert|n", 7,
+      true, "ewfwe", 5, false, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "\npqardabc\nsdfgsqwert|n");
+  EXPECT_FALSE(ctx.has_error());
+
+  out_str = concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      ctx_ptr, "", 0, "pqrs", 4, "abc\n", 4, "y", 1, "", 0, "asdf", 4, "", 0, "jkl", 3,
+      "sfl\n", 4, "", 0, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "pqrsabc\nyasdfjklsfl\n");
   EXPECT_FALSE(ctx.has_error());
 }
 
@@ -808,138 +1126,171 @@ TEST(TestStringOps, TestReplace) {
   ctx.Reset();
 }
 
-TEST(TestArithmeticOps, TestCastINT) {
+TEST(TestStringOps, TestBinaryString) {
   gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+  gdv_int32 out_len = 0;
+  const char* out_str;
 
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
+  out_str = binary_string(ctx_ptr, "TestString", 10, &out_len);
+  std::string output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "TestString");
 
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-45", 3), -45);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "0", 1), 0);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "2147483647", 10), 2147483647);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "02147483647", 11), 2147483647);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-2147483648", 11), -2147483648LL);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-02147483648", 12), -2147483648LL);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, " 12 ", 4), 12);
+  out_str = binary_string(ctx_ptr, "", 0, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "");
 
-  castINT_utf8(ctx_ptr, "2147483648", 10);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string 2147483648 to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "T", 1, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "T");
 
-  castINT_utf8(ctx_ptr, "-2147483649", 11);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string -2147483649 to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "\\x41\\x42\\x43", 12, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "ABC");
 
-  castINT_utf8(ctx_ptr, "12.34", 5);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string 12.34 to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "\\x41", 4, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "A");
 
-  castINT_utf8(ctx_ptr, "abc", 3);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string abc to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "\\x6d\\x6D", 8, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "mm");
 
-  castINT_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string  to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "\\x6f\\x6d", 8, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "om");
 
-  castINT_utf8(ctx_ptr, "-", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string - to int32"));
-  ctx.Reset();
+  out_str = binary_string(ctx_ptr, "\\x4f\\x4D", 8, &out_len);
+  output = std::string(out_str, out_len);
+  EXPECT_EQ(output, "OM");
 }
 
-TEST(TestArithmeticOps, TestCastBIGINT) {
+TEST(TestStringOps, TestSplitPart) {
   gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+  gdv_int32 out_len = 0;
+  const char* out_str;
 
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
-
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-45", 3), -45);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "0", 1), 0);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "9223372036854775807", 19), 9223372036854775807LL);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "09223372036854775807", 20), 9223372036854775807LL);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-9223372036854775808", 20),
-            -9223372036854775807LL - 1);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-009223372036854775808", 22),
-            -9223372036854775807LL - 1);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, " 12 ", 4), 12);
-
-  castBIGINT_utf8(ctx_ptr, "9223372036854775808", 19);
+  out_str = split_part(ctx_ptr, "A,B,C", 5, ",", 1, 0, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
   EXPECT_THAT(
       ctx.get_error(),
-      ::testing::HasSubstr("Failed to cast the string 9223372036854775808 to int64"));
-  ctx.Reset();
+      ::testing::HasSubstr("Index in split_part must be positive, value provided was 0"));
 
-  castBIGINT_utf8(ctx_ptr, "-9223372036854775809", 20);
-  EXPECT_THAT(
-      ctx.get_error(),
-      ::testing::HasSubstr("Failed to cast the string -9223372036854775809 to int64"));
-  ctx.Reset();
+  out_str = split_part(ctx_ptr, "A,B,C", 5, ",", 1, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "A");
 
-  castBIGINT_utf8(ctx_ptr, "12.34", 5);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string 12.34 to int64"));
-  ctx.Reset();
+  out_str = split_part(ctx_ptr, "A,B,C", 5, ",", 1, 2, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "B");
 
-  castBIGINT_utf8(ctx_ptr, "abc", 3);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string abc to int64"));
-  ctx.Reset();
+  out_str = split_part(ctx_ptr, "A,B,C", 5, ",", 1, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "C");
 
-  castBIGINT_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string  to int64"));
-  ctx.Reset();
+  out_str = split_part(ctx_ptr, "abc~@~def~@~ghi", 15, "~@~", 3, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "abc");
 
-  castBIGINT_utf8(ctx_ptr, "-", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string - to int64"));
-  ctx.Reset();
+  out_str = split_part(ctx_ptr, "abc~@~def~@~ghi", 15, "~@~", 3, 2, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "def");
+
+  out_str = split_part(ctx_ptr, "abc~@~def~@~ghi", 15, "~@~", 3, 3, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "ghi");
+
+  // Result must be empty when the index is > no of elements
+  out_str = split_part(ctx_ptr, "123|456|789", 11, "|", 1, 4, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
+
+  out_str = split_part(ctx_ptr, "123|", 4, "|", 1, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "123");
+
+  out_str = split_part(ctx_ptr, "|123", 4, "|", 1, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "");
+
+  out_str = split_part(ctx_ptr, "ç†ååçåå†", 18, "å", 2, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "ç†");
+
+  out_str = split_part(ctx_ptr, "ç†ååçåå†", 18, "†åå", 6, 1, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "ç");
+
+  out_str = split_part(ctx_ptr, "ç†ååçåå†", 18, "†", 3, 2, &out_len);
+  EXPECT_EQ(std::string(out_str, out_len), "ååçåå");
 }
 
-TEST(TestArithmeticOps, TestCastFloat4) {
+TEST(TestStringOps, TestConvertTo) {
   gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+  gdv_int32 out_len = 0;
+  const char* out_str;
 
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
+  const int32_t ALL_BYTES_MATCH = 0;
 
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "-45.34", 6), -45.34f);
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "0", 1), 0.0f);
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "5", 1), 5.0f);
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, " 3.4 ", 5), 3.4f);
+  int32_t integer_value = std::numeric_limits<int32_t>::max();
+  out_str = convert_toINT(ctx_ptr, integer_value, &out_len);
+  EXPECT_EQ(out_len, sizeof(integer_value));
+  EXPECT_EQ(ALL_BYTES_MATCH, memcmp(out_str, &integer_value, out_len));
 
-  castFLOAT4_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string  to float32"));
-  ctx.Reset();
+  int64_t big_integer_value = std::numeric_limits<int64_t>::max();
+  out_str = convert_toBIGINT(ctx_ptr, big_integer_value, &out_len);
+  EXPECT_EQ(out_len, sizeof(big_integer_value));
+  EXPECT_EQ(ALL_BYTES_MATCH, memcmp(out_str, &big_integer_value, out_len));
 
-  castFLOAT4_utf8(ctx_ptr, "e", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string e to float32"));
-  ctx.Reset();
+  float float_value = std::numeric_limits<float>::max();
+  out_str = convert_toFLOAT(ctx_ptr, float_value, &out_len);
+  EXPECT_EQ(out_len, sizeof(float_value));
+  EXPECT_EQ(ALL_BYTES_MATCH, memcmp(out_str, &float_value, out_len));
+
+  double double_value = std::numeric_limits<double>::max();
+  out_str = convert_toDOUBLE(ctx_ptr, double_value, &out_len);
+  EXPECT_EQ(out_len, sizeof(double_value));
+  EXPECT_EQ(ALL_BYTES_MATCH, memcmp(out_str, &double_value, out_len));
+
+  const char* test_string = "test string";
+  int32_t str_len = 11;
+  out_str = convert_toUTF8(ctx_ptr, test_string, str_len, &out_len);
+  EXPECT_EQ(out_len, str_len);
+  EXPECT_EQ(ALL_BYTES_MATCH, memcmp(out_str, test_string, out_len));
 }
 
-TEST(TestParseStringHolder, TestCastFloat8) {
+TEST(TestStringOps, TestConvertToBigEndian) {
   gandiva::ExecutionContext ctx;
+  uint64_t ctx_ptr = reinterpret_cast<gdv_int64>(&ctx);
+  gdv_int32 out_len = 0;
+  gdv_int32 out_len_big_endian = 0;
+  const char* out_str;
+  const char* out_str_big_endian;
 
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
+  int64_t big_integer_value = std::numeric_limits<int64_t>::max();
+  out_str = convert_toBIGINT(ctx_ptr, big_integer_value, &out_len);
+  out_str_big_endian =
+      convert_toBIGINT_be(ctx_ptr, big_integer_value, &out_len_big_endian);
+  EXPECT_EQ(out_len_big_endian, sizeof(big_integer_value));
+  EXPECT_EQ(out_len_big_endian, out_len);
 
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "-45.34", 6), -45.34);
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "0", 1), 0.0);
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "5", 1), 5.0);
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, " 3.4 ", 5), 3.4);
+#if ARROW_LITTLE_ENDIAN
+  // Checks that bytes are in reverse order
+  for (auto i = 0; i < out_len; i++) {
+    EXPECT_EQ(out_str[i], out_str_big_endian[out_len - (i + 1)]);
+  }
+#else
+  for (auto i = 0; i < out_len; i++) {
+    EXPECT_EQ(out_str[i], out_str_big_endian[i]);
+  }
+#endif
 
-  castFLOAT8_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string  to float64"));
-  ctx.Reset();
+  double double_value = std::numeric_limits<double>::max();
+  out_str = convert_toDOUBLE(ctx_ptr, double_value, &out_len);
+  out_str_big_endian = convert_toDOUBLE_be(ctx_ptr, double_value, &out_len_big_endian);
+  EXPECT_EQ(out_len_big_endian, sizeof(double_value));
+  EXPECT_EQ(out_len_big_endian, out_len);
 
-  castFLOAT8_utf8(ctx_ptr, "e", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed to cast the string e to float64"));
-  ctx.Reset();
+#if ARROW_LITTLE_ENDIAN
+  // Checks that bytes are in reverse order
+  for (auto i = 0; i < out_len; i++) {
+    EXPECT_EQ(out_str[i], out_str_big_endian[out_len - (i + 1)]);
+  }
+#else
+  for (auto i = 0; i < out_len; i++) {
+    EXPECT_EQ(out_str[i], out_str_big_endian[i]);
+  }
+#endif
 }
-
 }  // namespace gandiva

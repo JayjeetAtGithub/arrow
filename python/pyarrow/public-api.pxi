@@ -94,17 +94,19 @@ cdef api object pyarrow_wrap_data_type(
     elif type.get().id() == _Type_STRUCT:
         out = StructType.__new__(StructType)
     elif type.get().id() == _Type_SPARSE_UNION:
-        out = UnionType.__new__(UnionType)
+        out = SparseUnionType.__new__(SparseUnionType)
     elif type.get().id() == _Type_DENSE_UNION:
-        out = UnionType.__new__(UnionType)
+        out = DenseUnionType.__new__(DenseUnionType)
     elif type.get().id() == _Type_TIMESTAMP:
         out = TimestampType.__new__(TimestampType)
     elif type.get().id() == _Type_DURATION:
         out = DurationType.__new__(DurationType)
     elif type.get().id() == _Type_FIXED_SIZE_BINARY:
         out = FixedSizeBinaryType.__new__(FixedSizeBinaryType)
-    elif type.get().id() == _Type_DECIMAL:
+    elif type.get().id() == _Type_DECIMAL128:
         out = Decimal128Type.__new__(Decimal128Type)
+    elif type.get().id() == _Type_DECIMAL256:
+        out = Decimal256Type.__new__(Decimal256Type)
     elif type.get().id() == _Type_EXTENSION:
         ext_type = <const CExtensionType*> type.get()
         cpy_ext_type = dynamic_cast[_CPyExtensionTypePtr](ext_type)
@@ -248,6 +250,9 @@ cdef api object pyarrow_wrap_scalar(const shared_ptr[CScalar]& sp_scalar):
 
     if data_type == NULL:
         raise ValueError('Scalar data type was NULL')
+
+    if data_type.id() == _Type_NA:
+        return _NULL
 
     if data_type.id() not in _scalar_classes:
         raise ValueError('Scalar type not supported')

@@ -105,6 +105,11 @@ module Helper
       build_array(Arrow::LargeBinaryArrayBuilder.new, values)
     end
 
+    def build_fixed_size_binary_array(data_type, values)
+      build_array(Arrow::FixedSizeBinaryArrayBuilder.new(data_type),
+                  values)
+    end
+
     def build_string_array(values)
       build_array(Arrow::StringArrayBuilder.new, values)
     end
@@ -131,11 +136,7 @@ module Helper
       data_type = Arrow::ListDataType.new(value_field)
       builder = Arrow::ListArrayBuilder.new(data_type)
       values_list.each do |values|
-        if values.nil?
-          builder.append_null
-        else
-          append_to_builder(builder, values)
-        end
+        append_to_builder(builder, values)
       end
       builder.finish
     end
@@ -145,11 +146,16 @@ module Helper
       data_type = Arrow::LargeListDataType.new(value_field)
       builder = Arrow::LargeListArrayBuilder.new(data_type)
       values_list.each do |values|
-        if values.nil?
-          builder.append_null
-        else
-          append_to_builder(builder, values)
-        end
+        append_to_builder(builder, values)
+      end
+      builder.finish
+    end
+
+    def build_map_array(key_data_type, item_data_type, maps)
+      data_type = Arrow::MapDataType.new(key_data_type, item_data_type)
+      builder = Arrow::MapArrayBuilder.new(data_type)
+      maps.each do |map|
+        append_to_builder(builder, map)
       end
       builder.finish
     end
@@ -158,11 +164,7 @@ module Helper
       data_type = Arrow::StructDataType.new(fields)
       builder = Arrow::StructArrayBuilder.new(data_type)
       structs.each do |struct|
-        if struct.nil?
-          builder.append_null
-        else
-          append_to_builder(builder, struct)
-        end
+        append_to_builder(builder, struct)
       end
       builder.finish
     end
@@ -173,6 +175,14 @@ module Helper
       else
         data_type = builder.value_data_type
         case data_type
+        when Arrow::MapDataType
+          builder.append_value
+          key_builder = builder.key_builder
+          item_builder = builder.item_builder
+          value.each do |k, v|
+            append_to_builder(key_builder, k)
+            append_to_builder(item_builder, v)
+          end
         when Arrow::ListDataType, Arrow::LargeListDataType
           builder.append_value
           value_builder = builder.value_builder
@@ -194,22 +204,22 @@ module Helper
 
     def build_table(columns)
       fields = []
-      arrays = []
-      columns.each do |name, array|
-        fields << Arrow::Field.new(name, array.value_data_type)
-        arrays << array
+      chunked_arrays = []
+      columns.each do |name, chunked_array|
+        fields << Arrow::Field.new(name, chunked_array.value_data_type)
+        chunked_arrays << chunked_array
       end
       schema = Arrow::Schema.new(fields)
-      Arrow::Table.new(schema, arrays)
+      Arrow::Table.new(schema, chunked_arrays)
     end
 
-    def build_record_batch(arrays)
-      n_rows = arrays.collect {|_, array| array.length}.min || 0
-      fields = arrays.collect do |name, array|
+    def build_record_batch(columns)
+      n_rows = columns.collect {|_, array| array.length}.min || 0
+      fields = columns.collect do |name, array|
         Arrow::Field.new(name, array.value_data_type)
       end
       schema = Arrow::Schema.new(fields)
-      Arrow::RecordBatch.new(schema, n_rows, arrays.values)
+      Arrow::RecordBatch.new(schema, n_rows, columns.values)
     end
 
     private

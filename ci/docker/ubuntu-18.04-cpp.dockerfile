@@ -66,10 +66,10 @@ RUN apt-get update -y -q && \
         git \
         libbenchmark-dev \
         libboost-filesystem-dev \
-        libboost-regex-dev \
         libboost-system-dev \
         libbrotli-dev \
         libbz2-dev \
+        libcurl4-openssl-dev \
         libgflags-dev \
         libgoogle-glog-dev \
         liblz4-dev \
@@ -96,6 +96,7 @@ RUN apt-get update -y -q && \
 # - libgtest-dev only provide sources
 # - libprotobuf-dev only provide sources
 # - thrift is too old
+# - s3 tests would require boost-asio that is included since Boost 1.66.0
 ENV ARROW_BUILD_TESTS=ON \
     ARROW_DEPENDENCY_SOURCE=SYSTEM \
     ARROW_DATASET=ON \
@@ -110,6 +111,7 @@ ENV ARROW_BUILD_TESTS=ON \
     ARROW_PLASMA=ON \
     ARROW_USE_ASAN=OFF \
     ARROW_USE_CCACHE=ON \
+    ARROW_USE_TSAN=OFF \
     ARROW_USE_UBSAN=OFF \
     ARROW_WITH_BROTLI=ON \
     ARROW_WITH_BZ2=ON \
@@ -117,6 +119,7 @@ ENV ARROW_BUILD_TESTS=ON \
     ARROW_WITH_SNAPPY=ON \
     ARROW_WITH_ZLIB=ON \
     ARROW_WITH_ZSTD=ON \
+    AWSSDK_SOURCE=BUNDLED \
     GTest_SOURCE=BUNDLED \
     ORC_SOURCE=BUNDLED \
     PARQUET_BUILD_EXECUTABLES=ON \

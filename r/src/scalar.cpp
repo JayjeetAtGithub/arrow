@@ -22,6 +22,19 @@
 #include <arrow/array/array_base.h>
 #include <arrow/array/util.h>
 #include <arrow/scalar.h>
+#include <arrow/type.h>
+
+namespace cpp11 {
+
+const char* r6_class_name<arrow::Scalar>::get(
+    const std::shared_ptr<arrow::Scalar>& scalar) {
+  if (scalar->type->id() == arrow::Type::STRUCT) {
+    return "StructScalar";
+  }
+  return "Scalar";
+}
+
+}  // namespace cpp11
 
 // [[arrow::export]]
 std::shared_ptr<arrow::Scalar> Array__GetScalar(const std::shared_ptr<arrow::Array>& x,
@@ -32,12 +45,6 @@ std::shared_ptr<arrow::Scalar> Array__GetScalar(const std::shared_ptr<arrow::Arr
 // [[arrow::export]]
 std::string Scalar__ToString(const std::shared_ptr<arrow::Scalar>& s) {
   return s->ToString();
-}
-
-// [[arrow::export]]
-std::shared_ptr<arrow::Scalar> Scalar__CastTo(const std::shared_ptr<arrow::Scalar>& s,
-                                              const std::shared_ptr<arrow::DataType>& t) {
-  return ValueOrStop(s->CastTo(t));
 }
 
 // [[arrow::export]]
@@ -54,11 +61,17 @@ std::shared_ptr<arrow::Scalar> StructScalar__GetFieldByName(
 
 // [[arrow::export]]
 SEXP Scalar__as_vector(const std::shared_ptr<arrow::Scalar>& scalar) {
-  auto array = ValueOrStop(arrow::MakeArrayFromScalar(*scalar, 1));
+  auto array = ValueOrStop(arrow::MakeArrayFromScalar(*scalar, 1, gc_memory_pool()));
 
   // defined in array_to_vector.cpp
   SEXP Array__as_vector(const std::shared_ptr<arrow::Array>& array);
   return Array__as_vector(array);
+}
+
+// [[arrow::export]]
+std::shared_ptr<arrow::Array> MakeArrayFromScalar(
+    const std::shared_ptr<arrow::Scalar>& scalar) {
+  return ValueOrStop(arrow::MakeArrayFromScalar(*scalar, 1, gc_memory_pool()));
 }
 
 // [[arrow::export]]
@@ -67,6 +80,18 @@ bool Scalar__is_valid(const std::shared_ptr<arrow::Scalar>& s) { return s->is_va
 // [[arrow::export]]
 std::shared_ptr<arrow::DataType> Scalar__type(const std::shared_ptr<arrow::Scalar>& s) {
   return s->type;
+}
+
+// [[arrow::export]]
+bool Scalar__Equals(const std::shared_ptr<arrow::Scalar>& lhs,
+                    const std::shared_ptr<arrow::Scalar>& rhs) {
+  return lhs->Equals(rhs);
+}
+
+// [[arrow::export]]
+bool Scalar__ApproxEquals(const std::shared_ptr<arrow::Scalar>& lhs,
+                          const std::shared_ptr<arrow::Scalar>& rhs) {
+  return lhs->ApproxEquals(*rhs);
 }
 
 #endif

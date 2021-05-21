@@ -64,6 +64,11 @@ public class ${mode}StructWriter extends AbstractFieldWriter {
       case LIST:
         list(child.getName());
         break;
+      case MAP: {
+        ArrowType.Map arrowType = (ArrowType.Map) child.getType();
+        map(child.getName(), arrowType.getKeysSorted());
+        break;
+      }
       case UNION:
         FieldType fieldType = new FieldType(addVectorAsNullable, MinorType.UNION.getType(), null, null);
         UnionWriter writer = new UnionWriter(container.addOrGet(child.getName(), fieldType, UnionVector.class), getNullableStructWriterFactory());
@@ -184,6 +189,41 @@ public class ${mode}StructWriter extends AbstractFieldWriter {
     return writer;
   }
 
+  @Override
+  public MapWriter map(String name) {
+    return map(name, false);
+  }
+
+  @Override
+  public MapWriter map(String name, boolean keysSorted) {
+    FieldWriter writer = fields.get(handleCase(name));
+    if(writer == null) {
+      ValueVector vector;
+      ValueVector currentVector = container.getChild(name);
+      MapVector v = container.addOrGet(name,
+          new FieldType(addVectorAsNullable,
+            new ArrowType.Map(keysSorted)
+          ,null, null),
+          MapVector.class);
+      writer = new PromotableWriter(v, container, getNullableStructWriterFactory());
+      vector = v;
+      if (currentVector == null || currentVector != vector) {
+        if(this.initialCapacity > 0) {
+          vector.setInitialCapacity(this.initialCapacity);
+        }
+        vector.allocateNewSafe();
+      }
+      writer.setPosition(idx());
+      fields.put(handleCase(name), writer);
+    } else {
+      if (writer instanceof PromotableWriter) {
+        // ensure writers are initialized
+        ((PromotableWriter)writer).getWriter(MinorType.MAP, new ArrowType.Map(keysSorted));
+      }
+    }
+    return writer;
+  }
+
   public void setValueCount(int count) {
     container.setValueCount(count);
   }
@@ -255,7 +295,7 @@ public class ${mode}StructWriter extends AbstractFieldWriter {
                 <#assign constructorParams = constructorParams + [ typeParam.name ] />
               </#list>
             </#if>    
-            new ${minor.arrowType}(${constructorParams?join(", ")})
+            new ${minor.arrowType}(${constructorParams?join(", ")}<#if minor.class?starts_with("Decimal")>, ${vectName}Vector.TYPE_WIDTH * 8</#if>)
           <#else>
             MinorType.${upperName}.getType()
           </#if>
@@ -274,7 +314,7 @@ public class ${mode}StructWriter extends AbstractFieldWriter {
     } else {
       if (writer instanceof PromotableWriter) {
         // ensure writers are initialized
-        ((PromotableWriter)writer).getWriter(MinorType.${upperName}<#if minor.class == "Decimal">, new ${minor.arrowType}(precision, scale)</#if>);
+        ((PromotableWriter)writer).getWriter(MinorType.${upperName}<#if minor.class?starts_with("Decimal")>, new ${minor.arrowType}(precision, scale, ${vectName}Vector.TYPE_WIDTH * 8)</#if>);
       }
     }
     return writer;

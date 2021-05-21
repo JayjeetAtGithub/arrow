@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/dataset/filter.h"
+#include "arrow/compute/exec/expression.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
 #include "arrow/util/optional.h"
@@ -37,6 +37,10 @@ namespace dataset {
 
 // ----------------------------------------------------------------------
 // Partitioning
+
+/// \defgroup dataset-partitioning Partitioning API
+///
+/// @{
 
 /// \brief Interface for parsing partition expressions from string partition
 /// identifiers.
@@ -60,22 +64,23 @@ class ARROW_DS_EXPORT Partitioning {
   virtual std::string type_name() const = 0;
 
   /// \brief If the input batch shares any fields with this partitioning,
-  /// produce slices of the batch which satisfy mutually exclusive Expressions.
-  struct PartitionedBatch {
-    std::shared_ptr<RecordBatch> batch;
-    std::shared_ptr<Expression> partition_expression;
+  /// produce sub-batches which satisfy mutually exclusive Expressions.
+  struct PartitionedBatches {
+    RecordBatchVector batches;
+    std::vector<compute::Expression> expressions;
   };
-  virtual Result<std::vector<PartitionedBatch>> Partition(
+  virtual Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const = 0;
 
   /// \brief Parse a path into a partition expression
-  virtual Result<std::shared_ptr<Expression>> Parse(const std::string& path) const = 0;
+  virtual Result<compute::Expression> Parse(const std::string& path) const = 0;
 
-  virtual Result<std::string> Format(const Expression& expr) const = 0;
+  virtual Result<std::string> Format(const compute::Expression& expr) const = 0;
 
   /// \brief A default Partitioning which always yields scalar(true)
   static std::shared_ptr<Partitioning> Default();
 
+  /// \brief The partition schema.
   const std::shared_ptr<Schema>& schema() { return schema_; }
 
  protected:
@@ -84,15 +89,23 @@ class ARROW_DS_EXPORT Partitioning {
   std::shared_ptr<Schema> schema_;
 };
 
+/// \brief Options for inferring a partitioning.
 struct PartitioningFactoryOptions {
-  /// When inferring a schema for partition fields, string fields may be inferred as
-  /// a dictionary type instead. This can be more efficient when materializing virtual
-  /// columns. If the number of discovered unique values of a string field exceeds
-  /// max_partition_dictionary_size, it will instead be inferred as a string.
-  ///
-  /// max_partition_dictionary_size = 0: No fields will be inferred as dictionary.
-  /// max_partition_dictionary_size = -1: All fields will be inferred as dictionary.
-  int max_partition_dictionary_size = 0;
+  /// When inferring a schema for partition fields, yield dictionary encoded types
+  /// instead of plain. This can be more efficient when materializing virtual
+  /// columns, and Expressions parsed by the finished Partitioning will include
+  /// dictionaries of all unique inspected values for each field.
+  bool infer_dictionary = false;
+  /// Optionally, an expected schema can be provided, in which case inference
+  /// will only check discovered fields against the schema and update internal
+  /// state (such as dictionaries).
+  std::shared_ptr<Schema> schema;
+};
+
+/// \brief Options for inferring a hive-style partitioning.
+struct HivePartitioningFactoryOptions : PartitioningFactoryOptions {
+  /// The hive partitioning scheme maps null to a hard coded fallback string.
+  std::string null_fallback;
 };
 
 /// \brief PartitioningFactory provides creation of a partitioning  when the
@@ -122,26 +135,16 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
   /// An unconverted equality expression consisting of a field name and the representation
   /// of a scalar value
   struct Key {
-    std::string name, value;
+    std::string name;
+    util::optional<std::string> value;
   };
 
-  static Status VisitKeys(
-      const Expression& expr,
-      const std::function<Status(const std::string& name,
-                                 const std::shared_ptr<Scalar>& value)>& visitor);
-
-  static Result<std::unordered_map<std::string, std::shared_ptr<Scalar>>> GetKeys(
-      const Expression& expr);
-
-  static Status SetDefaultValuesFromKeys(const Expression& expr,
-                                         RecordBatchProjector* projector);
-
-  Result<std::vector<PartitionedBatch>> Partition(
+  Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const override;
 
-  Result<std::shared_ptr<Expression>> Parse(const std::string& path) const override;
+  Result<compute::Expression> Parse(const std::string& path) const override;
 
-  Result<std::string> Format(const Expression& expr) const override;
+  Result<std::string> Format(const compute::Expression& expr) const override;
 
  protected:
   KeyValuePartitioning(std::shared_ptr<Schema> schema, ArrayVector dictionaries)
@@ -153,10 +156,10 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
 
   virtual std::vector<Key> ParseKeys(const std::string& path) const = 0;
 
-  virtual Result<std::string> FormatValues(const std::vector<Scalar*>& values) const = 0;
+  virtual Result<std::string> FormatValues(const ScalarVector& values) const = 0;
 
   /// Convert a Key to a full expression.
-  Result<std::shared_ptr<Expression>> ConvertKey(const Key& key) const;
+  Result<compute::Expression> ConvertKey(const Key& key) const;
 
   ArrayVector dictionaries_;
 };
@@ -169,22 +172,29 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
 /// parsed to ("year"_ == 2009 and "month"_ == 11)
 class ARROW_DS_EXPORT DirectoryPartitioning : public KeyValuePartitioning {
  public:
-  // If a field in schema is of dictionary type, the corresponding element of dictionaries
-  // must be contain the dictionary of values for that field.
+  /// If a field in schema is of dictionary type, the corresponding element of
+  /// dictionaries must be contain the dictionary of values for that field.
   explicit DirectoryPartitioning(std::shared_ptr<Schema> schema,
                                  ArrayVector dictionaries = {})
       : KeyValuePartitioning(std::move(schema), std::move(dictionaries)) {}
 
   std::string type_name() const override { return "schema"; }
 
+  /// \brief Create a factory for a directory partitioning.
+  ///
+  /// \param[in] field_names The names for the partition fields. Types will be
+  ///     inferred.
   static std::shared_ptr<PartitioningFactory> MakeFactory(
       std::vector<std::string> field_names, PartitioningFactoryOptions = {});
 
  private:
   std::vector<Key> ParseKeys(const std::string& path) const override;
 
-  Result<std::string> FormatValues(const std::vector<Scalar*>& values) const override;
+  Result<std::string> FormatValues(const ScalarVector& values) const override;
 };
+
+/// \brief The default fallback used for null values in a Hive-style partitioning.
+static constexpr char kDefaultHiveNullFallback[] = "__HIVE_DEFAULT_PARTITION__";
 
 /// \brief Multi-level, directory based partitioning
 /// originating from Apache Hive with all data files stored in the
@@ -197,31 +207,36 @@ class ARROW_DS_EXPORT DirectoryPartitioning : public KeyValuePartitioning {
 /// "/day=321/ignored=3.4/year=2009" parses to ("year"_ == 2009 and "day"_ == 321)
 class ARROW_DS_EXPORT HivePartitioning : public KeyValuePartitioning {
  public:
-  // If a field in schema is of dictionary type, the corresponding element of dictionaries
-  // must be contain the dictionary of values for that field.
-  explicit HivePartitioning(std::shared_ptr<Schema> schema, ArrayVector dictionaries = {})
-      : KeyValuePartitioning(std::move(schema), std::move(dictionaries)) {}
+  /// If a field in schema is of dictionary type, the corresponding element of
+  /// dictionaries must be contain the dictionary of values for that field.
+  explicit HivePartitioning(std::shared_ptr<Schema> schema, ArrayVector dictionaries = {},
+                            std::string null_fallback = kDefaultHiveNullFallback)
+      : KeyValuePartitioning(std::move(schema), std::move(dictionaries)),
+        null_fallback_(std::move(null_fallback)) {}
 
   std::string type_name() const override { return "hive"; }
+  std::string null_fallback() const { return null_fallback_; }
 
-  static util::optional<Key> ParseKey(const std::string& segment);
+  static util::optional<Key> ParseKey(const std::string& segment,
+                                      const std::string& null_fallback);
 
+  /// \brief Create a factory for a hive partitioning.
   static std::shared_ptr<PartitioningFactory> MakeFactory(
-      PartitioningFactoryOptions = {});
+      HivePartitioningFactoryOptions = {});
 
  private:
+  const std::string null_fallback_;
   std::vector<Key> ParseKeys(const std::string& path) const override;
 
-  Result<std::string> FormatValues(const std::vector<Scalar*>& values) const override;
+  Result<std::string> FormatValues(const ScalarVector& values) const override;
 };
 
 /// \brief Implementation provided by lambda or other callable
 class ARROW_DS_EXPORT FunctionPartitioning : public Partitioning {
  public:
-  using ParseImpl =
-      std::function<Result<std::shared_ptr<Expression>>(const std::string&)>;
+  using ParseImpl = std::function<Result<compute::Expression>(const std::string&)>;
 
-  using FormatImpl = std::function<Result<std::string>(const Expression&)>;
+  using FormatImpl = std::function<Result<std::string>(const compute::Expression&)>;
 
   FunctionPartitioning(std::shared_ptr<Schema> schema, ParseImpl parse_impl,
                        FormatImpl format_impl = NULLPTR, std::string name = "function")
@@ -232,18 +247,18 @@ class ARROW_DS_EXPORT FunctionPartitioning : public Partitioning {
 
   std::string type_name() const override { return name_; }
 
-  Result<std::shared_ptr<Expression>> Parse(const std::string& path) const override {
+  Result<compute::Expression> Parse(const std::string& path) const override {
     return parse_impl_(path);
   }
 
-  Result<std::string> Format(const Expression& expr) const override {
+  Result<std::string> Format(const compute::Expression& expr) const override {
     if (format_impl_) {
       return format_impl_(expr);
     }
     return Status::NotImplemented("formatting paths from ", type_name(), " Partitioning");
   }
 
-  Result<std::vector<PartitionedBatch>> Partition(
+  Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const override {
     return Status::NotImplemented("partitioning batches from ", type_name(),
                                   " Partitioning");
@@ -286,16 +301,21 @@ class ARROW_DS_EXPORT PartitioningOrFactory {
     return *this = PartitioningOrFactory(std::move(factory));
   }
 
+  /// \brief The partitioning (if given).
   const std::shared_ptr<Partitioning>& partitioning() const { return partitioning_; }
 
+  /// \brief The partition factory (if given).
   const std::shared_ptr<PartitioningFactory>& factory() const { return factory_; }
 
+  /// \brief Get the partition schema, inferring it with the given factory if needed.
   Result<std::shared_ptr<Schema>> GetOrInferSchema(const std::vector<std::string>& paths);
 
  private:
   std::shared_ptr<PartitioningFactory> factory_;
   std::shared_ptr<Partitioning> partitioning_;
 };
+
+/// @}
 
 }  // namespace dataset
 }  // namespace arrow

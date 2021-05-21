@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cmath>
+
 #include "arrow/compute/kernels/common.h"
 
 #include "arrow/util/bit_util.h"
@@ -30,11 +32,12 @@ namespace internal {
 namespace {
 
 struct IsValidOperator {
-  static void Call(KernelContext* ctx, const Scalar& in, Scalar* out) {
+  static Status Call(KernelContext* ctx, const Scalar& in, Scalar* out) {
     checked_cast<BooleanScalar*>(out)->value = in.is_valid;
+    return Status::OK();
   }
 
-  static void Call(KernelContext* ctx, const ArrayData& arr, ArrayData* out) {
+  static Status Call(KernelContext* ctx, const ArrayData& arr, ArrayData* out) {
     DCHECK_EQ(out->offset, 0);
     DCHECK_LE(out->length, arr.length);
     if (arr.MayHaveNulls()) {
@@ -46,39 +49,50 @@ struct IsValidOperator {
           arr.offset == 0 ? arr.buffers[0]
                           : SliceBuffer(arr.buffers[0], arr.offset / 8,
                                         BitUtil::BytesForBits(out->length + out->offset));
-      return;
+      return Status::OK();
     }
 
     // Input has no nulls => output is entirely true.
-    KERNEL_ASSIGN_OR_RAISE(out->buffers[1], ctx,
-                           ctx->AllocateBitmap(out->length + out->offset));
+    ARROW_ASSIGN_OR_RAISE(out->buffers[1],
+                          ctx->AllocateBitmap(out->length + out->offset));
     BitUtil::SetBitsTo(out->buffers[1]->mutable_data(), out->offset, out->length, true);
+    return Status::OK();
   }
 };
 
 struct IsNullOperator {
-  static void Call(KernelContext* ctx, const Scalar& in, Scalar* out) {
+  static Status Call(KernelContext* ctx, const Scalar& in, Scalar* out) {
     checked_cast<BooleanScalar*>(out)->value = !in.is_valid;
+    return Status::OK();
   }
 
-  static void Call(KernelContext* ctx, const ArrayData& arr, ArrayData* out) {
+  static Status Call(KernelContext* ctx, const ArrayData& arr, ArrayData* out) {
     if (arr.MayHaveNulls()) {
       // Input has nulls => output is the inverted null (validity) bitmap.
       InvertBitmap(arr.buffers[0]->data(), arr.offset, arr.length,
                    out->buffers[1]->mutable_data(), out->offset);
-      return;
+    } else {
+      // Input has no nulls => output is entirely false.
+      BitUtil::SetBitsTo(out->buffers[1]->mutable_data(), out->offset, out->length,
+                         false);
     }
-
-    // Input has no nulls => output is entirely false.
-    BitUtil::SetBitsTo(out->buffers[1]->mutable_data(), out->offset, out->length, false);
+    return Status::OK();
   }
 };
 
-void MakeFunction(std::string name, std::vector<InputType> in_types, OutputType out_type,
+struct IsNanOperator {
+  template <typename OutType, typename InType>
+  static constexpr OutType Call(KernelContext*, const InType& value, Status*) {
+    return std::isnan(value);
+  }
+};
+
+void MakeFunction(std::string name, const FunctionDoc* doc,
+                  std::vector<InputType> in_types, OutputType out_type,
                   ArrayKernelExec exec, FunctionRegistry* registry,
                   MemAllocation::type mem_allocation, bool can_write_into_slices) {
   Arity arity{static_cast<int>(in_types.size())};
-  auto func = std::make_shared<ScalarFunction>(name, arity);
+  auto func = std::make_shared<ScalarFunction>(name, arity, doc);
 
   ScalarKernel kernel(std::move(in_types), out_type, exec);
   kernel.null_handling = NullHandling::OUTPUT_NOT_NULL;
@@ -89,7 +103,24 @@ void MakeFunction(std::string name, std::vector<InputType> in_types, OutputType 
   DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
-void IsValidExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+template <typename InType>
+void AddIsNanKernel(const std::shared_ptr<DataType>& ty, ScalarFunction* func) {
+  DCHECK_OK(
+      func->AddKernel({ty}, boolean(),
+                      applicator::ScalarUnary<BooleanType, InType, IsNanOperator>::Exec));
+}
+
+std::shared_ptr<ScalarFunction> MakeIsNanFunction(std::string name,
+                                                  const FunctionDoc* doc) {
+  auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), doc);
+
+  AddIsNanKernel<FloatType>(float32(), func.get());
+  AddIsNanKernel<DoubleType>(float64(), func.get());
+
+  return func;
+}
+
+Status IsValidExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
   const Datum& arg0 = batch[0];
   if (arg0.type()->id() == Type::NA) {
     auto false_value = std::make_shared<BooleanScalar>(false);
@@ -97,17 +128,17 @@ void IsValidExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
       out->value = false_value;
     } else {
       std::shared_ptr<Array> false_values;
-      KERNEL_RETURN_IF_ERROR(
-          ctx, MakeArrayFromScalar(*false_value, out->length(), ctx->memory_pool())
-                   .Value(&false_values));
+      RETURN_NOT_OK(MakeArrayFromScalar(*false_value, out->length(), ctx->memory_pool())
+                        .Value(&false_values));
       out->value = false_values->data();
     }
+    return Status::OK();
   } else {
-    applicator::SimpleUnary<IsValidOperator>(ctx, batch, out);
+    return applicator::SimpleUnary<IsValidOperator>(ctx, batch, out);
   }
 }
 
-void IsNullExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+Status IsNullExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
   const Datum& arg0 = batch[0];
   if (arg0.type()->id() == Type::NA) {
     if (arg0.kind() == Datum::SCALAR) {
@@ -118,20 +149,35 @@ void IsNullExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
       BitUtil::SetBitsTo(out_arr->buffers[1]->mutable_data(), out_arr->offset,
                          out_arr->length, true);
     }
+    return Status::OK();
   } else {
-    applicator::SimpleUnary<IsNullOperator>(ctx, batch, out);
+    return applicator::SimpleUnary<IsNullOperator>(ctx, batch, out);
   }
 }
+
+const FunctionDoc is_valid_doc(
+    "Return true if non-null",
+    ("For each input value, emit true iff the value is valid (non-null)."), {"values"});
+
+const FunctionDoc is_null_doc("Return true if null",
+                              ("For each input value, emit true iff the value is null."),
+                              {"values"});
+
+const FunctionDoc is_nan_doc("Return true if NaN",
+                             ("For each input value, emit true iff the value is NaN."),
+                             {"values"});
 
 }  // namespace
 
 void RegisterScalarValidity(FunctionRegistry* registry) {
-  MakeFunction("is_valid", {ValueDescr::ANY}, boolean(), IsValidExec, registry,
-               MemAllocation::NO_PREALLOCATE, /*can_write_into_slices=*/false);
+  MakeFunction("is_valid", &is_valid_doc, {ValueDescr::ANY}, boolean(), IsValidExec,
+               registry, MemAllocation::NO_PREALLOCATE, /*can_write_into_slices=*/false);
 
-  MakeFunction("is_null", {ValueDescr::ANY}, boolean(), IsNullExec, registry,
-               MemAllocation::PREALLOCATE,
+  MakeFunction("is_null", &is_null_doc, {ValueDescr::ANY}, boolean(), IsNullExec,
+               registry, MemAllocation::PREALLOCATE,
                /*can_write_into_slices=*/true);
+
+  DCHECK_OK(registry->AddFunction(MakeIsNanFunction("is_nan", &is_nan_doc)));
 }
 
 }  // namespace internal

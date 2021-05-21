@@ -17,6 +17,7 @@
 
 from datetime import datetime, timezone, timedelta
 import gzip
+import os
 import pathlib
 import pickle
 import sys
@@ -26,6 +27,8 @@ import weakref
 
 import pyarrow as pa
 from pyarrow.tests.test_io import assert_file_not_found
+from pyarrow.vendored.version import Version
+
 from pyarrow.fs import (FileType, FileInfo, FileSelector, FileSystem,
                         LocalFileSystem, SubTreeFileSystem, _MockFileSystem,
                         FileSystemHandler, PyFileSystem, FSSpecHandler)
@@ -279,13 +282,14 @@ def s3fs(request, s3_connection, s3_server):
     )
     fs.create_dir(bucket)
 
-    return dict(
+    yield dict(
         fs=fs,
         pathfn=bucket.__add__,
         allow_copy_file=True,
         allow_move_dir=False,
         allow_append_to_file=False,
     )
+    fs.delete_dir(bucket)
 
 
 @pytest.fixture
@@ -336,6 +340,9 @@ def py_fsspec_localfs(request, tempdir):
 @pytest.fixture
 def py_fsspec_memoryfs(request, tempdir):
     fsspec = pytest.importorskip("fsspec", minversion="0.7.5")
+    if fsspec.__version__ == "0.8.5":
+        # see https://issues.apache.org/jira/browse/ARROW-10934
+        pytest.skip("Bug in fsspec 0.8.5 for in-memory filesystem")
     fs = fsspec.filesystem('memory')
     return dict(
         fs=PyFileSystem(FSSpecHandler(fs)),
@@ -349,6 +356,9 @@ def py_fsspec_memoryfs(request, tempdir):
 @pytest.fixture
 def py_fsspec_s3fs(request, s3_connection, s3_server):
     s3fs = pytest.importorskip("s3fs")
+    if (sys.version_info < (3, 7) and
+            Version(s3fs.__version__) >= Version("0.5")):
+        pytest.skip("s3fs>=0.5 version is async and requires Python >= 3.7")
 
     host, port, access_key, secret_key = s3_connection
     bucket = 'pyarrow-filesystem/'
@@ -359,19 +369,16 @@ def py_fsspec_s3fs(request, s3_connection, s3_server):
         client_kwargs=dict(endpoint_url='http://{}:{}'.format(host, port))
     )
     fs = PyFileSystem(FSSpecHandler(fs))
-    try:
-        fs.create_dir(bucket)
-    except IOError:
-        # BucketAlreadyOwnedByYou on second test
-        pass
+    fs.create_dir(bucket)
 
-    return dict(
+    yield dict(
         fs=fs,
         pathfn=bucket.__add__,
         allow_copy_file=True,
         allow_move_dir=False,
         allow_append_to_file=True,
     )
+    fs.delete_dir(bucket)
 
 
 @pytest.fixture(params=[
@@ -601,8 +608,6 @@ def test_non_path_like_input_raises(fs):
 
 
 def test_get_file_info(fs, pathfn):
-    skip_fsspec_s3fs(fs)  # s3fs doesn't create nested directories
-
     aaa = pathfn('a/aa/aaa/')
     bb = pathfn('a/bb')
     c = pathfn('c.txt')
@@ -619,7 +624,12 @@ def test_get_file_info(fs, pathfn):
     assert aaa_info.path == aaa
     assert 'aaa' in repr(aaa_info)
     assert aaa_info.extension == ''
-    assert 'FileType.Directory' in repr(aaa_info)
+    if fs.type_name == "py::fsspec+s3":
+        # s3fs doesn't create empty directories
+        assert aaa_info.type == FileType.NotFound
+    else:
+        assert aaa_info.type == FileType.Directory
+        assert 'FileType.Directory' in repr(aaa_info)
     assert aaa_info.size is None
     check_mtime_or_absent(aaa_info)
 
@@ -629,7 +639,7 @@ def test_get_file_info(fs, pathfn):
     assert bb_info.type == FileType.File
     assert 'FileType.File' in repr(bb_info)
     assert bb_info.size == 0
-    if fs.type_name != "py::fsspec+memory":
+    if fs.type_name not in ["py::fsspec+memory", "py::fsspec+s3"]:
         check_mtime(bb_info)
 
     assert c_info.path == str(c)
@@ -638,7 +648,7 @@ def test_get_file_info(fs, pathfn):
     assert c_info.type == FileType.File
     assert 'FileType.File' in repr(c_info)
     assert c_info.size == 4
-    if fs.type_name != "py::fsspec+memory":
+    if fs.type_name not in ["py::fsspec+memory", "py::fsspec+s3"]:
         check_mtime(c_info)
 
     assert zzz_info.path == str(zzz)
@@ -657,12 +667,12 @@ def test_get_file_info(fs, pathfn):
 
 
 def test_get_file_info_with_selector(fs, pathfn):
-    skip_fsspec_s3fs(fs)
-
     base_dir = pathfn('selector-dir/')
     file_a = pathfn('selector-dir/test_file_a')
     file_b = pathfn('selector-dir/test_file_b')
     dir_a = pathfn('selector-dir/test_dir_a')
+    file_c = pathfn('selector-dir/test_dir_a/test_file_c')
+    dir_b = pathfn('selector-dir/test_dir_b')
 
     try:
         fs.create_dir(base_dir)
@@ -671,34 +681,60 @@ def test_get_file_info_with_selector(fs, pathfn):
         with fs.open_output_stream(file_b):
             pass
         fs.create_dir(dir_a)
+        with fs.open_output_stream(file_c):
+            pass
+        fs.create_dir(dir_b)
 
+        # recursive selector
         selector = FileSelector(base_dir, allow_not_found=False,
                                 recursive=True)
         assert selector.base_dir == base_dir
 
         infos = fs.get_file_info(selector)
-        assert len(infos) == 3
+        if fs.type_name == "py::fsspec+s3":
+            # s3fs only lists directories if they are not empty, but depending
+            # on the s3fs/fsspec version combo, it includes the base_dir
+            # (https://github.com/dask/s3fs/issues/393)
+            assert (len(infos) == 4) or (len(infos) == 5)
+        else:
+            assert len(infos) == 5
 
         for info in infos:
-            if info.path.endswith(file_a):
+            if (info.path.endswith(file_a) or info.path.endswith(file_b) or
+                    info.path.endswith(file_c)):
                 assert info.type == FileType.File
-            elif info.path.endswith(file_b):
-                assert info.type == FileType.File
-            elif info.path.rstrip("/").endswith(dir_a):
+            elif (info.path.rstrip("/").endswith(dir_a) or
+                  info.path.rstrip("/").endswith(dir_b)):
+                assert info.type == FileType.Directory
+            elif (fs.type_name == "py::fsspec+s3" and
+                  info.path.rstrip("/").endswith("selector-dir")):
+                # s3fs can include base dir, see above
                 assert info.type == FileType.Directory
             else:
                 raise ValueError('unexpected path {}'.format(info.path))
             check_mtime_or_absent(info)
+
+        # non-recursive selector -> not selecting the nested file_c
+        selector = FileSelector(base_dir, recursive=False)
+
+        infos = fs.get_file_info(selector)
+        if fs.type_name == "py::fsspec+s3":
+            # s3fs only lists directories if they are not empty
+            # + for s3fs 0.5.2 all directories are dropped because of buggy
+            # side-effect of previous find() call
+            # (https://github.com/dask/s3fs/issues/410)
+            assert (len(infos) == 3) or (len(infos) == 2)
+        else:
+            assert len(infos) == 4
+
     finally:
-        fs.delete_file(file_a)
-        fs.delete_file(file_b)
-        fs.delete_dir(dir_a)
         fs.delete_dir(base_dir)
 
 
 def test_create_dir(fs, pathfn):
-    skip_fsspec_s3fs(fs)  # create_dir doesn't create dir, so delete dir fails
-
+    # s3fs fails deleting dir fails if it is empty
+    # (https://github.com/dask/s3fs/issues/317)
+    skip_fsspec_s3fs(fs)
     d = pathfn('test-directory/')
 
     with pytest.raises(pa.ArrowIOError):
@@ -785,10 +821,6 @@ def test_copy_file(fs, pathfn, allow_copy_file):
 
 
 def test_move_directory(fs, pathfn, allow_move_dir):
-    if fs.type_name == "py::fsspec+memory":
-        # https://github.com/intake/filesystem_spec/issues/316
-        pytest.xfail(reason='Not working with in-memory fsspec')
-
     # move directory (doesn't work with S3)
     s = pathfn('source-dir/')
     t = pathfn('target-dir/')
@@ -806,10 +838,10 @@ def test_move_directory(fs, pathfn, allow_move_dir):
 
 
 def test_move_file(fs, pathfn):
-    if fs.type_name == "py::fsspec+memory":
-        # https://issues.apache.org/jira/browse/ARROW-9621
-        # https://github.com/intake/filesystem_spec/issues/367
-        pytest.xfail(reason='Not working with in-memory fsspec')
+    # s3fs moving a file with recursive=True on latest 0.5 version
+    # (https://github.com/dask/s3fs/issues/394)
+    skip_fsspec_s3fs(fs)
+
     s = pathfn('test-move-source-file')
     t = pathfn('test-move-target-file')
 
@@ -988,16 +1020,14 @@ def test_mockfs_mtime_roundtrip(mockfs):
 
 
 @pytest.mark.s3
-def test_s3_options(monkeypatch):
+def test_s3_options():
     from pyarrow.fs import S3FileSystem
 
-    # Avoid wait for unavailable metadata server in ARN role example below
-    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-
     fs = S3FileSystem(access_key='access', secret_key='secret',
-                      session_token='token', region='us-east-1',
+                      session_token='token', region='us-east-2',
                       scheme='https', endpoint_override='localhost:8999')
     assert isinstance(fs, S3FileSystem)
+    assert fs.region == 'us-east-2'
     assert pickle.loads(pickle.dumps(fs)) == fs
 
     fs = S3FileSystem(role_arn='role', session_name='session',
@@ -1017,6 +1047,147 @@ def test_s3_options(monkeypatch):
         S3FileSystem(
             access_key='access', secret_key='secret', role_arn='arn'
         )
+
+
+@pytest.mark.s3
+def test_s3_proxy_options(monkeypatch):
+    from pyarrow.fs import S3FileSystem
+
+    # The following two are equivalent:
+    proxy_opts_1_dict = {'scheme': 'http', 'host': 'localhost', 'port': 8999}
+    proxy_opts_1_str = 'http://localhost:8999'
+    # The following two are equivalent:
+    proxy_opts_2_dict = {'scheme': 'https', 'host': 'localhost', 'port': 8080}
+    proxy_opts_2_str = 'https://localhost:8080'
+
+    # Check dict case for 'proxy_options'
+    fs = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    assert isinstance(fs, S3FileSystem)
+    assert pickle.loads(pickle.dumps(fs)) == fs
+
+    fs = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    assert isinstance(fs, S3FileSystem)
+    assert pickle.loads(pickle.dumps(fs)) == fs
+
+    # Check str case for 'proxy_options'
+    fs = S3FileSystem(proxy_options=proxy_opts_1_str)
+    assert isinstance(fs, S3FileSystem)
+    assert pickle.loads(pickle.dumps(fs)) == fs
+
+    fs = S3FileSystem(proxy_options=proxy_opts_2_str)
+    assert isinstance(fs, S3FileSystem)
+    assert pickle.loads(pickle.dumps(fs)) == fs
+
+    # Check that two FSs using the same proxy_options dict are equal
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    # Check that two FSs using the same proxy_options str are equal
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    # Check that two FSs using equivalent proxy_options
+    # (one dict, one str) are equal
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    assert fs1 == fs2
+    assert pickle.loads(pickle.dumps(fs1)) == fs2
+    assert pickle.loads(pickle.dumps(fs2)) == fs1
+
+    # Check that two FSs using nonequivalent proxy_options are not equal
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    fs2 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    # Check that two FSs (one using proxy_options and the other not)
+    # are not equal
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_dict)
+    fs2 = S3FileSystem()
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_1_str)
+    fs2 = S3FileSystem()
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_2_dict)
+    fs2 = S3FileSystem()
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    fs1 = S3FileSystem(proxy_options=proxy_opts_2_str)
+    fs2 = S3FileSystem()
+    assert fs1 != fs2
+    assert pickle.loads(pickle.dumps(fs1)) != fs2
+    assert pickle.loads(pickle.dumps(fs2)) != fs1
+
+    # Only dict and str are supported
+    with pytest.raises(TypeError):
+        S3FileSystem(proxy_options=('http', 'localhost', 9090))
+    # Missing scheme
+    with pytest.raises(KeyError):
+        S3FileSystem(proxy_options={'host': 'localhost', 'port': 9090})
+    # Missing host
+    with pytest.raises(KeyError):
+        S3FileSystem(proxy_options={'scheme': 'https', 'port': 9090})
+    # Missing port
+    with pytest.raises(KeyError):
+        S3FileSystem(proxy_options={'scheme': 'http', 'host': 'localhost'})
+    # Invalid proxy URI (invalid scheme htttps)
+    with pytest.raises(pa.ArrowInvalid):
+        S3FileSystem(proxy_options='htttps://localhost:9000')
+    # Invalid proxy_options dict (invalid scheme htttps)
+    with pytest.raises(pa.ArrowInvalid):
+        S3FileSystem(proxy_options={'scheme': 'htttp', 'host': 'localhost',
+                                    'port': 8999})
 
 
 @pytest.mark.hdfs
@@ -1111,10 +1282,6 @@ def test_filesystem_from_uri(uri, expected_klass, expected_path):
     assert path == expected_path
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 6),
-    reason="python 3.5 Path.resolve() checks that the path exists"
-)
 @pytest.mark.parametrize(
     'path',
     ['', '/', 'foo/bar', '/foo/bar', __file__]
@@ -1318,6 +1485,34 @@ def test_s3_real_aws():
     # Exercise connection code with an AWS-backed S3 bucket.
     # This is a minimal integration check for ARROW-9261 and similar issues.
     from pyarrow.fs import S3FileSystem
+    default_region = (os.environ.get('PYARROW_TEST_S3_REGION') or
+                      'us-east-1')
     fs = S3FileSystem(anonymous=True)
+    assert fs.region == default_region
+
+    fs = S3FileSystem(anonymous=True, region='us-east-2')
     entries = fs.get_file_info(FileSelector('ursa-labs-taxi-data'))
     assert len(entries) > 0
+
+
+@pytest.mark.s3
+def test_s3_real_aws_region_selection():
+    # Taken from a registry of open S3-hosted datasets
+    # at https://github.com/awslabs/open-data-registry
+    fs, path = FileSystem.from_uri('s3://mf-nwp-models/README.txt')
+    assert fs.region == 'eu-west-1'
+    with fs.open_input_stream(path) as f:
+        assert b"Meteo-France Atmospheric models on AWS" in f.read(50)
+
+    # Passing an explicit region disables auto-selection
+    fs, path = FileSystem.from_uri(
+        's3://mf-nwp-models/README.txt?region=us-east-2')
+    assert fs.region == 'us-east-2'
+    # Reading from the wrong region may still work for public buckets...
+
+    # Non-existent bucket (hopefully, otherwise need to fix this test)
+    with pytest.raises(IOError, match="Bucket '.*' not found"):
+        FileSystem.from_uri('s3://x-arrow-non-existent-bucket')
+    fs, path = FileSystem.from_uri(
+        's3://x-arrow-non-existent-bucket?region=us-east-3')
+    assert fs.region == 'us-east-3'

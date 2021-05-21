@@ -24,7 +24,7 @@ py_to_r.pyarrow.lib.Array <- function(x, ...) {
   })
 
   x$`_export_to_c`(array_ptr, schema_ptr)
-  Array$create(ImportArray(array_ptr, schema_ptr))
+  ImportArray(array_ptr, schema_ptr)
 }
 
 r_to_py.Array <- function(x, convert = FALSE) {
@@ -53,7 +53,8 @@ py_to_r.pyarrow.lib.RecordBatch <- function(x, ...) {
   })
 
   x$`_export_to_c`(array_ptr, schema_ptr)
-  shared_ptr(RecordBatch, ImportRecordBatch(array_ptr, schema_ptr))
+
+  ImportRecordBatch(array_ptr, schema_ptr)
 }
 
 r_to_py.RecordBatch <- function(x, convert = FALSE) {
@@ -89,7 +90,7 @@ py_to_r.pyarrow.lib.ChunkedArray <- function(x, ...) {
 r_to_py.Table <- function(x, convert = FALSE) {
   # Import with convert = FALSE so that `_import_from_c` returns a Python object
   pa <- reticulate::import("pyarrow", convert = FALSE)
-  out <- pa$Table$from_arrays(x$columns, names = names(x))
+  out <- pa$Table$from_arrays(x$columns, schema = x$schema)
   # But set the convert attribute on the return object to the requested value
   assign("convert", convert, out)
   out
@@ -99,8 +100,94 @@ py_to_r.pyarrow.lib.Table <- function(x, ...) {
   colnames <- maybe_py_to_r(x$column_names)
   r_cols <- maybe_py_to_r(x$columns)
   names(r_cols) <- colnames
-  Table$create(!!!r_cols)
+  Table$create(!!!r_cols, schema = maybe_py_to_r(x$schema))
 }
+
+py_to_r.pyarrow.lib.Schema <- function(x, ...) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  x$`_export_to_c`(schema_ptr)
+  ImportSchema(schema_ptr)
+}
+
+r_to_py.Schema <- function(x, convert = FALSE) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  # Import with convert = FALSE so that `_import_from_c` returns a Python object
+  pa <- reticulate::import("pyarrow", convert = FALSE)
+  ExportSchema(x, schema_ptr)
+  out <- pa$Schema$`_import_from_c`(schema_ptr)
+  # But set the convert attribute on the return object to the requested value
+  assign("convert", convert, out)
+  out
+}
+
+py_to_r.pyarrow.lib.Field <- function(x, ...) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  x$`_export_to_c`(schema_ptr)
+  ImportField(schema_ptr)
+}
+
+r_to_py.Field <- function(x, convert = FALSE) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  # Import with convert = FALSE so that `_import_from_c` returns a Python object
+  pa <- reticulate::import("pyarrow", convert = FALSE)
+  ExportField(x, schema_ptr)
+  out <- pa$Field$`_import_from_c`(schema_ptr)
+  # But set the convert attribute on the return object to the requested value
+  assign("convert", convert, out)
+  out
+}
+
+py_to_r.pyarrow.lib.DataType <- function(x, ...) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  x$`_export_to_c`(schema_ptr)
+  ImportType(schema_ptr)
+}
+
+r_to_py.DataType <- function(x, convert = FALSE) {
+  schema_ptr <- allocate_arrow_schema()
+  on.exit(delete_arrow_schema(schema_ptr))
+
+  # Import with convert = FALSE so that `_import_from_c` returns a Python object
+  pa <- reticulate::import("pyarrow", convert = FALSE)
+  ExportType(x, schema_ptr)
+  out <- pa$DataType$`_import_from_c`(schema_ptr)
+  # But set the convert attribute on the return object to the requested value
+  assign("convert", convert, out)
+  out
+}
+
+py_to_r.pyarrow.lib.RecordBatchReader <- function(x, ...) {
+  stream_ptr <- allocate_arrow_array_stream()
+  on.exit(delete_arrow_array_stream(stream_ptr))
+
+  x$`_export_to_c`(stream_ptr)
+  ImportRecordBatchReader(stream_ptr)
+}
+
+r_to_py.RecordBatchReader <- function(x, convert = FALSE) {
+  stream_ptr <- allocate_arrow_array_stream()
+  on.exit(delete_arrow_array_stream(stream_ptr))
+
+  # Import with convert = FALSE so that `_import_from_c` returns a Python object
+  pa <- reticulate::import("pyarrow", convert = FALSE)
+  ExportRecordBatchReader(x, stream_ptr)
+  # TODO: handle subclasses of RecordBatchReader?
+  out <- pa$lib$RecordBatchReader$`_import_from_c`(stream_ptr)
+  # But set the convert attribute on the return object to the requested value
+  assign("convert", convert, out)
+  out
+}
+
 
 maybe_py_to_r <- function(x) {
   if (inherits(x, "python.builtin.object")) {

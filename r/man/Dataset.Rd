@@ -45,7 +45,8 @@ as described above.
 takes the following arguments:
 \itemize{
 \item \code{filesystem}: A \link{FileSystem}
-\item \code{selector}: A \link{FileSelector}
+\item \code{selector}: Either a \link{FileSelector} or \code{NULL}
+\item \code{paths}: Either a character vector of file paths or \code{NULL}
 \item \code{format}: A \link{FileFormat}
 \item \code{partitioning}: Either \code{Partitioning}, \code{PartitioningFactory}, or \code{NULL}
 }
@@ -61,9 +62,6 @@ A \code{Dataset} has the following methods:
 may also replace the dataset's schema by using \code{ds$schema <- new_schema}.
 This method currently supports only adding, removing, or reordering
 fields in the schema: you cannot alter or cast the field types.
-\item \verb{$write(path, filesystem, schema, format, partitioning, ...)}: writes the
-dataset to \code{path} in the \code{format} file format, partitioned by \code{partitioning},
-and invisibly returns \code{self}. See \code{\link[=write_dataset]{write_dataset()}}.
 }
 
 \code{FileSystemDataset} has the following methods:

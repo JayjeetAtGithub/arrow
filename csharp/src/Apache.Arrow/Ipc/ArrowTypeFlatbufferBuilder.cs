@@ -30,7 +30,7 @@ namespace Apache.Arrow.Ipc
             public readonly int Offset;
 
             public static FieldType Build<T>(Flatbuf.Type type, Offset<T> offset)
-                where T: struct =>
+                where T : struct =>
                 new FieldType(type, offset.Value);
 
             public FieldType(Flatbuf.Type type, int offset)
@@ -40,7 +40,7 @@ namespace Apache.Arrow.Ipc
             }
         }
 
-        class TypeVisitor : 
+        class TypeVisitor :
             IArrowTypeVisitor<BooleanType>,
             IArrowTypeVisitor<Int8Type>,
             IArrowTypeVisitor<Int16Type>,
@@ -60,7 +60,10 @@ namespace Apache.Arrow.Ipc
             IArrowTypeVisitor<BinaryType>,
             IArrowTypeVisitor<TimestampType>,
             IArrowTypeVisitor<ListType>,
-            IArrowTypeVisitor<UnionType>
+            IArrowTypeVisitor<UnionType>,
+            IArrowTypeVisitor<StructType>,
+            IArrowTypeVisitor<Decimal128Type>,
+            IArrowTypeVisitor<Decimal256Type>
         {
             private FlatBufferBuilder Builder { get; }
 
@@ -100,7 +103,7 @@ namespace Apache.Arrow.Ipc
             {
                 Flatbuf.List.StartList(Builder);
                 Result = FieldType.Build(
-                    Flatbuf.Type.List, 
+                    Flatbuf.Type.List,
                     Flatbuf.List.EndList(Builder));
             }
 
@@ -118,14 +121,14 @@ namespace Apache.Arrow.Ipc
             }
 
             public void Visit(TimestampType type)
-            {  
+            {
                 StringOffset timezoneStringOffset = default;
 
                 if (!string.IsNullOrWhiteSpace(type.Timezone))
                     timezoneStringOffset = Builder.CreateString(type.Timezone);
 
                 Result = FieldType.Build(
-                    Flatbuf.Type.Timestamp, 
+                    Flatbuf.Type.Timestamp,
                     Flatbuf.Timestamp.CreateTimestamp(Builder, ToFlatBuffer(type.Unit), timezoneStringOffset));
             }
 
@@ -169,6 +172,26 @@ namespace Apache.Arrow.Ipc
                 Result = FieldType.Build(
                     Flatbuf.Type.Time,
                     Flatbuf.Time.CreateTime(Builder, ToFlatBuffer(type.Unit), 64));
+            }
+
+            public void Visit(StructType type)
+            {
+                Flatbuf.Struct_.StartStruct_(Builder);
+                Result = FieldType.Build(Flatbuf.Type.Struct_, Flatbuf.Struct_.EndStruct_(Builder));
+            }
+
+            public void Visit(Decimal128Type type)
+            {
+                Result = FieldType.Build(
+                    Flatbuf.Type.Decimal,
+                    Flatbuf.Decimal.CreateDecimal(Builder, type.Precision, type.Scale, type.BitWidth));
+            }
+
+            public void Visit(Decimal256Type type)
+            {
+                Result = FieldType.Build(
+                    Flatbuf.Type.Decimal,
+                    Flatbuf.Decimal.CreateDecimal(Builder, type.Precision, type.Scale, type.BitWidth));
             }
 
             private void CreateIntType(NumberType type)

@@ -17,61 +17,24 @@
 
 #include "parquet/metadata.h"
 
-#include <inttypes.h>
-
 #include <algorithm>
+#include <cinttypes>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "arrow/io/memory.h"
+#include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
-#include "parquet/encryption_internal.h"
+#include "arrow/util/string_view.h"
+#include "parquet/encryption/encryption_internal.h"
+#include "parquet/encryption/internal_file_decryptor.h"
 #include "parquet/exception.h"
-#include "parquet/internal_file_decryptor.h"
 #include "parquet/schema.h"
 #include "parquet/schema_internal.h"
 #include "parquet/statistics.h"
 #include "parquet/thrift_internal.h"
-
-// ARROW-6096: The boost regex library must be used when compiling with gcc < 4.9
-#if defined(PARQUET_USE_BOOST_REGEX)
-#include <boost/regex.hpp>  // IWYU pragma: keep
-using ::boost::regex;
-using ::boost::smatch;
-
-template <typename... Args>
-static bool regex_match(Args&&... args) {
-  try {
-    return boost::regex_match(std::forward<Args>(args)...);
-  } catch (const boost::regex_error& e) {
-    if (e.code() == boost::regex_constants::error_complexity ||
-        e.code() == boost::regex_constants::error_stack) {
-      // Input-dependent error => return as if matching failed
-      return false;
-    }
-    throw;
-  }
-}
-#else
-#include <regex>
-using ::std::regex;
-using ::std::smatch;
-
-template <typename... Args>
-static bool regex_match(Args&&... args) {
-  try {
-    return std::regex_match(std::forward<Args>(args)...);
-  } catch (const std::regex_error& e) {
-    if (e.code() == std::regex_constants::error_complexity ||
-        e.code() == std::regex_constants::error_stack) {
-      // Input-dependent error => return as if matching failed
-      return false;
-    }
-    throw;
-  }
-}
-#endif
 
 namespace parquet {
 
@@ -116,14 +79,17 @@ static std::shared_ptr<Statistics> MakeTypedColumnStats(
         descr, metadata.statistics.min_value, metadata.statistics.max_value,
         metadata.num_values - metadata.statistics.null_count,
         metadata.statistics.null_count, metadata.statistics.distinct_count,
-        metadata.statistics.__isset.max_value || metadata.statistics.__isset.min_value);
+        metadata.statistics.__isset.max_value || metadata.statistics.__isset.min_value,
+        metadata.statistics.__isset.null_count,
+        metadata.statistics.__isset.distinct_count);
   }
   // Default behavior
   return MakeStatistics<DType>(
       descr, metadata.statistics.min, metadata.statistics.max,
       metadata.num_values - metadata.statistics.null_count,
       metadata.statistics.null_count, metadata.statistics.distinct_count,
-      metadata.statistics.__isset.max || metadata.statistics.__isset.min);
+      metadata.statistics.__isset.max || metadata.statistics.__isset.min,
+      metadata.statistics.__isset.null_count, metadata.statistics.__isset.distinct_count);
 }
 
 std::shared_ptr<Statistics> MakeColumnStats(const format::ColumnMetaData& meta_data,
@@ -159,8 +125,6 @@ class ColumnCryptoMetaData::ColumnCryptoMetaDataImpl {
   explicit ColumnCryptoMetaDataImpl(const format::ColumnCryptoMetaData* crypto_metadata)
       : crypto_metadata_(crypto_metadata) {}
 
-  ~ColumnCryptoMetaDataImpl() {}
-
   bool encrypted_with_footer_key() const {
     return crypto_metadata_->__isset.ENCRYPTION_WITH_FOOTER_KEY;
   }
@@ -188,7 +152,7 @@ ColumnCryptoMetaData::ColumnCryptoMetaData(const uint8_t* metadata)
     : impl_(new ColumnCryptoMetaDataImpl(
           reinterpret_cast<const format::ColumnCryptoMetaData*>(metadata))) {}
 
-ColumnCryptoMetaData::~ColumnCryptoMetaData() {}
+ColumnCryptoMetaData::~ColumnCryptoMetaData() = default;
 
 std::shared_ptr<schema::ColumnPath> ColumnCryptoMetaData::path_in_schema() const {
   return impl_->path_in_schema();
@@ -203,11 +167,11 @@ const std::string& ColumnCryptoMetaData::key_metadata() const {
 // ColumnChunk metadata
 class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
  public:
-  explicit ColumnChunkMetaDataImpl(
-      const format::ColumnChunk* column, const ColumnDescriptor* descr,
-      int16_t row_group_ordinal, int16_t column_ordinal,
-      const ApplicationVersion* writer_version,
-      std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
+  explicit ColumnChunkMetaDataImpl(const format::ColumnChunk* column,
+                                   const ColumnDescriptor* descr,
+                                   int16_t row_group_ordinal, int16_t column_ordinal,
+                                   const ApplicationVersion* writer_version,
+                                   std::shared_ptr<InternalFileDecryptor> file_decryptor)
       : column_(column), descr_(descr), writer_version_(writer_version) {
     column_metadata_ = &column->meta_data;
     if (column->__isset.crypto_metadata) {  // column metadata is encrypted
@@ -222,10 +186,10 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
 
           std::string aad_column_metadata = encryption::CreateModuleAad(
               file_decryptor->file_aad(), encryption::kColumnMetaData, row_group_ordinal,
-              column_ordinal, (int16_t)-1);
+              column_ordinal, static_cast<int16_t>(-1));
           auto decryptor = file_decryptor->GetColumnMetaDecryptor(
               path->ToDotString(), key_metadata, aad_column_metadata);
-          uint32_t len = static_cast<uint32_t>(column->encrypted_column_metadata.size());
+          auto len = static_cast<uint32_t>(column->encrypted_column_metadata.size());
           DeserializeThriftMsg(
               reinterpret_cast<const uint8_t*>(column->encrypted_column_metadata.c_str()),
               &len, &decrypted_metadata_, decryptor);
@@ -247,6 +211,11 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     }
     possible_stats_ = nullptr;
   }
+
+  bool Equals(const ColumnChunkMetaDataImpl& other) const {
+    return *column_metadata_ == *other.column_metadata_;
+  }
+
   // column chunk
   inline int64_t file_offset() const { return column_->file_offset; }
   inline const std::string& file_path() const { return column_->file_path; }
@@ -340,18 +309,20 @@ std::unique_ptr<ColumnChunkMetaData> ColumnChunkMetaData::Make(
     int16_t column_ordinal, std::shared_ptr<InternalFileDecryptor> file_decryptor) {
   return std::unique_ptr<ColumnChunkMetaData>(
       new ColumnChunkMetaData(metadata, descr, row_group_ordinal, column_ordinal,
-                              writer_version, file_decryptor));
+                              writer_version, std::move(file_decryptor)));
 }
 
 ColumnChunkMetaData::ColumnChunkMetaData(
     const void* metadata, const ColumnDescriptor* descr, int16_t row_group_ordinal,
     int16_t column_ordinal, const ApplicationVersion* writer_version,
     std::shared_ptr<InternalFileDecryptor> file_decryptor)
-    : impl_{std::unique_ptr<ColumnChunkMetaDataImpl>(new ColumnChunkMetaDataImpl(
+    : impl_{new ColumnChunkMetaDataImpl(
           reinterpret_cast<const format::ColumnChunk*>(metadata), descr,
-          row_group_ordinal, column_ordinal, writer_version, file_decryptor))} {}
+          row_group_ordinal, column_ordinal, writer_version, std::move(file_decryptor))} {
+}
 
-ColumnChunkMetaData::~ColumnChunkMetaData() {}
+ColumnChunkMetaData::~ColumnChunkMetaData() = default;
+
 // column chunk
 int64_t ColumnChunkMetaData::file_offset() const { return impl_->file_offset(); }
 
@@ -417,6 +388,10 @@ std::unique_ptr<ColumnCryptoMetaData> ColumnChunkMetaData::crypto_metadata() con
   return impl_->crypto_metadata();
 }
 
+bool ColumnChunkMetaData::Equals(const ColumnChunkMetaData& other) const {
+  return impl_->Equals(*other.impl_);
+}
+
 // row-group metadata
 class RowGroupMetaData::RowGroupMetaDataImpl {
  public:
@@ -427,7 +402,11 @@ class RowGroupMetaData::RowGroupMetaDataImpl {
       : row_group_(row_group),
         schema_(schema),
         writer_version_(writer_version),
-        file_decryptor_(file_decryptor) {}
+        file_decryptor_(std::move(file_decryptor)) {}
+
+  bool Equals(const RowGroupMetaDataImpl& other) const {
+    return *row_group_ == *other.row_group_;
+  }
 
   inline int num_columns() const { return static_cast<int>(row_group_->columns.size()); }
 
@@ -435,24 +414,22 @@ class RowGroupMetaData::RowGroupMetaDataImpl {
 
   inline int64_t total_byte_size() const { return row_group_->total_byte_size; }
 
-  inline int64_t file_offset() const { return row_group_->file_offset; }
-
   inline int64_t total_compressed_size() const {
     return row_group_->total_compressed_size;
   }
 
+  inline int64_t file_offset() const { return row_group_->file_offset; }
+
   inline const SchemaDescriptor* schema() const { return schema_; }
 
   std::unique_ptr<ColumnChunkMetaData> ColumnChunk(int i) {
-    if (!(i < num_columns())) {
-      std::stringstream ss;
-      ss << "The file only has " << num_columns()
-         << " columns, requested metadata for column: " << i;
-      throw ParquetException(ss.str());
+    if (i < num_columns()) {
+      return ColumnChunkMetaData::Make(&row_group_->columns[i], schema_->Column(i),
+                                       writer_version_, row_group_->ordinal,
+                                       static_cast<int16_t>(i), file_decryptor_);
     }
-    return ColumnChunkMetaData::Make(&row_group_->columns[i], schema_->Column(i),
-                                     writer_version_, row_group_->ordinal, (int16_t)i,
-                                     file_decryptor_);
+    throw ParquetException("The file only has ", num_columns(),
+                           " columns, requested metadata for column: ", i);
   }
 
  private:
@@ -467,23 +444,31 @@ std::unique_ptr<RowGroupMetaData> RowGroupMetaData::Make(
     const ApplicationVersion* writer_version,
     std::shared_ptr<InternalFileDecryptor> file_decryptor) {
   return std::unique_ptr<RowGroupMetaData>(
-      new RowGroupMetaData(metadata, schema, writer_version, file_decryptor));
+      new RowGroupMetaData(metadata, schema, writer_version, std::move(file_decryptor)));
 }
 
 RowGroupMetaData::RowGroupMetaData(const void* metadata, const SchemaDescriptor* schema,
                                    const ApplicationVersion* writer_version,
                                    std::shared_ptr<InternalFileDecryptor> file_decryptor)
-    : impl_{std::unique_ptr<RowGroupMetaDataImpl>(
-          new RowGroupMetaDataImpl(reinterpret_cast<const format::RowGroup*>(metadata),
-                                   schema, writer_version, file_decryptor))} {}
+    : impl_{new RowGroupMetaDataImpl(reinterpret_cast<const format::RowGroup*>(metadata),
+                                     schema, writer_version, std::move(file_decryptor))} {
+}
 
-RowGroupMetaData::~RowGroupMetaData() {}
+RowGroupMetaData::~RowGroupMetaData() = default;
+
+bool RowGroupMetaData::Equals(const RowGroupMetaData& other) const {
+  return impl_->Equals(*other.impl_);
+}
 
 int RowGroupMetaData::num_columns() const { return impl_->num_columns(); }
 
 int64_t RowGroupMetaData::num_rows() const { return impl_->num_rows(); }
 
 int64_t RowGroupMetaData::total_byte_size() const { return impl_->total_byte_size(); }
+
+int64_t RowGroupMetaData::total_compressed_size() const {
+  return impl_->total_compressed_size();
+}
 
 int64_t RowGroupMetaData::file_offset() const { return impl_->file_offset(); }
 
@@ -506,12 +491,12 @@ bool RowGroupMetaData::can_decompress() const {
 // file metadata
 class FileMetaData::FileMetaDataImpl {
  public:
-  FileMetaDataImpl() : metadata_len_(0) {}
+  FileMetaDataImpl() = default;
 
   explicit FileMetaDataImpl(
       const void* metadata, uint32_t* metadata_len,
       std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
-      : metadata_len_(0), file_decryptor_(file_decryptor) {
+      : file_decryptor_(file_decryptor) {
     metadata_.reset(new format::FileMetaData);
 
     auto footer_decryptor =
@@ -544,9 +529,9 @@ class FileMetaData::FileMetaDataImpl {
     serializer.SerializeToBuffer(metadata_.get(), &serialized_len, &serialized_data);
 
     // encrypt with nonce
-    uint8_t* nonce = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(signature));
-    uint8_t* tag = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(signature)) +
-                   encryption::kNonceLength;
+    auto nonce = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(signature));
+    auto tag = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(signature)) +
+               encryption::kNonceLength;
 
     std::string key = file_decryptor_->GetFooterKey();
     std::string aad = encryption::CreateFooterAad(file_decryptor_->file_aad());
@@ -634,6 +619,10 @@ class FileMetaData::FileMetaDataImpl {
                                   file_decryptor_);
   }
 
+  bool Equals(const FileMetaDataImpl& other) const {
+    return *metadata_ == *other.metadata_;
+  }
+
   const SchemaDescriptor* schema() const { return &schema_; }
 
   const std::shared_ptr<const KeyValueMetadata>& key_value_metadata() const {
@@ -666,13 +655,52 @@ class FileMetaData::FileMetaDataImpl {
     }
   }
 
+  std::shared_ptr<FileMetaData> Subset(const std::vector<int>& row_groups) {
+    for (int i : row_groups) {
+      if (i < num_row_groups()) continue;
+
+      throw ParquetException(
+          "The file only has ", num_row_groups(),
+          " row groups, but requested a subset including row group: ", i);
+    }
+
+    std::shared_ptr<FileMetaData> out(new FileMetaData());
+    out->impl_.reset(new FileMetaDataImpl());
+    out->impl_->metadata_.reset(new format::FileMetaData());
+
+    auto metadata = out->impl_->metadata_.get();
+    metadata->version = metadata_->version;
+    metadata->schema = metadata_->schema;
+
+    metadata->row_groups.resize(row_groups.size());
+    int i = 0;
+    for (int selected_index : row_groups) {
+      metadata->num_rows += row_group(selected_index).num_rows;
+      metadata->row_groups[i++] = row_group(selected_index);
+    }
+
+    metadata->key_value_metadata = metadata_->key_value_metadata;
+    metadata->created_by = metadata_->created_by;
+    metadata->column_orders = metadata_->column_orders;
+    metadata->encryption_algorithm = metadata_->encryption_algorithm;
+    metadata->footer_signing_key_metadata = metadata_->footer_signing_key_metadata;
+    metadata->__isset = metadata_->__isset;
+
+    out->impl_->schema_ = schema_;
+    out->impl_->writer_version_ = writer_version_;
+    out->impl_->key_value_metadata_ = key_value_metadata_;
+    out->impl_->file_decryptor_ = file_decryptor_;
+
+    return out;
+  }
+
   void set_file_decryptor(std::shared_ptr<InternalFileDecryptor> file_decryptor) {
     file_decryptor_ = file_decryptor;
   }
 
  private:
   friend FileMetaDataBuilder;
-  uint32_t metadata_len_;
+  uint32_t metadata_len_ = 0;
   std::unique_ptr<format::FileMetaData> metadata_;
   SchemaDescriptor schema_;
   ApplicationVersion writer_version_;
@@ -733,7 +761,11 @@ FileMetaData::FileMetaData(const void* metadata, uint32_t* metadata_len,
 FileMetaData::FileMetaData()
     : impl_{std::unique_ptr<FileMetaDataImpl>(new FileMetaDataImpl())} {}
 
-FileMetaData::~FileMetaData() {}
+FileMetaData::~FileMetaData() = default;
+
+bool FileMetaData::Equals(const FileMetaData& other) const {
+  return impl_->Equals(*other.impl_);
+}
 
 std::unique_ptr<RowGroupMetaData> FileMetaData::RowGroup(int i) const {
   return impl_->RowGroup(i);
@@ -811,6 +843,11 @@ void FileMetaData::AppendRowGroups(const FileMetaData& other) {
   impl_->AppendRowGroups(other.impl_);
 }
 
+std::shared_ptr<FileMetaData> FileMetaData::Subset(
+    const std::vector<int>& row_groups) const {
+  return impl_->Subset(row_groups);
+}
+
 void FileMetaData::WriteTo(::arrow::io::OutputStream* dst,
                            const std::shared_ptr<Encryptor>& encryptor) const {
   return impl_->WriteTo(dst, encryptor);
@@ -818,15 +855,13 @@ void FileMetaData::WriteTo(::arrow::io::OutputStream* dst,
 
 class FileCryptoMetaData::FileCryptoMetaDataImpl {
  public:
-  FileCryptoMetaDataImpl() {}
+  FileCryptoMetaDataImpl() = default;
 
   explicit FileCryptoMetaDataImpl(const uint8_t* metadata, uint32_t* metadata_len) {
     metadata_.reset(new format::FileCryptoMetaData);
     DeserializeThriftMsg(metadata, metadata_len, metadata_.get());
     metadata_len_ = *metadata_len;
   }
-
-  ~FileCryptoMetaDataImpl() {}
 
   EncryptionAlgorithm encryption_algorithm() {
     return FromThrift(metadata_->encryption_algorithm);
@@ -863,7 +898,7 @@ FileCryptoMetaData::FileCryptoMetaData(const uint8_t* serialized_metadata,
 
 FileCryptoMetaData::FileCryptoMetaData() : impl_(new FileCryptoMetaDataImpl()) {}
 
-FileCryptoMetaData::~FileCryptoMetaData() {}
+FileCryptoMetaData::~FileCryptoMetaData() = default;
 
 void FileCryptoMetaData::WriteTo(::arrow::io::OutputStream* dst) const {
   impl_->WriteTo(dst);
@@ -872,53 +907,319 @@ void FileCryptoMetaData::WriteTo(::arrow::io::OutputStream* dst) const {
 std::string FileMetaData::SerializeToString() const {
   // We need to pass in an initial size. Since it will automatically
   // increase the buffer size to hold the metadata, we just leave it 0.
-  PARQUET_ASSIGN_OR_THROW(auto serializer, arrow::io::BufferOutputStream::Create(0));
+  PARQUET_ASSIGN_OR_THROW(auto serializer, ::arrow::io::BufferOutputStream::Create(0));
   WriteTo(serializer.get());
   PARQUET_ASSIGN_OR_THROW(auto metadata_buffer, serializer->Finish());
   return metadata_buffer->ToString();
 }
 
-ApplicationVersion::ApplicationVersion(const std::string& application, int major,
-                                       int minor, int patch)
-    : application_(application), version{major, minor, patch, "", "", ""} {}
+ApplicationVersion::ApplicationVersion(std::string application, int major, int minor,
+                                       int patch)
+    : application_(std::move(application)), version{major, minor, patch, "", "", ""} {}
+
+namespace {
+// Parse the application version format and set parsed values to
+// ApplicationVersion.
+//
+// The application version format must be compatible parquet-mr's
+// one. See also:
+//   * https://github.com/apache/parquet-mr/blob/master/parquet-common/src/main/java/org/apache/parquet/VersionParser.java
+//   * https://github.com/apache/parquet-mr/blob/master/parquet-common/src/main/java/org/apache/parquet/SemanticVersion.java
+//
+// The application version format:
+//   "${APPLICATION_NAME}"
+//   "${APPLICATION_NAME} version ${VERSION}"
+//   "${APPLICATION_NAME} version ${VERSION} (build ${BUILD_NAME})"
+//
+// Eg:
+//   parquet-cpp
+//   parquet-cpp version 1.5.0ab-xyz5.5.0+cd
+//   parquet-cpp version 1.5.0ab-xyz5.5.0+cd (build abcd)
+//
+// The VERSION format:
+//   "${MAJOR}"
+//   "${MAJOR}.${MINOR}"
+//   "${MAJOR}.${MINOR}.${PATCH}"
+//   "${MAJOR}.${MINOR}.${PATCH}${UNKNOWN}"
+//   "${MAJOR}.${MINOR}.${PATCH}${UNKNOWN}-${PRE_RELEASE}"
+//   "${MAJOR}.${MINOR}.${PATCH}${UNKNOWN}-${PRE_RELEASE}+${BUILD_INFO}"
+//   "${MAJOR}.${MINOR}.${PATCH}${UNKNOWN}+${BUILD_INFO}"
+//   "${MAJOR}.${MINOR}.${PATCH}-${PRE_RELEASE}"
+//   "${MAJOR}.${MINOR}.${PATCH}-${PRE_RELEASE}+${BUILD_INFO}"
+//   "${MAJOR}.${MINOR}.${PATCH}+${BUILD_INFO}"
+//
+// Eg:
+//   1
+//   1.5
+//   1.5.0
+//   1.5.0ab
+//   1.5.0ab-cdh5.5.0
+//   1.5.0ab-cdh5.5.0+cd
+//   1.5.0ab+cd
+//   1.5.0-cdh5.5.0
+//   1.5.0-cdh5.5.0+cd
+//   1.5.0+cd
+class ApplicationVersionParser {
+ public:
+  ApplicationVersionParser(const std::string& created_by,
+                           ApplicationVersion& application_version)
+      : created_by_(created_by),
+        application_version_(application_version),
+        spaces_(" \t\v\r\n\f"),
+        digits_("0123456789") {}
+
+  void Parse() {
+    application_version_.application_ = "unknown";
+    application_version_.version = {0, 0, 0, "", "", ""};
+
+    if (!ParseApplicationName()) {
+      return;
+    }
+    if (!ParseVersion()) {
+      return;
+    }
+    if (!ParseBuildName()) {
+      return;
+    }
+  }
+
+ private:
+  bool IsSpace(const std::string& string, const size_t& offset) {
+    auto target = ::arrow::util::string_view(string).substr(offset, 1);
+    return target.find_first_of(spaces_) != ::arrow::util::string_view::npos;
+  }
+
+  void RemovePrecedingSpaces(const std::string& string, size_t& start,
+                             const size_t& end) {
+    while (start < end && IsSpace(string, start)) {
+      ++start;
+    }
+  }
+
+  void RemoveTrailingSpaces(const std::string& string, const size_t& start, size_t& end) {
+    while (start < (end - 1) && (end - 1) < string.size() && IsSpace(string, end - 1)) {
+      --end;
+    }
+  }
+
+  bool ParseApplicationName() {
+    std::string version_mark(" version ");
+    auto version_mark_position = created_by_.find(version_mark);
+    size_t application_name_end;
+    // No VERSION and BUILD_NAME.
+    if (version_mark_position == std::string::npos) {
+      version_start_ = std::string::npos;
+      application_name_end = created_by_.size();
+    } else {
+      version_start_ = version_mark_position + version_mark.size();
+      application_name_end = version_mark_position;
+    }
+
+    size_t application_name_start = 0;
+    RemovePrecedingSpaces(created_by_, application_name_start, application_name_end);
+    RemoveTrailingSpaces(created_by_, application_name_start, application_name_end);
+    application_version_.application_ = created_by_.substr(
+        application_name_start, application_name_end - application_name_start);
+
+    return true;
+  }
+
+  bool ParseVersion() {
+    // No VERSION.
+    if (version_start_ == std::string::npos) {
+      return false;
+    }
+
+    RemovePrecedingSpaces(created_by_, version_start_, created_by_.size());
+    version_end_ = created_by_.find(" (", version_start_);
+    // No BUILD_NAME.
+    if (version_end_ == std::string::npos) {
+      version_end_ = created_by_.size();
+    }
+    RemoveTrailingSpaces(created_by_, version_start_, version_end_);
+    // No VERSION.
+    if (version_start_ == version_end_) {
+      return false;
+    }
+    version_string_ = created_by_.substr(version_start_, version_end_ - version_start_);
+
+    if (!ParseVersionMajor()) {
+      return false;
+    }
+    if (!ParseVersionMinor()) {
+      return false;
+    }
+    if (!ParseVersionPatch()) {
+      return false;
+    }
+    if (!ParseVersionUnknown()) {
+      return false;
+    }
+    if (!ParseVersionPreRelease()) {
+      return false;
+    }
+    if (!ParseVersionBuildInfo()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool ParseVersionMajor() {
+    size_t version_major_start = 0;
+    auto version_major_end = version_string_.find_first_not_of(digits_);
+    // MAJOR only.
+    if (version_major_end == std::string::npos) {
+      version_major_end = version_string_.size();
+      version_parsing_position_ = version_major_end;
+    } else {
+      // No ".".
+      if (version_string_[version_major_end] != '.') {
+        return false;
+      }
+      // No MAJOR.
+      if (version_major_end == version_major_start) {
+        return false;
+      }
+      version_parsing_position_ = version_major_end + 1;  // +1 is for '.'.
+    }
+    auto version_major_string = version_string_.substr(
+        version_major_start, version_major_end - version_major_start);
+    application_version_.version.major = atoi(version_major_string.c_str());
+    return true;
+  }
+
+  bool ParseVersionMinor() {
+    auto version_minor_start = version_parsing_position_;
+    auto version_minor_end =
+        version_string_.find_first_not_of(digits_, version_minor_start);
+    // MAJOR.MINOR only.
+    if (version_minor_end == std::string::npos) {
+      version_minor_end = version_string_.size();
+      version_parsing_position_ = version_minor_end;
+    } else {
+      // No ".".
+      if (version_string_[version_minor_end] != '.') {
+        return false;
+      }
+      // No MINOR.
+      if (version_minor_end == version_minor_start) {
+        return false;
+      }
+      version_parsing_position_ = version_minor_end + 1;  // +1 is for '.'.
+    }
+    auto version_minor_string = version_string_.substr(
+        version_minor_start, version_minor_end - version_minor_start);
+    application_version_.version.minor = atoi(version_minor_string.c_str());
+    return true;
+  }
+
+  bool ParseVersionPatch() {
+    auto version_patch_start = version_parsing_position_;
+    auto version_patch_end =
+        version_string_.find_first_not_of(digits_, version_patch_start);
+    // No UNKNOWN, PRE_RELEASE and BUILD_INFO.
+    if (version_patch_end == std::string::npos) {
+      version_patch_end = version_string_.size();
+    }
+    // No PATCH.
+    if (version_patch_end == version_patch_start) {
+      return false;
+    }
+    auto version_patch_string = version_string_.substr(
+        version_patch_start, version_patch_end - version_patch_start);
+    application_version_.version.patch = atoi(version_patch_string.c_str());
+    version_parsing_position_ = version_patch_end;
+    return true;
+  }
+
+  bool ParseVersionUnknown() {
+    // No UNKNOWN.
+    if (version_parsing_position_ == version_string_.size()) {
+      return true;
+    }
+    auto version_unknown_start = version_parsing_position_;
+    auto version_unknown_end = version_string_.find_first_of("-+", version_unknown_start);
+    // No PRE_RELEASE and BUILD_INFO
+    if (version_unknown_end == std::string::npos) {
+      version_unknown_end = version_string_.size();
+    }
+    application_version_.version.unknown = version_string_.substr(
+        version_unknown_start, version_unknown_end - version_unknown_start);
+    version_parsing_position_ = version_unknown_end;
+    return true;
+  }
+
+  bool ParseVersionPreRelease() {
+    // No PRE_RELEASE.
+    if (version_parsing_position_ == version_string_.size() ||
+        version_string_[version_parsing_position_] != '-') {
+      return true;
+    }
+
+    auto version_pre_release_start = version_parsing_position_ + 1;  // +1 is for '-'.
+    auto version_pre_release_end =
+        version_string_.find_first_of("+", version_pre_release_start);
+    // No BUILD_INFO
+    if (version_pre_release_end == std::string::npos) {
+      version_pre_release_end = version_string_.size();
+    }
+    application_version_.version.pre_release = version_string_.substr(
+        version_pre_release_start, version_pre_release_end - version_pre_release_start);
+    version_parsing_position_ = version_pre_release_end;
+    return true;
+  }
+
+  bool ParseVersionBuildInfo() {
+    // No BUILD_INFO.
+    if (version_parsing_position_ == version_string_.size() ||
+        version_string_[version_parsing_position_] != '+') {
+      return true;
+    }
+
+    auto version_build_info_start = version_parsing_position_ + 1;  // +1 is for '+'.
+    application_version_.version.build_info =
+        version_string_.substr(version_build_info_start);
+    return true;
+  }
+
+  bool ParseBuildName() {
+    std::string build_mark(" (build ");
+    auto build_mark_position = created_by_.find(build_mark, version_end_);
+    // No BUILD_NAME.
+    if (build_mark_position == std::string::npos) {
+      return false;
+    }
+    auto build_name_start = build_mark_position + build_mark.size();
+    RemovePrecedingSpaces(created_by_, build_name_start, created_by_.size());
+    auto build_name_end = created_by_.find_first_of(")", build_name_start);
+    // No end ")".
+    if (build_name_end == std::string::npos) {
+      return false;
+    }
+    RemoveTrailingSpaces(created_by_, build_name_start, build_name_end);
+    application_version_.build_ =
+        created_by_.substr(build_name_start, build_name_end - build_name_start);
+
+    return true;
+  }
+
+  const std::string& created_by_;
+  ApplicationVersion& application_version_;
+
+  // For parsing.
+  std::string spaces_;
+  std::string digits_;
+  size_t version_parsing_position_;
+  size_t version_start_;
+  size_t version_end_;
+  std::string version_string_;
+};
+}  // namespace
 
 ApplicationVersion::ApplicationVersion(const std::string& created_by) {
-  // Use singletons to compile only once (ARROW-9863)
-  static regex app_regex{ApplicationVersion::APPLICATION_FORMAT};
-  static regex ver_regex{ApplicationVersion::VERSION_FORMAT};
-  smatch app_matches;
-  smatch ver_matches;
-
-  std::string created_by_lower = created_by;
-  std::transform(created_by_lower.begin(), created_by_lower.end(),
-                 created_by_lower.begin(), ::tolower);
-
-  bool app_success = regex_match(created_by_lower, app_matches, app_regex);
-  bool ver_success = false;
-  std::string version_str;
-
-  if (app_success && app_matches.size() >= 4) {
-    // first match is the entire string. sub-matches start from second.
-    application_ = app_matches[1];
-    version_str = app_matches[3];
-    build_ = app_matches[4];
-    ver_success = regex_match(version_str, ver_matches, ver_regex);
-  } else {
-    application_ = "unknown";
-  }
-
-  if (ver_success && ver_matches.size() >= 7) {
-    version.major = atoi(ver_matches[1].str().c_str());
-    version.minor = atoi(ver_matches[2].str().c_str());
-    version.patch = atoi(ver_matches[3].str().c_str());
-    version.unknown = ver_matches[4].str();
-    version.pre_release = ver_matches[5].str();
-    version.build_info = ver_matches[6].str();
-  } else {
-    version.major = 0;
-    version.minor = 0;
-    version.patch = 0;
-  }
+  ApplicationVersionParser parser(created_by, *this);
+  parser.Parse();
 }
 
 bool ApplicationVersion::VersionLt(const ApplicationVersion& other_version) const {
@@ -1179,7 +1480,7 @@ ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilder(
               std::move(props), column,
               reinterpret_cast<format::ColumnChunk*>(contents)))} {}
 
-ColumnChunkMetaDataBuilder::~ColumnChunkMetaDataBuilder() {}
+ColumnChunkMetaDataBuilder::~ColumnChunkMetaDataBuilder() = default;
 
 const void* ColumnChunkMetaDataBuilder::contents() const { return impl_->contents(); }
 
@@ -1297,10 +1598,9 @@ std::unique_ptr<RowGroupMetaDataBuilder> RowGroupMetaDataBuilder::Make(
 RowGroupMetaDataBuilder::RowGroupMetaDataBuilder(std::shared_ptr<WriterProperties> props,
                                                  const SchemaDescriptor* schema_,
                                                  void* contents)
-    : impl_{std::unique_ptr<RowGroupMetaDataBuilderImpl>(
-          new RowGroupMetaDataBuilderImpl(std::move(props), schema_, contents))} {}
+    : impl_{new RowGroupMetaDataBuilderImpl(std::move(props), schema_, contents)} {}
 
-RowGroupMetaDataBuilder::~RowGroupMetaDataBuilder() {}
+RowGroupMetaDataBuilder::~RowGroupMetaDataBuilder() = default;
 
 ColumnChunkMetaDataBuilder* RowGroupMetaDataBuilder::NextColumnChunk() {
   return impl_->NextColumnChunk();
@@ -1328,10 +1628,10 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
   explicit FileMetaDataBuilderImpl(
       const SchemaDescriptor* schema, std::shared_ptr<WriterProperties> props,
       std::shared_ptr<const KeyValueMetadata> key_value_metadata)
-      : properties_(std::move(props)),
+      : metadata_(new format::FileMetaData()),
+        properties_(std::move(props)),
         schema_(schema),
         key_value_metadata_(std::move(key_value_metadata)) {
-    metadata_.reset(new format::FileMetaData());
     if (properties_->file_encryption_properties() != nullptr &&
         properties_->file_encryption_properties()->encrypted_footer()) {
       crypto_metadata_.reset(new format::FileCryptoMetaData());
@@ -1398,8 +1698,9 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
       EncryptionAlgorithm algo = file_encryption_properties->algorithm();
       signing_algorithm.aad.aad_file_unique = algo.aad.aad_file_unique;
       signing_algorithm.aad.supply_aad_prefix = algo.aad.supply_aad_prefix;
-      if (!algo.aad.supply_aad_prefix)
+      if (!algo.aad.supply_aad_prefix) {
         signing_algorithm.aad.aad_prefix = algo.aad.aad_prefix;
+      }
       signing_algorithm.algorithm = ParquetCipher::AES_GCM_V1;
 
       metadata_->__set_encryption_algorithm(ToThrift(signing_algorithm));
@@ -1415,6 +1716,7 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
     auto file_meta_data = std::unique_ptr<FileMetaData>(new FileMetaData());
     file_meta_data->impl_->metadata_ = std::move(metadata_);
     file_meta_data->impl_->InitSchema();
+    file_meta_data->impl_->InitKeyValueMetadata();
     return file_meta_data;
   }
 
@@ -1466,7 +1768,7 @@ FileMetaDataBuilder::FileMetaDataBuilder(
     : impl_{std::unique_ptr<FileMetaDataBuilderImpl>(new FileMetaDataBuilderImpl(
           schema, std::move(props), std::move(key_value_metadata)))} {}
 
-FileMetaDataBuilder::~FileMetaDataBuilder() {}
+FileMetaDataBuilder::~FileMetaDataBuilder() = default;
 
 RowGroupMetaDataBuilder* FileMetaDataBuilder::AppendRowGroup() {
   return impl_->AppendRowGroup();

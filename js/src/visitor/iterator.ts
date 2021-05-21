@@ -19,7 +19,7 @@ import { Data } from '../data';
 import { Type } from '../enum';
 import { Visitor } from '../visitor';
 import { VectorType } from '../interfaces';
-import { iterateBits } from '../util/bit';
+import { BitIterator } from '../util/bit';
 import { instance as getVisitor } from './get';
 import {
     DataType, Dictionary,
@@ -90,11 +90,35 @@ export class IteratorVisitor extends Visitor {}
 /** @ignore */
 function nullableIterator<T extends DataType>(vector: VectorType<T>): IterableIterator<T['TValue'] | null> {
     const getFn = getVisitor.getVisitFn(vector);
-    return iterateBits<T['TValue'] | null>(
-        vector.nullBitmap, vector.offset, vector.length, vector,
+    return new BitIterator<T['TValue'] | null>(
+        vector.data.nullBitmap, vector.data.offset, vector.length, vector,
         (vec: VectorType<T>, idx: number, nullByte: number, nullBit: number) =>
             ((nullByte & 1 << nullBit) !== 0) ? getFn(vec, idx) : null
     );
+}
+
+/** @ignore */
+class VectorIterator<T extends DataType> implements IterableIterator<T['TValue'] | null> {
+    private index = 0;
+
+    constructor(
+        private vector: VectorType<T>,
+        private getFn: (vector: VectorType<T>, index: number) => VectorType<T>['TValue']
+    ) {}
+
+    next(): IteratorResult<T['TValue'] | null> {
+        if (this.index < this.vector.length) {
+            return {
+                value: this.getFn(this.vector, this.index++)
+            };
+        }
+
+        return {done: true, value: null};
+    }
+
+    [Symbol.iterator]() {
+        return this;
+    }
 }
 
 /** @ignore */
@@ -114,15 +138,11 @@ function vectorIterator<T extends DataType>(vector: VectorType<T>): IterableIter
         (typeId === Type.Time && (type as Time).bitWidth !== 64) ||
         (typeId === Type.Float && (type as Float).precision > 0 /* Precision.HALF */)
     )) {
-        return vector.values.subarray(0, length)[Symbol.iterator]();
+        return vector.data.values.subarray(0, length)[Symbol.iterator]();
     }
 
     // Otherwise, iterate manually
-    return (function* (getFn) {
-        for (let index = -1; ++index < length;) {
-            yield getFn(vector, index);
-        }
-    })(getVisitor.getVisitFn(vector));
+    return new VectorIterator(vector, getVisitor.getVisitFn(vector));
 }
 
 IteratorVisitor.prototype.visitNull                 = vectorIterator;

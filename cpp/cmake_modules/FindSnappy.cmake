@@ -26,9 +26,13 @@ if(ARROW_SNAPPY_USE_SHARED)
 else()
   set(SNAPPY_STATIC_LIB_NAME_BASE "snappy")
   if(MSVC)
-    set(SNAPPY_STATIC_LIB_NAME_BASE "${SNAPPY_STATIC_LIB_NAME_BASE}${SNAPPY_MSVC_STATIC_LIB_SUFFIX}")
+    set(SNAPPY_STATIC_LIB_NAME_BASE
+        "${SNAPPY_STATIC_LIB_NAME_BASE}${SNAPPY_MSVC_STATIC_LIB_SUFFIX}")
   endif()
-  set(SNAPPY_LIB_NAMES "${CMAKE_STATIC_LIBRARY_PREFIX}${SNAPPY_STATIC_LIB_NAME_BASE}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  set(
+    SNAPPY_LIB_NAMES
+    "${CMAKE_STATIC_LIBRARY_PREFIX}${SNAPPY_STATIC_LIB_NAME_BASE}${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    )
 endif()
 
 if(Snappy_ROOT)
@@ -44,13 +48,14 @@ if(Snappy_ROOT)
             PATH_SUFFIXES ${ARROW_INCLUDE_PATH_SUFFIXES})
 else()
   find_library(Snappy_LIB NAMES ${SNAPPY_LIB_NAMES})
-  find_path(Snappy_INCLUDE_DIR NAMES snappy.h PATH_SUFFIXES ${ARROW_INCLUDE_PATH_SUFFIXES})
+  find_path(Snappy_INCLUDE_DIR
+            NAMES snappy.h
+            PATH_SUFFIXES ${ARROW_INCLUDE_PATH_SUFFIXES})
 endif()
 
 find_package_handle_standard_args(Snappy REQUIRED_VARS Snappy_LIB Snappy_INCLUDE_DIR)
 
-# CMake 3.2 does uppercase the FOUND variable
-if(Snappy_FOUND OR SNAPPY_FOUND)
+if(Snappy_FOUND)
   add_library(Snappy::snappy UNKNOWN IMPORTED)
   set_target_properties(Snappy::snappy
                         PROPERTIES IMPORTED_LOCATION "${Snappy_LIB}"

@@ -27,7 +27,8 @@ if [ "$RTOOLS_VERSION" = "35" ]; then
   # Use rtools-backports if building with rtools35
   curl https://raw.githubusercontent.com/r-windows/rtools-backports/master/pacman.conf > /etc/pacman.conf
   # Update keys: https://www.msys2.org/news/#2020-06-29-new-packagers
-  curl -OSsl "http://repo.msys2.org/msys/x86_64/msys2-keyring-r21.b39fb11-1-any.pkg.tar.xz"
+  msys2_repo_base_url=https://repo.msys2.org/msys
+  curl -OSsL "${msys2_repo_base_url}/x86_64/msys2-keyring-r21.b39fb11-1-any.pkg.tar.xz"
   pacman -U --noconfirm msys2-keyring-r21.b39fb11-1-any.pkg.tar.xz && rm msys2-keyring-r21.b39fb11-1-any.pkg.tar.xz
   pacman --noconfirm -Scc
   pacman --noconfirm -Syy
@@ -90,8 +91,8 @@ cp $MSYS_LIB_DIR/mingw64/lib/lib{thrift,snappy}.a $DST_DIR/${RWINLIB_LIB_DIR}/x6
 cp $MSYS_LIB_DIR/mingw32/lib/lib{thrift,snappy}.a $DST_DIR/${RWINLIB_LIB_DIR}/i386
 
 # These are from https://dl.bintray.com/rtools/mingw{32,64}/
-cp $MSYS_LIB_DIR/mingw64/lib/lib{zstd,lz4,crypto,aws*}.a $DST_DIR/lib/x64
-cp $MSYS_LIB_DIR/mingw32/lib/lib{zstd,lz4,crypto,aws*}.a $DST_DIR/lib/i386
+cp $MSYS_LIB_DIR/mingw64/lib/lib{zstd,lz4,crypto,utf8proc,re2,aws*}.a $DST_DIR/lib/x64
+cp $MSYS_LIB_DIR/mingw32/lib/lib{zstd,lz4,crypto,utf8proc,re2,aws*}.a $DST_DIR/lib/i386
 
 # Create build artifact
 zip -r ${DST_DIR}.zip $DST_DIR

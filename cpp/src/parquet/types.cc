@@ -30,7 +30,7 @@
 
 #include "generated/parquet_types.h"
 
-using ::arrow::internal::checked_cast;
+using arrow::internal::checked_cast;
 using arrow::util::Codec;
 
 namespace parquet {
@@ -43,23 +43,23 @@ bool IsCodecSupported(Compression::type codec) {
     case Compression::BROTLI:
     case Compression::ZSTD:
     case Compression::LZ4:
+    case Compression::LZ4_HADOOP:
       return true;
     default:
       return false;
   }
 }
 
-namespace internal {
+std::unique_ptr<Codec> GetCodec(Compression::type codec) {
+  return GetCodec(codec, Codec::UseDefaultCompressionLevel());
+}
 
-std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level,
-                                bool for_writing) {
+std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level) {
   std::unique_ptr<Codec> result;
-  if (for_writing && (codec == Compression::LZ4 || codec == Compression::LZ4_FRAME)) {
+  if (codec == Compression::LZO) {
     throw ParquetException(
-        "Per ARROW-9424, writing files with LZ4 compression has been "
-        "disabled until implementation issues have been resolved. "
-        "It is recommended to read any existing files and rewrite them "
-        "using a different compression.");
+        "While LZO compression is supported by the Parquet format in "
+        "general, it is currently not supported by the C++ implementation.");
   }
 
   if (!IsCodecSupported(codec)) {
@@ -71,24 +71,6 @@ std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level,
 
   PARQUET_ASSIGN_OR_THROW(result, Codec::Create(codec, compression_level));
   return result;
-}
-
-std::unique_ptr<Codec> GetReadCodec(Compression::type codec) {
-  return GetCodec(codec, Codec::UseDefaultCompressionLevel(), /*for_writing=*/false);
-}
-
-std::unique_ptr<Codec> GetWriteCodec(Compression::type codec, int compression_level) {
-  return GetCodec(codec, compression_level, /*for_writing=*/true);
-}
-
-}  // namespace internal
-
-std::unique_ptr<Codec> GetCodec(Compression::type codec, int compression_level) {
-  return internal::GetCodec(codec, compression_level, /*for_writing=*/false);
-}
-
-std::unique_ptr<Codec> GetCodec(Compression::type codec) {
-  return GetCodec(codec, Codec::UseDefaultCompressionLevel());
 }
 
 std::string FormatStatValue(Type::type parquet_type, ::arrow::util::string_view val) {
@@ -379,13 +361,14 @@ std::shared_ptr<const LogicalType> LogicalType::FromConvertedType(
       return JSONLogicalType::Make();
     case ConvertedType::BSON:
       return BSONLogicalType::Make();
+    case ConvertedType::NA:
+      return NullLogicalType::Make();
     case ConvertedType::NONE:
       return NoLogicalType::Make();
-    case ConvertedType::NA:
     case ConvertedType::UNDEFINED:
-      return UnknownLogicalType::Make();
+      return UndefinedLogicalType::Make();
   }
-  return UnknownLogicalType::Make();
+  return UndefinedLogicalType::Make();
 }
 
 std::shared_ptr<const LogicalType> LogicalType::FromThrift(
@@ -496,10 +479,6 @@ std::shared_ptr<const LogicalType> LogicalType::UUID() { return UUIDLogicalType:
 
 std::shared_ptr<const LogicalType> LogicalType::None() { return NoLogicalType::Make(); }
 
-std::shared_ptr<const LogicalType> LogicalType::Unknown() {
-  return UnknownLogicalType::Make();
-}
-
 /*
  * The logical type implementation classes are built in four layers: (1) the base
  * layer, which establishes the interface and provides generally reusable implementations
@@ -529,7 +508,7 @@ class LogicalType::Impl {
   virtual std::string ToString() const = 0;
 
   virtual bool is_serialized() const {
-    return !(type_ == LogicalType::Type::NONE || type_ == LogicalType::Type::UNKNOWN);
+    return !(type_ == LogicalType::Type::NONE || type_ == LogicalType::Type::UNDEFINED);
   }
 
   virtual std::string ToJSON() const {
@@ -580,14 +559,14 @@ class LogicalType::Impl {
   class BSON;
   class UUID;
   class No;
-  class Unknown;
+  class Undefined;
 
  protected:
   Impl(LogicalType::Type::type t, SortOrder::type o) : type_(t), order_(o) {}
   Impl() = default;
 
  private:
-  LogicalType::Type::type type_ = LogicalType::Type::UNKNOWN;
+  LogicalType::Type::type type_ = LogicalType::Type::UNDEFINED;
   SortOrder::type order_ = SortOrder::UNKNOWN;
 };
 
@@ -649,7 +628,9 @@ bool LogicalType::is_JSON() const { return impl_->type() == LogicalType::Type::J
 bool LogicalType::is_BSON() const { return impl_->type() == LogicalType::Type::BSON; }
 bool LogicalType::is_UUID() const { return impl_->type() == LogicalType::Type::UUID; }
 bool LogicalType::is_none() const { return impl_->type() == LogicalType::Type::NONE; }
-bool LogicalType::is_valid() const { return impl_->type() != LogicalType::Type::UNKNOWN; }
+bool LogicalType::is_valid() const {
+  return impl_->type() != LogicalType::Type::UNDEFINED;
+}
 bool LogicalType::is_invalid() const { return !is_valid(); }
 bool LogicalType::is_nested() const {
   return (impl_->type() == LogicalType::Type::LIST) ||
@@ -1568,95 +1549,19 @@ class LogicalType::Impl::No final : public LogicalType::Impl::SimpleCompatible,
 
 GENERATE_MAKE(No)
 
-class LogicalType::Impl::Unknown final : public LogicalType::Impl::SimpleCompatible,
-                                         public LogicalType::Impl::UniversalApplicable {
+class LogicalType::Impl::Undefined final : public LogicalType::Impl::SimpleCompatible,
+                                           public LogicalType::Impl::UniversalApplicable {
  public:
-  friend class UnknownLogicalType;
+  friend class UndefinedLogicalType;
 
-  OVERRIDE_TOSTRING(Unknown)
+  OVERRIDE_TOSTRING(Undefined)
 
  private:
-  Unknown()
-      : LogicalType::Impl(LogicalType::Type::UNKNOWN, SortOrder::UNKNOWN),
-        LogicalType::Impl::SimpleCompatible(ConvertedType::NA) {}
+  Undefined()
+      : LogicalType::Impl(LogicalType::Type::UNDEFINED, SortOrder::UNKNOWN),
+        LogicalType::Impl::SimpleCompatible(ConvertedType::UNDEFINED) {}
 };
 
-GENERATE_MAKE(Unknown)
-
-namespace internal {
-
-/// \brief Compute the number of bytes required to represent a decimal of a
-/// given precision. Taken from the Apache Impala codebase. The comments next
-/// to the return values are the maximum value that can be represented in 2's
-/// complement with the returned number of bytes.
-int32_t DecimalSize(int32_t precision) {
-  DCHECK_GE(precision, 1) << "decimal precision must be greater than or equal to 1, got "
-                          << precision;
-  DCHECK_LE(precision, 38) << "decimal precision must be less than or equal to 38, got "
-                           << precision;
-
-  switch (precision) {
-    case 1:
-    case 2:
-      return 1;  // 127
-    case 3:
-    case 4:
-      return 2;  // 32,767
-    case 5:
-    case 6:
-      return 3;  // 8,388,607
-    case 7:
-    case 8:
-    case 9:
-      return 4;  // 2,147,483,427
-    case 10:
-    case 11:
-      return 5;  // 549,755,813,887
-    case 12:
-    case 13:
-    case 14:
-      return 6;  // 140,737,488,355,327
-    case 15:
-    case 16:
-      return 7;  // 36,028,797,018,963,967
-    case 17:
-    case 18:
-      return 8;  // 9,223,372,036,854,775,807
-    case 19:
-    case 20:
-    case 21:
-      return 9;  // 2,361,183,241,434,822,606,847
-    case 22:
-    case 23:
-      return 10;  // 604,462,909,807,314,587,353,087
-    case 24:
-    case 25:
-    case 26:
-      return 11;  // 154,742,504,910,672,534,362,390,527
-    case 27:
-    case 28:
-      return 12;  // 39,614,081,257,132,168,796,771,975,167
-    case 29:
-    case 30:
-    case 31:
-      return 13;  // 10,141,204,801,825,835,211,973,625,643,007
-    case 32:
-    case 33:
-      return 14;  // 2,596,148,429,267,413,814,265,248,164,610,047
-    case 34:
-    case 35:
-      return 15;  // 664,613,997,892,457,936,451,903,530,140,172,287
-    case 36:
-    case 37:
-    case 38:
-      return 16;  // 170,141,183,460,469,231,731,687,303,715,884,105,727
-    default:
-      break;
-  }
-  DCHECK(false);
-  return -1;
-}
-
-}  // namespace internal
+GENERATE_MAKE(Undefined)
 
 }  // namespace parquet

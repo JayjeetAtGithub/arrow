@@ -17,13 +17,14 @@
 
 // String functions
 #include "arrow/util/value_parsing.h"
-
 extern "C" {
 
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <algorithm>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include "./types.h"
 
 FORCE_INLINE
@@ -38,6 +39,19 @@ gdv_int32 octet_length_binary(const gdv_binary input, gdv_int32 length) { return
 FORCE_INLINE
 gdv_int32 bit_length_binary(const gdv_binary input, gdv_int32 length) {
   return length * 8;
+}
+
+FORCE_INLINE
+int match_string(const char* input, gdv_int32 input_len, gdv_int32 start_pos,
+                 const char* delim, gdv_int32 delim_len) {
+  for (int i = start_pos; i < input_len; i++) {
+    int left_chars = input_len - i;
+    if ((left_chars >= delim_len) && memcmp(input + i, delim, delim_len) == 0) {
+      return i + delim_len;
+    }
+  }
+
+  return -1;
 }
 
 FORCE_INLINE
@@ -83,6 +97,16 @@ VAR_LEN_OP_TYPES(BINARY_RELATIONAL, greater_than_or_equal_to, >=)
 #define VAR_LEN_TYPES(INNER, NAME) \
   INNER(NAME, utf8)                \
   INNER(NAME, binary)
+
+FORCE_INLINE
+int to_binary_from_hex(char ch) {
+  if (ch >= 'A' && ch <= 'F') {
+    return 10 + (ch - 'A');
+  } else if (ch >= 'a' && ch <= 'f') {
+    return 10 + (ch - 'a');
+  }
+  return ch - '0';
+}
 
 FORCE_INLINE
 bool starts_with_utf8_utf8(const char* data, gdv_int32 data_len, const char* prefix,
@@ -131,6 +155,17 @@ void set_error_for_invalid_utf(int64_t execution_context, char val) {
   snprintf(error, size, fmt, (unsigned char)val);
   gdv_fn_context_set_error_msg(execution_context, error);
   free(error);
+}
+
+FORCE_INLINE
+bool validate_utf8_following_bytes(const char* data, int32_t data_len,
+                                   int32_t char_index) {
+  for (int j = 1; j < data_len; ++j) {
+    if ((data[char_index + j] & 0xC0) != 0x80) {  // bytes following head-byte of glyph
+      return false;
+    }
+  }
+  return true;
 }
 
 // Count the number of utf8 characters
@@ -483,89 +518,113 @@ const char* btrim_utf8_utf8(gdv_int64 context, const char* basetext,
   return basetext + start_ptr;
 }
 
-// Truncates the string to given length
 FORCE_INLINE
-const char* castVARCHAR_utf8_int64(gdv_int64 context, const char* data,
-                                   gdv_int32 data_len, int64_t out_len,
-                                   int32_t* out_length) {
-  int32_t len = static_cast<int32_t>(out_len);
-
+const char* castVARCHAR_bool_int64(gdv_int64 context, gdv_boolean value,
+                                   gdv_int64 out_len, gdv_int32* out_length) {
+  gdv_int32 len = static_cast<gdv_int32>(out_len);
   if (len < 0) {
     gdv_fn_context_set_error_msg(context, "Output buffer length can't be negative");
     *out_length = 0;
     return "";
   }
-
-  if (len >= data_len || len == 0) {
-    *out_length = data_len;
-    return data;
-  }
-
-  int32_t remaining = len;
-  int32_t index = 0;
-  bool is_multibyte = false;
-  do {
-    // In utf8, MSB of a single byte unicode char is always 0,
-    // whereas for a multibyte character the MSB of each byte is 1.
-    // So for a single byte char, a bitwise-and with x80 (10000000) will be 0
-    // and it won't be 0 for bytes of a multibyte char
-    char* data_ptr = const_cast<char*>(data);
-
-    // we advance byte by byte till the 8 byte boundary then advance 8 bytes at a time
-    auto num_bytes = reinterpret_cast<uintptr_t>(data_ptr) & 0x07;
-    num_bytes = (8 - num_bytes) & 0x07;
-    while (num_bytes > 0) {
-      uint8_t* ptr = reinterpret_cast<uint8_t*>(data_ptr + index);
-      if ((*ptr & 0x80) != 0) {
-        is_multibyte = true;
-        break;
-      }
-      index++;
-      remaining--;
-      num_bytes--;
-    }
-    if (is_multibyte) break;
-    while (remaining >= 8) {
-      uint64_t* ptr = reinterpret_cast<uint64_t*>(data_ptr + index);
-      if ((*ptr & 0x8080808080808080) != 0) {
-        is_multibyte = true;
-        break;
-      }
-      index += 8;
-      remaining -= 8;
-    }
-    if (is_multibyte) break;
-    if (remaining >= 4) {
-      uint32_t* ptr = reinterpret_cast<uint32_t*>(data_ptr + index);
-      if ((*ptr & 0x80808080) != 0) break;
-      index += 4;
-      remaining -= 4;
-    }
-    while (remaining > 0) {
-      uint8_t* ptr = reinterpret_cast<uint8_t*>(data_ptr + index);
-      if ((*ptr & 0x80) != 0) {
-        is_multibyte = true;
-        break;
-      }
-      index++;
-      remaining--;
-    }
-    if (is_multibyte) break;
-    // reached here; all are single byte characters
-    *out_length = len;
-    return data;
-  } while (false);
-
-  // detected multibyte utf8 characters; slow path
-  int32_t byte_pos = utf8_byte_pos(context, data + index, data_len - index, len - index);
-  if (byte_pos < 0) {
-    *out_length = 0;
-    return "";
-  }
-
-  *out_length = index + byte_pos;
-  return data;
+  const char* out =
+      reinterpret_cast<const char*>(gdv_fn_context_arena_malloc(context, 5));
+  out = value ? "true" : "false";
+  *out_length = value ? ((len > 4) ? 4 : len) : ((len > 5) ? 5 : len);
+  return out;
 }
+
+// Truncates the string to given length
+#define CAST_VARCHAR_FROM_VARLEN_TYPE(TYPE)                                            \
+  FORCE_INLINE                                                                         \
+  const char* castVARCHAR_##TYPE##_int64(gdv_int64 context, const char* data,          \
+                                         gdv_int32 data_len, int64_t out_len,          \
+                                         int32_t* out_length) {                        \
+    int32_t len = static_cast<int32_t>(out_len);                                       \
+                                                                                       \
+    if (len < 0) {                                                                     \
+      gdv_fn_context_set_error_msg(context, "Output buffer length can't be negative"); \
+      *out_length = 0;                                                                 \
+      return "";                                                                       \
+    }                                                                                  \
+                                                                                       \
+    if (len >= data_len || len == 0) {                                                 \
+      *out_length = data_len;                                                          \
+      return data;                                                                     \
+    }                                                                                  \
+                                                                                       \
+    int32_t remaining = len;                                                           \
+    int32_t index = 0;                                                                 \
+    bool is_multibyte = false;                                                         \
+    do {                                                                               \
+      /* In utf8, MSB of a single byte unicode char is always 0,                       \
+       * whereas for a multibyte character the MSB of each byte is 1.                  \
+       * So for a single byte char, a bitwise-and with x80 (10000000) will be 0        \
+       * and it won't be 0 for bytes of a multibyte char.                              \
+       */                                                                              \
+      char* data_ptr = const_cast<char*>(data);                                        \
+                                                                                       \
+      /* advance byte by byte till the 8-byte boundary then advance 8 bytes */         \
+      auto num_bytes = reinterpret_cast<uintptr_t>(data_ptr) & 0x07;                   \
+      num_bytes = (8 - num_bytes) & 0x07;                                              \
+      while (num_bytes > 0) {                                                          \
+        uint8_t* ptr = reinterpret_cast<uint8_t*>(data_ptr + index);                   \
+        if ((*ptr & 0x80) != 0) {                                                      \
+          is_multibyte = true;                                                         \
+          break;                                                                       \
+        }                                                                              \
+        index++;                                                                       \
+        remaining--;                                                                   \
+        num_bytes--;                                                                   \
+      }                                                                                \
+      if (is_multibyte) break;                                                         \
+      while (remaining >= 8) {                                                         \
+        uint64_t* ptr = reinterpret_cast<uint64_t*>(data_ptr + index);                 \
+        if ((*ptr & 0x8080808080808080) != 0) {                                        \
+          is_multibyte = true;                                                         \
+          break;                                                                       \
+        }                                                                              \
+        index += 8;                                                                    \
+        remaining -= 8;                                                                \
+      }                                                                                \
+      if (is_multibyte) break;                                                         \
+      if (remaining >= 4) {                                                            \
+        uint32_t* ptr = reinterpret_cast<uint32_t*>(data_ptr + index);                 \
+        if ((*ptr & 0x80808080) != 0) break;                                           \
+        index += 4;                                                                    \
+        remaining -= 4;                                                                \
+      }                                                                                \
+      while (remaining > 0) {                                                          \
+        uint8_t* ptr = reinterpret_cast<uint8_t*>(data_ptr + index);                   \
+        if ((*ptr & 0x80) != 0) {                                                      \
+          is_multibyte = true;                                                         \
+          break;                                                                       \
+        }                                                                              \
+        index++;                                                                       \
+        remaining--;                                                                   \
+      }                                                                                \
+      if (is_multibyte) break;                                                         \
+      /* reached here; all are single byte characters */                               \
+      *out_length = len;                                                               \
+      return data;                                                                     \
+    } while (false);                                                                   \
+                                                                                       \
+    /* detected multibyte utf8 characters; slow path */                                \
+    int32_t byte_pos =                                                                 \
+        utf8_byte_pos(context, data + index, data_len - index, len - index);           \
+    if (byte_pos < 0) {                                                                \
+      *out_length = 0;                                                                 \
+      return "";                                                                       \
+    }                                                                                  \
+                                                                                       \
+    *out_length = index + byte_pos;                                                    \
+    return data;                                                                       \
+  }
+
+CAST_VARCHAR_FROM_VARLEN_TYPE(utf8)
+CAST_VARCHAR_FROM_VARLEN_TYPE(binary)
+
+#undef CAST_VARCHAR_FROM_VARLEN_TYPE
 
 #define IS_NULL(NAME, TYPE)                                                \
   FORCE_INLINE                                                             \
@@ -710,6 +769,490 @@ const char* concatOperator_utf8_utf8(gdv_int64 context, const char* left,
 }
 
 FORCE_INLINE
+const char* concat_utf8_utf8_utf8(gdv_int64 context, const char* in1, gdv_int32 in1_len,
+                                  bool in1_validity, const char* in2, gdv_int32 in2_len,
+                                  bool in2_validity, const char* in3, gdv_int32 in3_len,
+                                  bool in3_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8(context, in1, in1_len, in2, in2_len, in3, in3_len,
+                                       out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8(gdv_int64 context, const char* in1,
+                                          gdv_int32 in1_len, const char* in2,
+                                          gdv_int32 in2_len, const char* in3,
+                                          gdv_int32 in3_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8(gdv_int64 context, const char* in1,
+                                       gdv_int32 in1_len, bool in1_validity,
+                                       const char* in2, gdv_int32 in2_len,
+                                       bool in2_validity, const char* in3,
+                                       gdv_int32 in3_len, bool in3_validity,
+                                       const char* in4, gdv_int32 in4_len,
+                                       bool in4_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8(context, in1, in1_len, in2, in2_len, in3,
+                                            in3_len, in4, in4_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8(gdv_int64 context, const char* in1,
+                                               gdv_int32 in1_len, const char* in2,
+                                               gdv_int32 in2_len, const char* in3,
+                                               gdv_int32 in3_len, const char* in4,
+                                               gdv_int32 in4_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8(context, in1, in1_len, in2, in2_len, in3,
+                                                 in3_len, in4, in4_len, in5, in5_len,
+                                                 out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len + in5_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    const char* in6, gdv_int32 in6_len, bool in6_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  if (!in6_validity) {
+    in6_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8_utf8(context, in1, in1_len, in2, in2_len,
+                                                      in3, in3_len, in4, in4_len, in5,
+                                                      in5_len, in6, in6_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, const char* in6,
+    gdv_int32 in6_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len + in5_len + in6_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len, in6, in6_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    const char* in6, gdv_int32 in6_len, bool in6_validity, const char* in7,
+    gdv_int32 in7_len, bool in7_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  if (!in6_validity) {
+    in6_len = 0;
+  }
+  if (!in7_validity) {
+    in7_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      context, in1, in1_len, in2, in2_len, in3, in3_len, in4, in4_len, in5, in5_len, in6,
+      in6_len, in7, in7_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, const char* in6,
+    gdv_int32 in6_len, const char* in7, gdv_int32 in7_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len, in6, in6_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len, in7, in7_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    const char* in6, gdv_int32 in6_len, bool in6_validity, const char* in7,
+    gdv_int32 in7_len, bool in7_validity, const char* in8, gdv_int32 in8_len,
+    bool in8_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  if (!in6_validity) {
+    in6_len = 0;
+  }
+  if (!in7_validity) {
+    in7_len = 0;
+  }
+  if (!in8_validity) {
+    in8_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      context, in1, in1_len, in2, in2_len, in3, in3_len, in4, in4_len, in5, in5_len, in6,
+      in6_len, in7, in7_len, in8, in8_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, const char* in6,
+    gdv_int32 in6_len, const char* in7, gdv_int32 in7_len, const char* in8,
+    gdv_int32 in8_len, gdv_int32* out_len) {
+  *out_len =
+      in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len + in8_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len, in6, in6_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len, in7, in7_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len, in8,
+         in8_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    const char* in6, gdv_int32 in6_len, bool in6_validity, const char* in7,
+    gdv_int32 in7_len, bool in7_validity, const char* in8, gdv_int32 in8_len,
+    bool in8_validity, const char* in9, gdv_int32 in9_len, bool in9_validity,
+    gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  if (!in6_validity) {
+    in6_len = 0;
+  }
+  if (!in7_validity) {
+    in7_len = 0;
+  }
+  if (!in8_validity) {
+    in8_len = 0;
+  }
+  if (!in9_validity) {
+    in9_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      context, in1, in1_len, in2, in2_len, in3, in3_len, in4, in4_len, in5, in5_len, in6,
+      in6_len, in7, in7_len, in8, in8_len, in9, in9_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, const char* in6,
+    gdv_int32 in6_len, const char* in7, gdv_int32 in7_len, const char* in8,
+    gdv_int32 in8_len, const char* in9, gdv_int32 in9_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len +
+             in8_len + in9_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len, in6, in6_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len, in7, in7_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len, in8,
+         in8_len);
+  memcpy(
+      ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len + in8_len,
+      in9, in9_len);
+  return ret;
+}
+
+FORCE_INLINE
+const char* concat_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, bool in1_validity,
+    const char* in2, gdv_int32 in2_len, bool in2_validity, const char* in3,
+    gdv_int32 in3_len, bool in3_validity, const char* in4, gdv_int32 in4_len,
+    bool in4_validity, const char* in5, gdv_int32 in5_len, bool in5_validity,
+    const char* in6, gdv_int32 in6_len, bool in6_validity, const char* in7,
+    gdv_int32 in7_len, bool in7_validity, const char* in8, gdv_int32 in8_len,
+    bool in8_validity, const char* in9, gdv_int32 in9_len, bool in9_validity,
+    const char* in10, gdv_int32 in10_len, bool in10_validity, gdv_int32* out_len) {
+  if (!in1_validity) {
+    in1_len = 0;
+  }
+  if (!in2_validity) {
+    in2_len = 0;
+  }
+  if (!in3_validity) {
+    in3_len = 0;
+  }
+  if (!in4_validity) {
+    in4_len = 0;
+  }
+  if (!in5_validity) {
+    in5_len = 0;
+  }
+  if (!in6_validity) {
+    in6_len = 0;
+  }
+  if (!in7_validity) {
+    in7_len = 0;
+  }
+  if (!in8_validity) {
+    in8_len = 0;
+  }
+  if (!in9_validity) {
+    in9_len = 0;
+  }
+  if (!in10_validity) {
+    in10_len = 0;
+  }
+  return concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+      context, in1, in1_len, in2, in2_len, in3, in3_len, in4, in4_len, in5, in5_len, in6,
+      in6_len, in7, in7_len, in8, in8_len, in9, in9_len, in10, in10_len, out_len);
+}
+
+FORCE_INLINE
+const char* concatOperator_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8_utf8(
+    gdv_int64 context, const char* in1, gdv_int32 in1_len, const char* in2,
+    gdv_int32 in2_len, const char* in3, gdv_int32 in3_len, const char* in4,
+    gdv_int32 in4_len, const char* in5, gdv_int32 in5_len, const char* in6,
+    gdv_int32 in6_len, const char* in7, gdv_int32 in7_len, const char* in8,
+    gdv_int32 in8_len, const char* in9, gdv_int32 in9_len, const char* in10,
+    gdv_int32 in10_len, gdv_int32* out_len) {
+  *out_len = in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len +
+             in8_len + in9_len + in10_len;
+  if (*out_len <= 0) {
+    *out_len = 0;
+    return "";
+  }
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  memcpy(ret, in1, in1_len);
+  memcpy(ret + in1_len, in2, in2_len);
+  memcpy(ret + in1_len + in2_len, in3, in3_len);
+  memcpy(ret + in1_len + in2_len + in3_len, in4, in4_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len, in5, in5_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len, in6, in6_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len, in7, in7_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len, in8,
+         in8_len);
+  memcpy(
+      ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len + in8_len,
+      in9, in9_len);
+  memcpy(ret + in1_len + in2_len + in3_len + in4_len + in5_len + in6_len + in7_len +
+             in8_len + in9_len,
+         in10, in10_len);
+  return ret;
+}
+
+FORCE_INLINE
 const char* convert_fromUTF8_binary(gdv_int64 context, const char* bin_in, gdv_int32 len,
                                     gdv_int32* out_len) {
   *out_len = len;
@@ -721,6 +1264,267 @@ const char* convert_fromUTF8_binary(gdv_int64 context, const char* bin_in, gdv_i
   }
   memcpy(ret, bin_in, *out_len);
   return ret;
+}
+
+FORCE_INLINE
+const char* convert_replace_invalid_fromUTF8_binary(int64_t context, const char* text_in,
+                                                    int32_t text_len,
+                                                    const char* char_to_replace,
+                                                    int32_t char_to_replace_len,
+                                                    int32_t* out_len) {
+  if (char_to_replace_len == 0) {
+    *out_len = text_len;
+    return text_in;
+  } else if (char_to_replace_len != 1) {
+    gdv_fn_context_set_error_msg(context, "Replacement of multiple bytes not supported");
+    *out_len = 0;
+    return "";
+  }
+  // actually the convert_replace function replaces invalid chars with an ASCII
+  // character so the output length will be the same as the input length
+  *out_len = text_len;
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+  int32_t valid_bytes_to_cpy = 0;
+  int32_t out_byte_counter = 0;
+  int32_t char_len;
+  // scan the base text from left to right and increment the start pointer till
+  // looking for invalid chars to substitute
+  for (int text_index = 0; text_index < text_len; text_index += char_len) {
+    char_len = utf8_char_length(text_in[text_index]);
+    // only memory copy the bytes when detect invalid char
+    if (char_len == 0 || text_index + char_len > text_len ||
+        !validate_utf8_following_bytes(text_in, char_len, text_index)) {
+      // define char_len = 1 to increase text_index by 1 (as ASCII char fits in 1 byte)
+      char_len = 1;
+      // first copy the valid bytes until now and then replace the invalid character
+      memcpy(ret + out_byte_counter, text_in + out_byte_counter, valid_bytes_to_cpy);
+      ret[out_byte_counter + valid_bytes_to_cpy] = char_to_replace[0];
+      out_byte_counter += valid_bytes_to_cpy + char_len;
+      valid_bytes_to_cpy = 0;
+      continue;
+    }
+    valid_bytes_to_cpy += char_len;
+  }
+  // if invalid chars were not found, return the original string
+  if (out_byte_counter == 0) return text_in;
+  // if there are still valid bytes to copy, do it
+  if (valid_bytes_to_cpy != 0) {
+    memcpy(ret + out_byte_counter, text_in + out_byte_counter, valid_bytes_to_cpy);
+  }
+  return ret;
+}
+
+// The function reverse a char array in-place
+static inline void reverse_char_buf(char* buf, int32_t len) {
+  char temp;
+
+  for (int32_t i = 0; i < len / 2; i++) {
+    int32_t pos_swp = len - (1 + i);
+    temp = buf[pos_swp];
+    buf[pos_swp] = buf[i];
+    buf[i] = temp;
+  }
+}
+
+// Converts a double variable to binary
+FORCE_INLINE
+const char* convert_toDOUBLE(int64_t context, double value, int32_t* out_len) {
+  *out_len = sizeof(value);
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context,
+                                 "Could not allocate memory for the output string");
+
+    *out_len = 0;
+    return "";
+  }
+
+  memcpy(ret, &value, *out_len);
+
+  return ret;
+}
+
+FORCE_INLINE
+const char* convert_toDOUBLE_be(int64_t context, double value, int32_t* out_len) {
+  // The function behaves like convert_toDOUBLE, but always return the result
+  // in big endian format
+  char* ret = const_cast<char*>(convert_toDOUBLE(context, value, out_len));
+
+#if ARROW_LITTLE_ENDIAN
+  reverse_char_buf(ret, *out_len);
+#endif
+
+  return ret;
+}
+
+// Converts a float variable to binary
+FORCE_INLINE
+const char* convert_toFLOAT(int64_t context, float value, int32_t* out_len) {
+  *out_len = sizeof(value);
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context,
+                                 "Could not allocate memory for the output string");
+
+    *out_len = 0;
+    return "";
+  }
+
+  memcpy(ret, &value, *out_len);
+
+  return ret;
+}
+
+FORCE_INLINE
+const char* convert_toFLOAT_be(int64_t context, float value, int32_t* out_len) {
+  // The function behaves like convert_toFLOAT, but always return the result
+  // in big endian format
+  char* ret = const_cast<char*>(convert_toFLOAT(context, value, out_len));
+
+#if ARROW_LITTLE_ENDIAN
+  reverse_char_buf(ret, *out_len);
+#endif
+
+  return ret;
+}
+
+// Converts a bigint(int with 64 bits) variable to binary
+FORCE_INLINE
+const char* convert_toBIGINT(int64_t context, int64_t value, int32_t* out_len) {
+  *out_len = sizeof(value);
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context,
+                                 "Could not allocate memory for the output string");
+
+    *out_len = 0;
+    return "";
+  }
+
+  memcpy(ret, &value, *out_len);
+
+  return ret;
+}
+
+FORCE_INLINE
+const char* convert_toBIGINT_be(int64_t context, int64_t value, int32_t* out_len) {
+  // The function behaves like convert_toBIGINT, but always return the result
+  // in big endian format
+  char* ret = const_cast<char*>(convert_toBIGINT(context, value, out_len));
+
+#if ARROW_LITTLE_ENDIAN
+  reverse_char_buf(ret, *out_len);
+#endif
+
+  return ret;
+}
+
+// Converts an integer(with 32 bits) variable to binary
+FORCE_INLINE
+const char* convert_toINT(int64_t context, int32_t value, int32_t* out_len) {
+  *out_len = sizeof(value);
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context,
+                                 "Could not allocate memory for the output string");
+
+    *out_len = 0;
+    return "";
+  }
+
+  memcpy(ret, &value, *out_len);
+
+  return ret;
+}
+
+FORCE_INLINE
+const char* convert_toINT_be(int64_t context, int32_t value, int32_t* out_len) {
+  // The function behaves like convert_toINT, but always return the result
+  // in big endian format
+  char* ret = const_cast<char*>(convert_toINT(context, value, out_len));
+
+#if ARROW_LITTLE_ENDIAN
+  reverse_char_buf(ret, *out_len);
+#endif
+
+  return ret;
+}
+
+// Converts a boolean variable to binary
+FORCE_INLINE
+const char* convert_toBOOLEAN(int64_t context, bool value, int32_t* out_len) {
+  *out_len = sizeof(value);
+  char* ret = reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context,
+                                 "Could not allocate memory for the output string");
+
+    *out_len = 0;
+    return "";
+  }
+
+  memcpy(ret, &value, *out_len);
+
+  return ret;
+}
+
+// Converts a time variable to binary
+FORCE_INLINE
+const char* convert_toTIME_EPOCH(int64_t context, int32_t value, int32_t* out_len) {
+  return convert_toINT(context, value, out_len);
+}
+
+FORCE_INLINE
+const char* convert_toTIME_EPOCH_be(int64_t context, int32_t value, int32_t* out_len) {
+  // The function behaves as convert_toTIME_EPOCH, but
+  // returns the bytes in big endian format
+  return convert_toINT_be(context, value, out_len);
+}
+
+// Converts a timestamp variable to binary
+FORCE_INLINE
+const char* convert_toTIMESTAMP_EPOCH(int64_t context, int64_t timestamp,
+                                      int32_t* out_len) {
+  return convert_toBIGINT(context, timestamp, out_len);
+}
+
+FORCE_INLINE
+const char* convert_toTIMESTAMP_EPOCH_be(int64_t context, int64_t timestamp,
+                                         int32_t* out_len) {
+  // The function behaves as convert_toTIMESTAMP_EPOCH, but
+  // returns the bytes in big endian format
+  return convert_toBIGINT_be(context, timestamp, out_len);
+}
+
+// Converts a date variable to binary
+FORCE_INLINE
+const char* convert_toDATE_EPOCH(int64_t context, int64_t date, int32_t* out_len) {
+  return convert_toBIGINT(context, date, out_len);
+}
+
+FORCE_INLINE
+const char* convert_toDATE_EPOCH_be(int64_t context, int64_t date, int32_t* out_len) {
+  // The function behaves as convert_toDATE_EPOCH, but
+  // returns the bytes in big endian format
+  return convert_toBIGINT_be(context, date, out_len);
+}
+
+// Converts a string variable to binary
+FORCE_INLINE
+const char* convert_toUTF8(int64_t context, const char* value, int32_t value_len,
+                           int32_t* out_len) {
+  *out_len = value_len;
+  return value;
 }
 
 // Search for a string within another string
@@ -835,27 +1639,101 @@ const char* replace_utf8_utf8_utf8(gdv_int64 context, const char* text,
                                              out_len);
 }
 
-#define CAST_NUMERIC_FROM_STRING(OUT_TYPE, ARROW_TYPE, TYPE_NAME)                       \
-  FORCE_INLINE                                                                          \
-  gdv_##OUT_TYPE cast##TYPE_NAME##_utf8(int64_t context, const char* data,              \
-                                        int32_t len) {                                  \
-    gdv_##OUT_TYPE val = 0;                                                             \
-    int32_t trimmed_len;                                                                \
-    data = btrim_utf8(context, data, len, &trimmed_len);                                \
-    if (!arrow::internal::ParseValue<ARROW_TYPE>(data, trimmed_len, &val)) {            \
-      std::string err = "Failed to cast the string " + std::string(data, trimmed_len) + \
-                        " to " #OUT_TYPE;                                               \
-      gdv_fn_context_set_error_msg(context, err.c_str());                               \
-    }                                                                                   \
-    return val;                                                                         \
+FORCE_INLINE
+const char* split_part(gdv_int64 context, const char* text, gdv_int32 text_len,
+                       const char* delimiter, gdv_int32 delim_len, gdv_int32 index,
+                       gdv_int32* out_len) {
+  *out_len = 0;
+  if (index < 1) {
+    char error_message[100];
+    snprintf(error_message, sizeof(error_message),
+             "Index in split_part must be positive, value provided was %d", index);
+    gdv_fn_context_set_error_msg(context, error_message);
+    return "";
   }
 
-CAST_NUMERIC_FROM_STRING(int32, arrow::Int32Type, INT)
-CAST_NUMERIC_FROM_STRING(int64, arrow::Int64Type, BIGINT)
-CAST_NUMERIC_FROM_STRING(float32, arrow::FloatType, FLOAT4)
-CAST_NUMERIC_FROM_STRING(float64, arrow::DoubleType, FLOAT8)
+  if (delim_len == 0 || text_len == 0) {
+    // output will just be text if no delimiter is provided
+    *out_len = text_len;
+    return text;
+  }
 
-#undef CAST_INT_FROM_STRING
-#undef CAST_FLOAT_FROM_STRING
+  int i = 0, match_no = 1;
 
+  while (i < text_len) {
+    // find the position where delimiter matched for the first time
+    int match_pos = match_string(text, text_len, i, delimiter, delim_len);
+    if (match_pos == -1 && match_no != index) {
+      // reached the end without finding a match.
+      return "";
+    } else {
+      // Found a match. If the match number is index then return this match
+      if (match_no == index) {
+        int end_pos = match_pos - delim_len;
+
+        if (match_pos == -1) {
+          // end position should be last position of the string as we have the last
+          // delimiter
+          end_pos = text_len;
+        }
+
+        *out_len = end_pos - i;
+        char* out_str =
+            reinterpret_cast<char*>(gdv_fn_context_arena_malloc(context, *out_len));
+        if (out_str == nullptr) {
+          gdv_fn_context_set_error_msg(context,
+                                       "Could not allocate memory for output string");
+          *out_len = 0;
+          return "";
+        }
+        memcpy(out_str, text + i, *out_len);
+        return out_str;
+      } else {
+        i = match_pos;
+        match_no++;
+      }
+    }
+  }
+
+  return "";
+}
+
+FORCE_INLINE
+const char* binary_string(gdv_int64 context, const char* text, gdv_int32 text_len,
+                          gdv_int32* out_len) {
+  gdv_binary ret =
+      reinterpret_cast<gdv_binary>(gdv_fn_context_arena_malloc(context, text_len));
+
+  if (ret == nullptr) {
+    gdv_fn_context_set_error_msg(context, "Could not allocate memory for output string");
+    *out_len = 0;
+    return "";
+  }
+
+  if (text_len == 0) {
+    *out_len = 0;
+    return "";
+  }
+
+  // converting hex encoded string to normal string
+  int j = 0;
+  for (int i = 0; i < text_len; i++, j++) {
+    if (text[i] == '\\' && i + 3 < text_len &&
+        (text[i + 1] == 'x' || text[i + 1] == 'X')) {
+      char hd1 = text[i + 2];
+      char hd2 = text[i + 3];
+      if (isxdigit(hd1) && isxdigit(hd2)) {
+        // [a-fA-F0-9]
+        ret[j] = to_binary_from_hex(hd1) * 16 + to_binary_from_hex(hd2);
+        i += 3;
+      } else {
+        ret[j] = text[i];
+      }
+    } else {
+      ret[j] = text[i];
+    }
+  }
+  *out_len = j;
+  return ret;
+}
 }  // extern "C"

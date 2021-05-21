@@ -166,6 +166,8 @@ class ARROW_TESTING_EXPORT ConstantArrayGenerator {
   static std::shared_ptr<arrow::Array> Zeroes(int64_t size,
                                               const std::shared_ptr<DataType>& type) {
     switch (type->id()) {
+      case Type::NA:
+        return std::make_shared<NullArray>(size);
       case Type::BOOL:
         return Boolean(size);
       case Type::UINT8:
@@ -252,5 +254,8 @@ class ARROW_TESTING_EXPORT ConstantArrayGenerator {
     return Repeat(n_batch, Zeroes(batch_size, schema));
   }
 };
+
+ARROW_TESTING_EXPORT
+Result<std::shared_ptr<Array>> ScalarVectorToArray(const ScalarVector& scalars);
 
 }  // namespace arrow

@@ -21,8 +21,6 @@ ARG DEBUG
 
 RUN \
   quiet=$([ "${DEBUG}" = "yes" ] || echo "--quiet") && \
-  dnf install -y ${quiet} epel-release && \
-  dnf install --enablerepo=PowerTools -y ${quiet} \
-    rpm-build \
+  dnf install --enablerepo=powertools -y ${quiet} \
     rpmdevtools && \
   dnf clean ${quiet} all

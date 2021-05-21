@@ -31,6 +31,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "arrow/util/logging.h"
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4141)
@@ -53,6 +55,7 @@
 #include <llvm/Linker/Linker.h>
 #include <llvm/MC/SubtargetFeature.h>
 #include <llvm/Support/DynamicLibrary.h>
+#include <llvm/Support/Host.h>
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
@@ -68,11 +71,10 @@
 #pragma warning(pop)
 #endif
 
+#include "arrow/util/make_unique.h"
 #include "gandiva/configuration.h"
 #include "gandiva/decimal_ir.h"
 #include "gandiva/exported_funcs_registry.h"
-
-#include "arrow/util/make_unique.h"
 
 namespace gandiva {
 
@@ -81,6 +83,8 @@ extern const size_t kPrecompiledBitcodeSize;
 
 std::once_flag llvm_init_once_flag;
 static bool llvm_init = false;
+static llvm::StringRef cpu_name;
+static llvm::SmallVector<std::string, 10> cpu_attrs;
 
 void Engine::InitOnce() {
   DCHECK_EQ(llvm_init, false);
@@ -91,6 +95,19 @@ void Engine::InitOnce() {
   llvm::InitializeNativeTargetDisassembler();
   llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
 
+  cpu_name = llvm::sys::getHostCPUName();
+  llvm::StringMap<bool> host_features;
+  std::string cpu_attrs_str;
+  if (llvm::sys::getHostCPUFeatures(host_features)) {
+    for (auto& f : host_features) {
+      std::string attr = f.second ? std::string("+") + f.first().str()
+                                  : std::string("-") + f.first().str();
+      cpu_attrs.push_back(attr);
+      cpu_attrs_str += " " + attr;
+    }
+  }
+  ARROW_LOG(INFO) << "Detected CPU Name : " << cpu_name.str();
+  ARROW_LOG(INFO) << "Detected CPU Features:" << cpu_attrs_str;
   llvm_init = true;
 }
 
@@ -122,23 +139,29 @@ Status Engine::Make(const std::shared_ptr<Configuration>& conf,
   auto ctx = arrow::internal::make_unique<llvm::LLVMContext>();
   auto module = arrow::internal::make_unique<llvm::Module>("codegen", *ctx);
 
-  // Capture before moving, ExceutionEngine does not allow retrieving the
+  // Capture before moving, ExecutionEngine does not allow retrieving the
   // original Module.
   auto module_ptr = module.get();
 
   auto opt_level =
       conf->optimize() ? llvm::CodeGenOpt::Aggressive : llvm::CodeGenOpt::None;
+
   // Note that the lifetime of the error string is not captured by the
   // ExecutionEngine but only for the lifetime of the builder. Found by
   // inspecting LLVM sources.
   std::string builder_error;
-  std::unique_ptr<llvm::ExecutionEngine> exec_engine{
-      llvm::EngineBuilder(std::move(module))
-          .setMCPU(llvm::sys::getHostCPUName())
-          .setEngineKind(llvm::EngineKind::JIT)
-          .setOptLevel(opt_level)
-          .setErrorStr(&builder_error)
-          .create()};
+
+  llvm::EngineBuilder engine_builder(std::move(module));
+
+  engine_builder.setEngineKind(llvm::EngineKind::JIT)
+      .setOptLevel(opt_level)
+      .setErrorStr(&builder_error);
+
+  if (conf->target_host_cpu()) {
+    engine_builder.setMCPU(cpu_name);
+    engine_builder.setMAttrs(cpu_attrs);
+  }
+  std::unique_ptr<llvm::ExecutionEngine> exec_engine{engine_builder.create()};
 
   if (exec_engine == nullptr) {
     return Status::CodeGenError("Could not instantiate llvm::ExecutionEngine: ",

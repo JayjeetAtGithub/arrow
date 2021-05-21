@@ -19,21 +19,30 @@
 import os
 import posixpath
 import sys
+import warnings
 
-from pyarrow.util import implements
+from pyarrow.util import implements, _DEPR_MSG
 from pyarrow.filesystem import FileSystem
-import pyarrow.lib as lib
+import pyarrow._hdfsio as _hdfsio
 
 
-class HadoopFileSystem(lib.HadoopFileSystem, FileSystem):
+class HadoopFileSystem(_hdfsio.HadoopFileSystem, FileSystem):
     """
-    FileSystem interface for HDFS cluster.
+    DEPRECATED: FileSystem interface for HDFS cluster.
 
     See pyarrow.hdfs.connect for full connection details
+
+    .. deprecated:: 2.0
+        ``pyarrow.hdfs.HadoopFileSystem`` is deprecated,
+        please use ``pyarrow.fs.HadoopFileSystem`` instead.
     """
 
     def __init__(self, host="default", port=0, user=None, kerb_ticket=None,
                  driver='libhdfs', extra_conf=None):
+        warnings.warn(
+            _DEPR_MSG.format(
+                "hdfs.HadoopFileSystem", "2.0.0", "fs.HadoopFileSystem"),
+            FutureWarning, stacklevel=2)
         if driver == 'libhdfs':
             _maybe_set_hadoop_classpath()
 
@@ -179,12 +188,18 @@ def _libhdfs_walk_files_dirs(top_path, contents):
 def connect(host="default", port=0, user=None, kerb_ticket=None,
             extra_conf=None):
     """
-    Connect to an HDFS cluster. All parameters are optional and should
-    only be set if the defaults need to be overridden.
+    DEPRECATED: Connect to an HDFS cluster.
+
+    All parameters are optional and should only be set if the defaults need
+    to be overridden.
 
     Authentication should be automatic if the HDFS cluster uses Kerberos.
     However, if a username is specified, then the ticket cache will likely
     be required.
+
+    .. deprecated:: 2.0
+        ``pyarrow.hdfs.connect`` is deprecated,
+        please use ``pyarrow.fs.HadoopFileSystem`` instead.
 
     Parameters
     ----------
@@ -205,7 +220,21 @@ def connect(host="default", port=0, user=None, kerb_ticket=None,
     -------
     filesystem : HadoopFileSystem
     """
-    fs = HadoopFileSystem(host=host, port=port, user=user,
-                          kerb_ticket=kerb_ticket,
-                          extra_conf=extra_conf)
+    warnings.warn(
+        _DEPR_MSG.format("hdfs.connect", "2.0.0", "fs.HadoopFileSystem"),
+        FutureWarning, stacklevel=2
+    )
+    return _connect(
+        host=host, port=port, user=user, kerb_ticket=kerb_ticket,
+        extra_conf=extra_conf
+    )
+
+
+def _connect(host="default", port=0, user=None, kerb_ticket=None,
+             extra_conf=None):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fs = HadoopFileSystem(host=host, port=port, user=user,
+                              kerb_ticket=kerb_ticket,
+                              extra_conf=extra_conf)
     return fs

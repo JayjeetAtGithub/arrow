@@ -29,7 +29,6 @@ import * as fs from 'fs';
 import { fs as memfs } from 'memfs';
 import { Readable, PassThrough } from 'stream';
 
-/* tslint:disable */
 const randomatic = require('randomatic');
 
 export abstract class ArrowIOTestHelper {
@@ -54,13 +53,13 @@ export abstract class ArrowIOTestHelper {
             await testFn(await this.writer(this.table).toUint8Array());
         };
     }
-    iterable(testFn: (iterable: Iterable<Uint8Array>) => void | Promise<void>) {
+    iterable(testFn: (iterable: Generator<Uint8Array>) => void | Promise<void>) {
         return async () => {
             expect.hasAssertions();
             await testFn(chunkedIterable(await this.writer(this.table).toUint8Array()));
         };
     }
-    asyncIterable(testFn: (asyncIterable: AsyncIterable<Uint8Array>) => void | Promise<void>) {
+    asyncIterable(testFn: (asyncIterable: AsyncGenerator<Uint8Array>) => void | Promise<void>) {
         return async () => {
             expect.hasAssertions();
             await testFn(asyncChunkedIterable(await this.writer(this.table).toUint8Array()));
@@ -173,8 +172,6 @@ export async function* readableDOMStreamToAsyncIterator<T>(stream: ReadableStrea
             // Else yield the chunk
             yield value as T;
         }
-    } catch (e) {
-        throw e;
     } finally {
         try { stream.locked && reader.releaseLock(); } catch (e) {}
     }

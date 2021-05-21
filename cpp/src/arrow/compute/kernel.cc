@@ -59,16 +59,6 @@ Result<std::shared_ptr<ResizableBuffer>> KernelContext::AllocateBitmap(int64_t n
   return result;
 }
 
-void KernelContext::SetStatus(const Status& status) {
-  if (ARROW_PREDICT_TRUE(status.ok())) {
-    return;
-  }
-  status_ = status;
-}
-
-/// \brief Clear any error status
-void KernelContext::ResetStatus() { status_ = Status::OK(); }
-
 // ----------------------------------------------------------------------
 // Some basic TypeMatcher implementations
 
@@ -281,6 +271,9 @@ std::string InputType::ToString() const {
   }
   ss << "[";
   switch (kind_) {
+    case InputType::ANY_TYPE:
+      ss << "any";
+      break;
     case InputType::EXACT_TYPE:
       ss << type_->ToString();
       break;
@@ -303,6 +296,8 @@ bool InputType::Equals(const InputType& other) const {
     return false;
   }
   switch (kind_) {
+    case InputType::ANY_TYPE:
+      return true;
     case InputType::EXACT_TYPE:
       return type_->Equals(*other.type_);
     case InputType::USE_TYPE_MATCHER:

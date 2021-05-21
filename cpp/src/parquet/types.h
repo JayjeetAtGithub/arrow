@@ -27,6 +27,16 @@
 #include "arrow/util/string_view.h"
 
 #include "parquet/platform.h"
+#include "parquet/type_fwd.h"
+
+#ifdef _WIN32
+
+// Repetition::OPTIONAL conflicts with a #define, so we undefine it
+#ifdef OPTIONAL
+#undef OPTIONAL
+#endif
+
+#endif  // _WIN32
 
 namespace arrow {
 namespace util {
@@ -70,7 +80,7 @@ struct Type {
 // Mirrors parquet::ConvertedType
 struct ConvertedType {
   enum type {
-    NONE,
+    NONE,  // Not a real converted type, but means no converted type is specified
     UTF8,
     MAP,
     MAP_KEY_VALUE,
@@ -93,9 +103,12 @@ struct ConvertedType {
     JSON,
     BSON,
     INTERVAL,
+    // DEPRECATED INVALID ConvertedType for all-null data.
+    // Only useful for reading legacy files written out by interim Parquet C++ releases.
+    // For writing, always emit LogicalType::Null instead.
+    // See PARQUET-1990.
     NA = 25,
-    // Should always be last element.
-    UNDEFINED = 26
+    UNDEFINED = 26  // Not a real converted type; should always be last element
   };
 };
 
@@ -139,7 +152,7 @@ class PARQUET_EXPORT LogicalType {
  public:
   struct Type {
     enum type {
-      UNKNOWN = 0,
+      UNDEFINED = 0,  // Not a real logical type
       STRING = 1,
       MAP,
       LIST,
@@ -150,11 +163,11 @@ class PARQUET_EXPORT LogicalType {
       TIMESTAMP,
       INTERVAL,
       INT,
-      NIL,  // Thrift NullType
+      NIL,  // Thrift NullType: annotates data that is always null
       JSON,
       BSON,
       UUID,
-      NONE
+      NONE  // Not a real logical type; should always be last element
     };
   };
 
@@ -198,12 +211,18 @@ class PARQUET_EXPORT LogicalType {
 
   static std::shared_ptr<const LogicalType> Interval();
   static std::shared_ptr<const LogicalType> Int(int bit_width, bool is_signed);
+
+  /// \brief Create a logical type for data that's always null
+  ///
+  /// Any physical type can be annotated with this logical type.
   static std::shared_ptr<const LogicalType> Null();
+
   static std::shared_ptr<const LogicalType> JSON();
   static std::shared_ptr<const LogicalType> BSON();
   static std::shared_ptr<const LogicalType> UUID();
+
+  /// \brief Create a placeholder for when no logical type is specified
   static std::shared_ptr<const LogicalType> None();
-  static std::shared_ptr<const LogicalType> Unknown();
 
   /// \brief Return true if this logical type is consistent with the given underlying
   /// physical type.
@@ -433,13 +452,13 @@ class PARQUET_EXPORT NoLogicalType : public LogicalType {
   NoLogicalType() = default;
 };
 
-/// \brief Allowed for any type.
-class PARQUET_EXPORT UnknownLogicalType : public LogicalType {
+// Internal API, for unrecognized logical types
+class PARQUET_EXPORT UndefinedLogicalType : public LogicalType {
  public:
   static std::shared_ptr<const LogicalType> Make();
 
  private:
-  UnknownLogicalType() = default;
+  UndefinedLogicalType() = default;
 };
 
 // Data encodings. Mirrors parquet::Encoding
@@ -463,15 +482,6 @@ struct Encoding {
 /// \brief Return true if Parquet supports indicated compression type
 PARQUET_EXPORT
 bool IsCodecSupported(Compression::type codec);
-
-namespace internal {
-
-// ARROW-9424: Separate functions for reading and writing so we can disable LZ4
-// on writing
-std::unique_ptr<Codec> GetReadCodec(Compression::type codec);
-std::unique_ptr<Codec> GetWriteCodec(Compression::type codec, int compression_level);
-
-}  // namespace internal
 
 PARQUET_EXPORT
 std::unique_ptr<Codec> GetCodec(Compression::type codec);
@@ -712,10 +722,4 @@ PARQUET_EXPORT SortOrder::type GetSortOrder(ConvertedType::type converted,
 PARQUET_EXPORT SortOrder::type GetSortOrder(
     const std::shared_ptr<const LogicalType>& logical_type, Type::type primitive);
 
-namespace internal {
-
-PARQUET_EXPORT
-int32_t DecimalSize(int32_t precision);
-
-}  // namespace internal
 }  // namespace parquet

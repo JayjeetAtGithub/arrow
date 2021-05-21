@@ -29,6 +29,7 @@
 #include "arrow/ipc/options.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
+#include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/util/variant.h"
 
@@ -65,6 +66,9 @@ class ARROW_FLIGHT_EXPORT FlightCallOptions {
 
   /// \brief IPC writer options, if applicable for the call.
   ipc::IpcWriteOptions write_options;
+
+  /// \brief Headers for client to add to context.
+  std::vector<std::pair<std::string, std::string>> headers;
 };
 
 /// \brief Indicate that the client attempted to write a message
@@ -88,8 +92,7 @@ class ARROW_FLIGHT_EXPORT FlightWriteSizeStatusDetail : public arrow::StatusDeta
   int64_t actual_;
 };
 
-class ARROW_FLIGHT_EXPORT FlightClientOptions {
- public:
+struct ARROW_FLIGHT_EXPORT FlightClientOptions {
   /// \brief Root certificates to use for validating server
   /// certificates.
   std::string tls_root_certs;
@@ -107,10 +110,14 @@ class ARROW_FLIGHT_EXPORT FlightClientOptions {
   /// Used to help limit server memory consumption. Only enabled if
   /// positive. When enabled, FlightStreamWriter.Write* may yield a
   /// IOError with error detail FlightWriteSizeStatusDetail.
-  int64_t write_size_limit_bytes;
+  int64_t write_size_limit_bytes = 0;
+
   /// \brief Generic connection options, passed to the underlying
   ///     transport; interpretation is implementation-dependent.
-  std::vector<std::pair<std::string, util::variant<int, std::string>>> generic_options;
+  std::vector<std::pair<std::string, util::Variant<int, std::string>>> generic_options;
+
+  /// \brief Use TLS without validating the server certificate. Use with caution.
+  bool disable_server_verification = false;
 
   /// \brief Get default options.
   static FlightClientOptions Defaults();
@@ -184,6 +191,16 @@ class ARROW_FLIGHT_EXPORT FlightClient {
   /// \return Status OK if the client authenticated successfully
   Status Authenticate(const FlightCallOptions& options,
                       std::unique_ptr<ClientAuthHandler> auth_handler);
+
+  /// \brief Authenticate to the server using basic HTTP style authentication.
+  /// \param[in] options Per-RPC options
+  /// \param[in] username Username to use
+  /// \param[in] password Password to use
+  /// \return Arrow result with bearer token and status OK if client authenticated
+  /// sucessfully
+  arrow::Result<std::pair<std::string, std::string>> AuthenticateBasicToken(
+      const FlightCallOptions& options, const std::string& username,
+      const std::string& password);
 
   /// \brief Perform the indicated action, returning an iterator to the stream
   /// of results, if any

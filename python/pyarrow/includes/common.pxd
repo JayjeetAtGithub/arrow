@@ -110,6 +110,8 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         c_bool IsCapacityError()
         c_bool IsIndexError()
         c_bool IsSerializationError()
+        c_bool IsExecutionError()
+        c_bool IsCancelled()
 
     cdef cppclass CStatusDetail "arrow::StatusDetail":
         c_string ToString()

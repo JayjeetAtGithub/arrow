@@ -25,18 +25,22 @@ import {
 
 import { ReadableDOMStreamOptions } from './interfaces';
 
+interface ReadableStreamReadResult<T> { done: boolean; value: T }
+type Uint8ArrayGenerator = Generator<Uint8Array, null, { cmd: 'peek' | 'read'; size: number }>;
+type AsyncUint8ArrayGenerator = AsyncGenerator<Uint8Array, null, { cmd: 'peek' | 'read'; size: number }>;
+
 /** @ignore */
 export default {
-    fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T): IterableIterator<Uint8Array> {
+    fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T): Uint8ArrayGenerator {
         return pump(fromIterable<T>(source));
     },
-    fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncIterable<T> | PromiseLike<T>): AsyncIterableIterator<Uint8Array> {
+    fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncIterable<T> | PromiseLike<T>): AsyncUint8ArrayGenerator {
         return pump(fromAsyncIterable<T>(source));
     },
-    fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableStream<T>): AsyncIterableIterator<Uint8Array> {
+    fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableStream<T>): AsyncUint8ArrayGenerator {
         return pump(fromDOMStream<T>(source));
     },
-    fromNodeStream(stream: NodeJS.ReadableStream): AsyncIterableIterator<Uint8Array> {
+    fromNodeStream(stream: NodeJS.ReadableStream): AsyncUint8ArrayGenerator {
         return pump(fromNodeStream(stream));
     },
     // @ts-ignore
@@ -50,12 +54,12 @@ export default {
 };
 
 /** @ignore */
-const pump = <T extends Iterator<any> | AsyncIterator<any>>(iterator: T) => { iterator.next(); return iterator; };
+const pump = <T extends Uint8ArrayGenerator | AsyncUint8ArrayGenerator>(iterator: T) => { iterator.next(); return iterator; };
 
 /** @ignore */
-function* fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T): IterableIterator<Uint8Array> {
+function* fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T): Uint8ArrayGenerator {
 
-    let done: boolean, threw = false;
+    let done: boolean | undefined, threw = false;
     let buffers: Uint8Array[] = [], buffer: Uint8Array;
     let cmd: 'peek' | 'read', size: number, bufferLength = 0;
 
@@ -71,7 +75,7 @@ function* fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T):
     ({ cmd, size } = yield <any> null);
 
     // initialize the iterator
-    let it = toUint8ArrayIterator(source)[Symbol.iterator]();
+    const it = toUint8ArrayIterator(source)[Symbol.iterator]();
 
     try {
         do {
@@ -93,14 +97,15 @@ function* fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T):
     } catch (e) {
         (threw = true) && (typeof it.throw === 'function') && (it.throw(e));
     } finally {
-        (threw === false) && (typeof it.return === 'function') && (it.return());
+        (threw === false) && (typeof it.return === 'function') && (it.return(null!));
     }
+    return null;
 }
 
 /** @ignore */
-async function* fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncIterable<T> | PromiseLike<T>): AsyncIterableIterator<Uint8Array> {
+async function* fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncIterable<T> | PromiseLike<T>): AsyncUint8ArrayGenerator {
 
-    let done: boolean, threw = false;
+    let done: boolean | undefined, threw = false;
     let buffers: Uint8Array[] = [], buffer: Uint8Array;
     let cmd: 'peek' | 'read', size: number, bufferLength = 0;
 
@@ -113,10 +118,10 @@ async function* fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncI
     }
 
     // Yield so the caller can inject the read command before creating the source AsyncIterator
-    ({ cmd, size } = yield <any> null);
+    ({ cmd, size } = (yield <any> null)!);
 
     // initialize the iterator
-    let it = toUint8ArrayAsyncIterator(source)[Symbol.asyncIterator]();
+    const it = toUint8ArrayAsyncIterator(source)[Symbol.asyncIterator]();
 
     try {
         do {
@@ -139,15 +144,16 @@ async function* fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncI
     } catch (e) {
         (threw = true) && (typeof it.throw === 'function') && (await it.throw(e));
     } finally {
-        (threw === false) && (typeof it.return === 'function') && (await it.return());
+        (threw === false) && (typeof it.return === 'function') && (await it.return(new Uint8Array(0)));
     }
+    return null;
 }
 
 // All this manual Uint8Array chunk management can be avoided if/when engines
 // add support for ArrayBuffer.transfer() or ArrayBuffer.prototype.realloc():
 // https://github.com/domenic/proposal-arraybuffer-transfer
 /** @ignore */
-async function* fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableStream<T>): AsyncIterableIterator<Uint8Array> {
+async function* fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableStream<T>): AsyncUint8ArrayGenerator {
 
     let done = false, threw = false;
     let buffers: Uint8Array[] = [], buffer: Uint8Array;
@@ -165,7 +171,7 @@ async function* fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableSt
     ({ cmd, size } = yield <any> null);
 
     // initialize the reader and lock the stream
-    let it = new AdaptiveByteReader(source);
+    const it = new AdaptiveByteReader(source);
 
     try {
         do {
@@ -191,6 +197,7 @@ async function* fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableSt
         (threw === false) ? (await it['cancel']())
             : source['locked'] && it.releaseLock();
     }
+    return null;
 }
 
 /** @ignore */
@@ -205,7 +212,7 @@ class AdaptiveByteReader<T extends ArrayBufferViewInput> {
         try {
             this.supportsBYOB = !!(this.reader = this.getBYOBReader());
         } catch (e) {
-            this.supportsBYOB = !!!(this.reader = this.getDefaultReader());
+            this.supportsBYOB = !(this.reader = this.getDefaultReader());
         }
     }
 
@@ -278,10 +285,10 @@ async function readInto(reader: ReadableStreamBYOBReader, buffer: ArrayBufferLik
         return { done: false, value: new Uint8Array(buffer, 0, size) };
     }
     const { done, value } = await reader.read(new Uint8Array(buffer, offset, size - offset));
-    if (((offset += value.byteLength) < size) && !done) {
-        return await readInto(reader, value.buffer, offset, size);
+    if (((offset += value!.byteLength) < size) && !done) {
+        return await readInto(reader, value!.buffer, offset, size);
     }
-    return { done, value: new Uint8Array(value.buffer, 0, offset) };
+    return { done, value: new Uint8Array(value!.buffer, 0, offset) };
 }
 
 /** @ignore */
@@ -290,7 +297,7 @@ type EventName = 'end' | 'error' | 'readable';
 type Event = [EventName, (_: any) => void, Promise<[EventName, Error | null]>];
 /** @ignore */
 const onEvent = <T extends string>(stream: NodeJS.ReadableStream, event: T) => {
-    let handler = (_: any) => resolve([event, _]);
+    const handler = (_: any) => resolve([event, _]);
     let resolve: (value?: [T, any] | PromiseLike<[T, any]>) => void;
     return [event, handler, new Promise<[T, any]>(
         (r) => (resolve = r) && stream['once'](event, handler)
@@ -298,9 +305,9 @@ const onEvent = <T extends string>(stream: NodeJS.ReadableStream, event: T) => {
 };
 
 /** @ignore */
-async function* fromNodeStream(stream: NodeJS.ReadableStream): AsyncIterableIterator<Uint8Array> {
+async function* fromNodeStream(stream: NodeJS.ReadableStream): AsyncUint8ArrayGenerator {
 
-    let events: Event[] = [];
+    const events: Event[] = [];
     let event: EventName = 'error';
     let done = false, err: Error | null = null;
     let cmd: 'peek' | 'read', size: number, bufferLength = 0;
@@ -319,7 +326,10 @@ async function* fromNodeStream(stream: NodeJS.ReadableStream): AsyncIterableIter
     ({ cmd, size } = yield <any> null);
 
     // ignore stdin if it's a TTY
-    if ((stream as any)['isTTY']) { return yield new Uint8Array(0); }
+    if ((stream as any)['isTTY']) {
+        yield new Uint8Array(0);
+        return null;
+    }
 
     try {
         // initialize the stream event handlers
@@ -365,9 +375,11 @@ async function* fromNodeStream(stream: NodeJS.ReadableStream): AsyncIterableIter
         await cleanup(events, event === 'error' ? err : null);
     }
 
+    return null;
+
     function cleanup<T extends Error | null | void>(events: Event[], err?: T) {
         buffer = buffers = <any> null;
-        return new Promise<T>(async (resolve, reject) => {
+        return new Promise<T>((resolve, reject) => {
             for (const [evt, fn] of events) {
                 stream['off'](evt, fn);
             }

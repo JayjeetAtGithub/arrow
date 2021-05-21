@@ -28,7 +28,7 @@ from pyarrow.util import find_free_port
 
 # setup hypothesis profiles
 h.settings.register_profile('ci', max_examples=1000)
-h.settings.register_profile('dev', max_examples=10)
+h.settings.register_profile('dev', max_examples=50)
 h.settings.register_profile('debug', max_examples=10,
                             verbosity=h.Verbosity.verbose)
 
@@ -37,6 +37,11 @@ h.settings.register_profile('debug', max_examples=10,
 # examples try:
 # pytest pyarrow -sv --enable-hypothesis --hypothesis-profile=debug
 h.settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
+
+# Set this at the beginning before the AWS SDK was loaded to avoid reading in
+# user configuration values.
+os.environ['AWS_CONFIG_FILE'] = "/dev/null"
+
 
 groups = [
     'cython',
@@ -222,8 +227,18 @@ def tempdir(tmpdir):
 
 
 @pytest.fixture(scope='session')
-def datadir():
+def base_datadir():
     return pathlib.Path(__file__).parent / 'data'
+
+
+@pytest.fixture(autouse=True)
+def disable_aws_metadata(monkeypatch):
+    """Stop the AWS SDK from trying to contact the EC2 metadata server.
+
+    Otherwise, this causes a 5 second delay in tests that exercise the
+    S3 filesystem.
+    """
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
 # TODO(kszucs): move the following fixtures to test_fs.py once the previous

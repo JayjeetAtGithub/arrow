@@ -27,6 +27,8 @@
 #include <vector>
 
 #include "arrow/testing/gtest_util.h"
+#include "arrow/type_traits.h"
+#include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
 
 #include "parquet/column_reader.h"
@@ -42,6 +44,8 @@
 
 using arrow::default_memory_pool;
 using arrow::MemoryPool;
+
+namespace BitUtil = arrow::BitUtil;
 
 namespace parquet {
 
@@ -65,21 +69,51 @@ static FLBA FLBAFromString(const std::string& s) {
 }
 
 TEST(Comparison, SignedByteArray) {
+  // Signed byte array comparison is only used for Decimal comparison. When
+  // decimals are encoded as byte arrays they use twos complement big-endian
+  // encoded values. Comparisons of byte arrays of unequal types need to handle
+  // sign extension.
   auto comparator = MakeComparator<ByteArrayType>(Type::BYTE_ARRAY, SortOrder::SIGNED);
+  struct Case {
+    std::vector<uint8_t> bytes;
+    int order;
+    ByteArray ToByteArray() const {
+      return ByteArray(static_cast<int>(bytes.size()), bytes.data());
+    }
+  };
 
-  std::string s1 = "12345";
-  std::string s2 = "12345678";
-  ByteArray s1ba = ByteArrayFromString(s1);
-  ByteArray s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  // Test a mix of big-endian comparison values that are both equal and
+  // unequal after sign extension.
+  std::vector<Case> cases = {
+      {{0x80, 0x80, 0, 0}, 0},           {{/*0xFF,*/ 0x80, 0, 0}, 1},
+      {{0xFF, 0x80, 0, 0}, 1},           {{/*0xFF,*/ 0xFF, 0x01, 0}, 2},
+      {{/*0xFF,  0xFF,*/ 0x80, 0}, 3},   {{/*0xFF,*/ 0xFF, 0x80, 0}, 3},
+      {{0xFF, 0xFF, 0x80, 0}, 3},        {{/*0xFF,0xFF,0xFF,*/ 0x80}, 4},
+      {{/*0xFF, 0xFF, 0xFF,*/ 0xFF}, 5}, {{/*0, 0,*/ 0x01, 0x01}, 6},
+      {{/*0,*/ 0, 0x01, 0x01}, 6},       {{0, 0, 0x01, 0x01}, 6},
+      {{/*0,*/ 0x01, 0x01, 0}, 7},       {{0x01, 0x01, 0, 0}, 8}};
 
-  // This is case where signed comparison UTF-8 (PARQUET-686) is incorrect
-  // This example is to only check signed comparison and not UTF-8.
-  s1 = u8"bügeln";
-  s2 = u8"braten";
-  s1ba = ByteArrayFromString(s1);
-  s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  for (size_t x = 0; x < cases.size(); x++) {
+    const auto& case1 = cases[x];
+    // Empty array is always the smallest values
+    EXPECT_TRUE(comparator->Compare(ByteArray(), case1.ToByteArray())) << x;
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), ByteArray())) << x;
+    // Equals is always false.
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case1.ToByteArray())) << x;
+
+    for (size_t y = 0; y < cases.size(); y++) {
+      const auto& case2 = cases[y];
+      if (case1.order < case2.order) {
+        EXPECT_TRUE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      } else {
+        EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      }
+    }
+  }
 }
 
 TEST(Comparison, UnsignedByteArray) {
@@ -107,21 +141,28 @@ TEST(Comparison, UnsignedByteArray) {
 }
 
 TEST(Comparison, SignedFLBA) {
-  int size = 10;
+  int size = 4;
   auto comparator =
       MakeComparator<FLBAType>(Type::FIXED_LEN_BYTE_ARRAY, SortOrder::SIGNED, size);
 
-  std::string s1 = "Anti123456";
-  std::string s2 = "Bunkd123456";
-  FLBA s1flba = FLBAFromString(s1);
-  FLBA s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  std::vector<uint8_t> byte_values[] = {
+      {0x80, 0, 0, 0},          {0xFF, 0xFF, 0x01, 0},    {0xFF, 0xFF, 0x80, 0},
+      {0xFF, 0xFF, 0xFF, 0x80}, {0xFF, 0xFF, 0xFF, 0xFF}, {0, 0, 0x01, 0x01},
+      {0, 0x01, 0x01, 0},       {0x01, 0x01, 0, 0}};
+  std::vector<FLBA> values_to_compare;
+  for (auto& bytes : byte_values) {
+    values_to_compare.emplace_back(FLBA(bytes.data()));
+  }
 
-  s1 = "Bünk123456";
-  s2 = "Bunk123456";
-  s1flba = FLBAFromString(s1);
-  s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  for (size_t x = 0; x < values_to_compare.size(); x++) {
+    EXPECT_FALSE(comparator->Compare(values_to_compare[x], values_to_compare[x])) << x;
+    for (size_t y = x + 1; y < values_to_compare.size(); y++) {
+      EXPECT_TRUE(comparator->Compare(values_to_compare[x], values_to_compare[y]))
+          << x << " " << y;
+      EXPECT_FALSE(comparator->Compare(values_to_compare[y], values_to_compare[x]))
+          << y << " " << x;
+    }
+  }
 }
 
 TEST(Comparison, UnsignedFLBA) {
@@ -253,13 +294,13 @@ TEST(Comparison, UnknownSortOrder) {
 template <typename TestType>
 class TestStatistics : public PrimitiveTypedTest<TestType> {
  public:
-  using T = typename TestType::c_type;
+  using c_type = typename TestType::c_type;
 
-  std::vector<T> GetDeepCopy(
-      const std::vector<T>&);  // allocates new memory for FLBA/ByteArray
+  std::vector<c_type> GetDeepCopy(
+      const std::vector<c_type>&);  // allocates new memory for FLBA/ByteArray
 
-  T* GetValuesPointer(std::vector<T>&);
-  void DeepFree(std::vector<T>&);
+  c_type* GetValuesPointer(std::vector<c_type>&);
+  void DeepFree(std::vector<c_type>&);
 
   void TestMinMaxEncode() {
     this->GenerateData(1000);
@@ -271,7 +312,7 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
 
     auto statistics2 =
         MakeStatistics<TestType>(this->schema_.Column(0), encoded_min, encoded_max,
-                                 this->values_.size(), 0, 0, true);
+                                 this->values_.size(), 0, 0, true, true, true);
 
     auto statistics3 = MakeStatistics<TestType>(this->schema_.Column(0));
     std::vector<uint8_t> valid_bits(
@@ -301,6 +342,7 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
     statistics->Reset();
     ASSERT_EQ(0, statistics->null_count());
     ASSERT_EQ(0, statistics->num_values());
+    ASSERT_EQ(0, statistics->distinct_count());
     ASSERT_EQ("", statistics->EncodeMin());
     ASSERT_EQ("", statistics->EncodeMax());
   }
@@ -356,8 +398,8 @@ class TestStatistics : public PrimitiveTypedTest<TestType> {
                                batch_num_values - batch_null_count, 1);
       auto beg = this->values_.begin() + i * num_values / 2;
       auto end = beg + batch_num_values;
-      std::vector<T> batch = GetDeepCopy(std::vector<T>(beg, end));
-      T* batch_values_ptr = GetValuesPointer(batch);
+      std::vector<c_type> batch = GetDeepCopy(std::vector<c_type>(beg, end));
+      c_type* batch_values_ptr = GetValuesPointer(batch);
       column_writer->WriteBatch(batch_num_values, definition_levels.data(), nullptr,
                                 batch_values_ptr);
       DeepFree(batch);
@@ -472,7 +514,7 @@ void TestStatistics<ByteArrayType>::TestMinMaxEncode() {
 
   auto statistics2 =
       MakeStatistics<ByteArrayType>(this->schema_.Column(0), encoded_min, encoded_max,
-                                    this->values_.size(), 0, 0, true);
+                                    this->values_.size(), 0, 0, true, true, true);
 
   ASSERT_EQ(encoded_min, statistics2->EncodeMin());
   ASSERT_EQ(encoded_max, statistics2->EncodeMax());
@@ -480,10 +522,10 @@ void TestStatistics<ByteArrayType>::TestMinMaxEncode() {
   ASSERT_EQ(statistics1->max(), statistics2->max());
 }
 
-using TestTypes = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType,
-                                   ByteArrayType, FLBAType, BooleanType>;
+using Types = ::testing::Types<Int32Type, Int64Type, FloatType, DoubleType, ByteArrayType,
+                               FLBAType, BooleanType>;
 
-TYPED_TEST_SUITE(TestStatistics, TestTypes);
+TYPED_TEST_SUITE(TestStatistics, Types);
 
 TYPED_TEST(TestStatistics, MinMaxEncode) {
   this->SetUpSchema(Repetition::REQUIRED);
@@ -607,7 +649,7 @@ static const int NUM_VALUES = 10;
 template <typename TestType>
 class TestStatisticsSortOrder : public ::testing::Test {
  public:
-  typedef typename TestType::c_type T;
+  using c_type = typename TestType::c_type;
 
   void AddNodes(std::string name) {
     fields_.push_back(schema::PrimitiveNode::Make(
@@ -654,7 +696,7 @@ class TestStatisticsSortOrder : public ::testing::Test {
     // Create a ParquetReader instance
     std::unique_ptr<parquet::ParquetFileReader> parquet_reader =
         parquet::ParquetFileReader::Open(
-            std::make_shared<arrow::io::BufferReader>(pbuffer));
+            std::make_shared<::arrow::io::BufferReader>(pbuffer));
 
     // Get the File MetaData
     std::shared_ptr<parquet::FileMetaData> file_metadata = parquet_reader->metadata();
@@ -668,7 +710,7 @@ class TestStatisticsSortOrder : public ::testing::Test {
   }
 
  protected:
-  std::vector<T> values_;
+  std::vector<c_type> values_;
   std::vector<uint8_t> values_buf_;
   std::vector<schema::NodePtr> fields_;
   std::shared_ptr<schema::GroupNode> schema_;
@@ -698,13 +740,13 @@ void TestStatisticsSortOrder<Int32Type>::SetValues() {
 
   // Write UINT32 min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(c_type)));
 
   // Write INT32 min/max values
   stats_[1]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::INT64
@@ -726,13 +768,13 @@ void TestStatisticsSortOrder<Int64Type>::SetValues() {
 
   // Write UINT64 min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[5]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[4]), sizeof(c_type)));
 
   // Write INT64 min/max values
   stats_[1]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::FLOAT
@@ -745,8 +787,8 @@ void TestStatisticsSortOrder<FloatType>::SetValues() {
 
   // Write Float min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::DOUBLE
@@ -759,8 +801,8 @@ void TestStatisticsSortOrder<DoubleType>::SetValues() {
 
   // Write Double min/max values
   stats_[0]
-      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(T)))
-      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(T)));
+      .set_min(std::string(reinterpret_cast<const char*>(&values_[0]), sizeof(c_type)))
+      .set_max(std::string(reinterpret_cast<const char*>(&values_[9]), sizeof(c_type)));
 }
 
 // TYPE::ByteArray
@@ -833,14 +875,16 @@ TYPED_TEST(TestStatisticsSortOrder, MinMax) {
   ASSERT_NO_FATAL_FAILURE(this->VerifyParquetStats());
 }
 
-TEST(TestByteArrayStatisticsFromArrow, Basics) {
-  // Part of ARROW-3246. Replicating TestStatisticsSortOrder test but via Arrow
+template <typename ArrowType>
+void TestByteArrayStatisticsFromArrow() {
+  using TypeTraits = ::arrow::TypeTraits<ArrowType>;
+  using ArrayType = typename TypeTraits::ArrayType;
 
-  auto values = ArrayFromJSON(::arrow::utf8(),
+  auto values = ArrayFromJSON(TypeTraits::type_singleton(),
                               u8"[\"c123\", \"b123\", \"a123\", null, "
                               "null, \"f123\", \"g123\", \"h123\", \"i123\", \"ü123\"]");
 
-  const auto& typed_values = static_cast<const ::arrow::BinaryArray&>(*values);
+  const auto& typed_values = static_cast<const ArrayType&>(*values);
 
   NodePtr node = PrimitiveNode::Make("field", Repetition::REQUIRED, Type::BYTE_ARRAY,
                                      ConvertedType::UTF8);
@@ -850,6 +894,15 @@ TEST(TestByteArrayStatisticsFromArrow, Basics) {
 
   ASSERT_EQ(ByteArray(typed_values.GetView(2)), stats->min());
   ASSERT_EQ(ByteArray(typed_values.GetView(9)), stats->max());
+}
+
+TEST(TestByteArrayStatisticsFromArrow, StringType) {
+  // Part of ARROW-3246. Replicating TestStatisticsSortOrder test but via Arrow
+  TestByteArrayStatisticsFromArrow<::arrow::StringType>();
+}
+
+TEST(TestByteArrayStatisticsFromArrow, LargeStringType) {
+  TestByteArrayStatisticsFromArrow<::arrow::LargeStringType>();
 }
 
 // Ensure UNKNOWN sort order is handled properly
@@ -867,7 +920,7 @@ TEST_F(TestStatisticsSortOrderFLBA, UnknownSortOrder) {
   // Create a ParquetReader instance
   std::unique_ptr<parquet::ParquetFileReader> parquet_reader =
       parquet::ParquetFileReader::Open(
-          std::make_shared<arrow::io::BufferReader>(pbuffer));
+          std::make_shared<::arrow::io::BufferReader>(pbuffer));
   // Get the File MetaData
   std::shared_ptr<parquet::FileMetaData> file_metadata = parquet_reader->metadata();
   std::shared_ptr<parquet::RowGroupMetaData> rg_metadata = file_metadata->RowGroup(0);

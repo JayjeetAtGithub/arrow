@@ -24,10 +24,9 @@
 #include <vector>
 
 #include "parquet/column_writer.h"
-#include "parquet/deprecated_io.h"
-#include "parquet/encryption_internal.h"
+#include "parquet/encryption/encryption_internal.h"
+#include "parquet/encryption/internal_file_encryptor.h"
 #include "parquet/exception.h"
-#include "parquet/internal_file_encryptor.h"
 #include "parquet/platform.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
@@ -342,7 +341,8 @@ class FileSerializer : public ParquetFileWriter::Contents {
         num_row_groups_(0),
         num_rows_(0),
         metadata_(FileMetaDataBuilder::Make(&schema_, properties_, key_value_metadata_)) {
-    if (sink_->Tell().ValueOrDie() == 0) {
+    PARQUET_ASSIGN_OR_THROW(int64_t position, sink_->Tell());
+    if (position == 0) {
       StartFile();
     } else {
       throw ParquetException("Appending to file not implemented.");
@@ -452,14 +452,6 @@ std::unique_ptr<ParquetFileWriter> ParquetFileWriter::Open(
   return result;
 }
 
-std::unique_ptr<ParquetFileWriter> ParquetFileWriter::Open(
-    std::shared_ptr<OutputStream> sink, std::shared_ptr<schema::GroupNode> schema,
-    std::shared_ptr<WriterProperties> properties,
-    std::shared_ptr<const KeyValueMetadata> key_value_metadata) {
-  return Open(std::make_shared<ParquetOutputWrapper>(std::move(sink)), std::move(schema),
-              std::move(properties), std::move(key_value_metadata));
-}
-
 void WriteFileMetaData(const FileMetaData& file_metadata, ArrowOutputStream* sink) {
   // Write MetaData
   PARQUET_ASSIGN_OR_THROW(int64_t position, sink->Tell());
@@ -498,28 +490,9 @@ void WriteEncryptedFileMetadata(const FileMetaData& file_metadata,
   }
 }
 
-void WriteFileMetaData(const FileMetaData& file_metadata, OutputStream* sink,
-                       const std::shared_ptr<Encryptor>& encryptor, bool encrypt_footer) {
-  ParquetOutputWrapper wrapper(sink);
-  return WriteFileMetaData(file_metadata, &wrapper);
-}
-
-void WriteEncryptedFileMetadata(const FileMetaData& file_metadata, OutputStream* sink,
-                                const std::shared_ptr<Encryptor>& encryptor,
-                                bool encrypt_footer) {
-  ParquetOutputWrapper wrapper(sink);
-  return WriteEncryptedFileMetadata(file_metadata, &wrapper, encryptor, encrypt_footer);
-}
-
 void WriteFileCryptoMetaData(const FileCryptoMetaData& crypto_metadata,
                              ArrowOutputStream* sink) {
   crypto_metadata.WriteTo(sink);
-}
-
-void WriteFileCryptoMetaData(const FileCryptoMetaData& crypto_metadata,
-                             OutputStream* sink) {
-  ParquetOutputWrapper wrapper(sink);
-  crypto_metadata.WriteTo(&wrapper);
 }
 
 const SchemaDescriptor* ParquetFileWriter::schema() const { return contents_->schema(); }

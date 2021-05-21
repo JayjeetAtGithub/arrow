@@ -46,7 +46,8 @@ cdef dict _pandas_type_map = {
     _Type_FIXED_SIZE_BINARY: np.object_,
     _Type_STRING: np.object_,
     _Type_LIST: np.object_,
-    _Type_DECIMAL: np.object_,
+    _Type_MAP: np.object_,
+    _Type_DECIMAL128: np.object_,
 }
 
 cdef dict _pep3118_type_map = {
@@ -154,7 +155,7 @@ cdef class DataType(_Weakrefable):
         return self.type.layout().buffers.size()
 
     def __str__(self):
-        return frombytes(self.type.ToString())
+        return frombytes(self.type.ToString(), safe=True)
 
     def __hash__(self):
         return hash(str(self))
@@ -304,6 +305,10 @@ cdef class LargeListType(DataType):
         return large_list, (self.value_type,)
 
     @property
+    def value_field(self):
+        return pyarrow_wrap_field(self.list_type.value_field())
+
+    @property
     def value_type(self):
         """
         The data type of large list values.
@@ -349,6 +354,10 @@ cdef class FixedSizeListType(DataType):
 
     def __reduce__(self):
         return list_, (self.value_type, self.list_size)
+
+    @property
+    def value_field(self):
+        return pyarrow_wrap_field(self.list_type.value_field())
 
     @property
     def value_type(self):
@@ -433,7 +442,7 @@ cdef class StructType(DataType):
 
 cdef class UnionType(DataType):
     """
-    Concrete class for struct data types.
+    Base class for union data types.
     """
 
     cdef void init(self, const shared_ptr[CDataType]& type) except *:
@@ -481,6 +490,18 @@ cdef class UnionType(DataType):
 
     def __reduce__(self):
         return union, (list(self), self.mode, self.type_codes)
+
+
+cdef class SparseUnionType(UnionType):
+    """
+    Concrete class for sparse union types.
+    """
+
+
+cdef class DenseUnionType(UnionType):
+    """
+    Concrete class for dense union types.
+    """
 
 
 cdef class TimestampType(DataType):
@@ -623,6 +644,33 @@ cdef class Decimal128Type(FixedSizeBinaryType):
         return self.decimal128_type.scale()
 
 
+cdef class Decimal256Type(FixedSizeBinaryType):
+    """
+    Concrete class for Decimal256 data types.
+    """
+
+    cdef void init(self, const shared_ptr[CDataType]& type) except *:
+        FixedSizeBinaryType.init(self, type)
+        self.decimal256_type = <const CDecimal256Type*> type.get()
+
+    def __reduce__(self):
+        return decimal256, (self.precision, self.scale)
+
+    @property
+    def precision(self):
+        """
+        The decimal precision, in number of decimal digits (an integer).
+        """
+        return self.decimal256_type.precision()
+
+    @property
+    def scale(self):
+        """
+        The decimal scale (an integer).
+        """
+        return self.decimal256_type.scale()
+
+
 cdef class BaseExtensionType(DataType):
     """
     Concrete base class for extension types.
@@ -696,6 +744,10 @@ cdef class ExtensionType(BaseExtensionType):
                     self.storage_type == other.storage_type)
         else:
             return NotImplemented
+
+    def __repr__(self):
+        fmt = '{0.__class__.__name__}({1})'
+        return fmt.format(self, repr(self.storage_type))
 
     def __arrow_ext_serialize__(self):
         """
@@ -884,7 +936,7 @@ cdef class KeyValueMetadata(_Metadata, Mapping):
         return str(self)
 
     def __str__(self):
-        return frombytes(self.metadata.ToString())
+        return frombytes(self.metadata.ToString(), safe=True)
 
     def __eq__(self, other):
         try:
@@ -1008,7 +1060,8 @@ cdef class Field(_Weakrefable):
         return field, (self.name, self.type, self.nullable, self.metadata)
 
     def __str__(self):
-        return 'pyarrow.Field<{0}>'.format(frombytes(self.field.ToString()))
+        return 'pyarrow.Field<{0}>'.format(
+            frombytes(self.field.ToString(), safe=True))
 
     def __repr__(self):
         return self.__str__()
@@ -1570,7 +1623,7 @@ cdef class Schema(_Weakrefable):
                 )
             )
 
-        return frombytes(result)
+        return frombytes(result, safe=True)
 
     def _export_to_c(self, uintptr_t out_ptr):
         """
@@ -2069,11 +2122,28 @@ def float64():
 
 cpdef DataType decimal128(int precision, int scale=0):
     """
-    Create decimal type with precision and scale and 128bit width.
+    Create decimal type with precision and scale and 128-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    As an example, ``decimal128(7, 3)`` can exactly represent the numbers
+    1234.567 and -1234.567 (encoded internally as the 128-bit integers
+    1234567 and -1234567, respectively), but neither 12345.67 nor 123.4567.
+
+    ``decimal128(5, -3)`` can exactly represent the number 12345000
+    (encoded internally as the 128-bit integer 12345), but neither
+    123450000 nor 1234500.
+
+    If you need a precision higher than 38 significant digits, consider
+    using ``decimal256``.
 
     Parameters
     ----------
     precision : int
+        Must be between 1 and 38
     scale : int
 
     Returns
@@ -2084,6 +2154,37 @@ cpdef DataType decimal128(int precision, int scale=0):
     if precision < 1 or precision > 38:
         raise ValueError("precision should be between 1 and 38")
     decimal_type.reset(new CDecimal128Type(precision, scale))
+    return pyarrow_wrap_data_type(decimal_type)
+
+
+cpdef DataType decimal256(int precision, int scale=0):
+    """
+    Create decimal type with precision and scale and 256-bit width.
+
+    Arrow decimals are fixed-point decimal numbers encoded as a scaled
+    integer.  The precision is the number of significant digits that the
+    decimal type can represent; the scale is the number of digits after
+    the decimal point (note the scale can be negative).
+
+    For most use cases, the maximum precision offered by ``decimal128``
+    is sufficient, and it will result in a more compact and more efficient
+    encoding.  ``decimal256`` is useful if you need a precision higher
+    than 38 significant digits.
+
+    Parameters
+    ----------
+    precision : int
+        Must be between 1 and 76
+    scale : int
+
+    Returns
+    -------
+    decimal_type : Decimal256Type
+    """
+    cdef shared_ptr[CDataType] decimal_type
+    if precision < 1 or precision > 76:
+        raise ValueError("precision should be between 1 and 76")
+    decimal_type.reset(new CDecimal256Type(precision, scale))
     return pyarrow_wrap_data_type(decimal_type)
 
 
@@ -2325,25 +2426,119 @@ def struct(fields):
     return pyarrow_wrap_data_type(struct_type)
 
 
-def union(children_fields, mode, type_codes=None):
-    """
-    Create UnionType from children fields.
+cdef _extract_union_params(child_fields, type_codes,
+                           vector[shared_ptr[CField]]* c_fields,
+                           vector[int8_t]* c_type_codes):
+    cdef:
+        Field child_field
 
-    A union is defined by an ordered sequence of types; each slot in the union
-    can have a value chosen from these types.
+    for child_field in child_fields:
+        c_fields[0].push_back(child_field.sp_field)
+
+    if type_codes is not None:
+        if len(type_codes) != <Py_ssize_t>(c_fields.size()):
+            raise ValueError("type_codes should have the same length "
+                             "as fields")
+        for code in type_codes:
+            c_type_codes[0].push_back(code)
+    else:
+        c_type_codes[0] = range(c_fields.size())
+
+
+def sparse_union(child_fields, type_codes=None):
+    """
+    Create SparseUnionType from child fields.
+
+    A sparse union is a nested type where each logical value is taken from
+    a single child.  A buffer of 8-bit type ids indicates which child
+    a given logical value is to be taken from.
+
+    In a sparse union, each child array should have the same length as the
+    union array, regardless of the actual number of union values that
+    refer to it.
 
     Parameters
     ----------
-    fields : sequence of Field values
+    child_fields : sequence of Field values
         Each field must have a UTF8-encoded name, and these field names are
         part of the type metadata.
-    mode : str
-        Either 'dense' or 'sparse'.
     type_codes : list of integers, default None
 
     Returns
     -------
-    type : DataType
+    type : SparseUnionType
+    """
+    cdef:
+        vector[shared_ptr[CField]] c_fields
+        vector[int8_t] c_type_codes
+
+    _extract_union_params(child_fields, type_codes,
+                          &c_fields, &c_type_codes)
+
+    return pyarrow_wrap_data_type(
+        CMakeSparseUnionType(move(c_fields), move(c_type_codes)))
+
+
+def dense_union(child_fields, type_codes=None):
+    """
+    Create DenseUnionType from child fields.
+
+    A dense union is a nested type where each logical value is taken from
+    a single child, at a specific offset.  A buffer of 8-bit type ids
+    indicates which child a given logical value is to be taken from,
+    and a buffer of 32-bit offsets indicates at which physical position
+    in the given child array the logical value is to be taken from.
+
+    Unlike a sparse union, a dense union allows encoding only the child array
+    values which are actually referred to by the union array.  This is
+    counterbalanced by the additional footprint of the offsets buffer, and
+    the additional indirection cost when looking up values.
+
+    Parameters
+    ----------
+    child_fields : sequence of Field values
+        Each field must have a UTF8-encoded name, and these field names are
+        part of the type metadata.
+    type_codes : list of integers, default None
+
+    Returns
+    -------
+    type : DenseUnionType
+    """
+    cdef:
+        vector[shared_ptr[CField]] c_fields
+        vector[int8_t] c_type_codes
+
+    _extract_union_params(child_fields, type_codes,
+                          &c_fields, &c_type_codes)
+
+    return pyarrow_wrap_data_type(
+        CMakeDenseUnionType(move(c_fields), move(c_type_codes)))
+
+
+def union(child_fields, mode, type_codes=None):
+    """
+    Create UnionType from child fields.
+
+    A union is a nested type where each logical value is taken from a
+    single child.  A buffer of 8-bit type ids indicates which child
+    a given logical value is to be taken from.
+
+    Unions come in two flavors: sparse and dense
+    (see also `pyarrow.sparse_union` and `pyarrow.dense_union`).
+
+    Parameters
+    ----------
+    child_fields : sequence of Field values
+        Each field must have a UTF8-encoded name, and these field names are
+        part of the type metadata.
+    mode : str
+        Must be 'sparse' or 'dense'
+    type_codes : list of integers, default None
+
+    Returns
+    -------
+    type : UnionType
     """
     cdef:
         Field child_field
@@ -2363,24 +2558,10 @@ def union(children_fields, mode, type_codes=None):
         else:
             raise ValueError("Invalid union mode {0!r}".format(mode))
 
-    for child_field in children_fields:
-        c_fields.push_back(child_field.sp_field)
-
-    if type_codes is not None:
-        if len(type_codes) != <Py_ssize_t>(c_fields.size()):
-            raise ValueError("type_codes should have the same length "
-                             "as fields")
-        for code in type_codes:
-            c_type_codes.push_back(code)
+    if mode == _UnionMode_SPARSE:
+        return sparse_union(child_fields, type_codes)
     else:
-        c_type_codes = range(c_fields.size())
-
-    if mode == UnionMode_SPARSE:
-        union_type = CMakeSparseUnionType(c_fields, c_type_codes)
-    else:
-        union_type = CMakeDenseUnionType(c_fields, c_type_codes)
-
-    return pyarrow_wrap_data_type(union_type)
+        return dense_union(child_fields, type_codes)
 
 
 cdef dict _type_aliases = {

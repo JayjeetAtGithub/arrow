@@ -157,18 +157,27 @@ DataFrame output:
 Arbitrary Object Serialization
 ------------------------------
 
-In ``pyarrow`` we are able to serialize and deserialize many kinds of Python
-objects. While not a complete replacement for the ``pickle`` module, these
-functions can be significantly faster, particular when dealing with collections
-of NumPy arrays.
-
 .. warning::
 
-   While the functions in this section utilize the Arrow stream protocol
-   internally, they do not produce data that is compatible with the above
-   ``ipc.open_file`` and ``ipc.open_stream`` functions.
+   The custom serialization functionality is deprecated in pyarrow 2.0, and
+   will be removed in a future version.
 
-As an example, consider a dictionary containing NumPy arrays:
+   While the serialization functions in this section utilize the Arrow stream
+   protocol internally, they do not produce data that is compatible with the
+   above ``ipc.open_file`` and ``ipc.open_stream`` functions.
+
+   For arbitrary objects, you can use the standard library ``pickle``
+   functionality instead. For pyarrow objects, you can use the IPC
+   serialization format through the ``pyarrow.ipc`` module, as explained
+   above.
+
+   PyArrow serialization was originally meant to provide a higher-performance
+   alternative to ``pickle`` thanks to zero-copy semantics.  However,
+   ``pickle`` protocol 5 gained support for zero-copy using out-of-band
+   buffers, and can be used instead for similar benefits.
+
+In ``pyarrow`` we are able to serialize and deserialize many kinds of Python
+objects.  As an example, consider a dictionary containing NumPy arrays:
 
 .. ipython:: python
 
@@ -183,6 +192,7 @@ We use the ``pyarrow.serialize`` function to convert this data to a byte
 buffer:
 
 .. ipython:: python
+   :okwarning:
 
    buf = pa.serialize(data).to_buffer()
    type(buf)
@@ -195,31 +205,11 @@ a buffer (the ``to_buffer`` method) or written directly to an output stream.
 Python object:
 
 .. ipython:: python
+   :okwarning:
 
    restored_data = pa.deserialize(buf)
    restored_data[0]
 
-When dealing with NumPy arrays, ``pyarrow.deserialize`` can be significantly
-faster than ``pickle`` because the resulting arrays are zero-copy references
-into the input buffer. The larger the arrays, the larger the performance
-savings.
-
-Consider this example, we have for ``pyarrow.deserialize``
-
-.. ipython:: python
-
-   %timeit restored_data = pa.deserialize(buf)
-
-And for pickle:
-
-.. ipython:: python
-
-   import pickle
-   pickled = pickle.dumps(data)
-   %timeit unpickled_data = pickle.loads(pickled)
-
-We aspire to make these functions a high-speed alternative to pickle for
-transient serialization in Python big data applications.
 
 Serializing Custom Data Types
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -292,6 +282,7 @@ metadata for each array and references to the memory inside the arrays. To do
 this, use the ``to_components`` method:
 
 .. ipython:: python
+   :okwarning:
 
    serialized = pa.serialize(data)
    components = serialized.to_components()
@@ -316,27 +307,10 @@ An object can be reconstructed from its component-based representation using
 ``deserialize_components``:
 
 .. ipython:: python
+   :okwarning:
 
    restored_data = pa.deserialize_components(components)
    restored_data[0]
 
 ``deserialize_components`` is also available as a method on
 ``SerializationContext`` objects.
-
-Serializing pandas Objects
---------------------------
-
-The default serialization context has optimized handling of pandas
-objects like ``DataFrame`` and ``Series``. Combined with component-based
-serialization above, this enables zero-copy transport of pandas DataFrame
-objects not containing any Python objects:
-
-.. ipython:: python
-
-   import pandas as pd
-   df = pd.DataFrame({'a': [1, 2, 3, 4, 5]})
-   context = pa.default_serialization_context()
-   serialized_df = context.serialize(df)
-   df_components = serialized_df.to_components()
-   original_df = context.deserialize_components(df_components)
-   original_df

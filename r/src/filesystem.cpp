@@ -23,8 +23,26 @@
 #include <arrow/filesystem/localfs.h>
 
 namespace fs = ::arrow::fs;
+namespace io = ::arrow::io;
 
-// FileInfo
+namespace cpp11 {
+
+const char* r6_class_name<fs::FileSystem>::get(
+    const std::shared_ptr<fs::FileSystem>& file_system) {
+  auto type_name = file_system->type_name();
+
+  if (type_name == "local") {
+    return "LocalFileSystem";
+  } else if (type_name == "s3") {
+    return "S3FileSystem";
+  } else if (type_name == "subtree") {
+    return "SubTreeFileSystem";
+  } else {
+    return "FileSystem";
+  }
+}
+
+}  // namespace cpp11
 
 // [[arrow::export]]
 fs::FileType fs___FileInfo__type(const std::shared_ptr<fs::FileInfo>& x) {
@@ -123,19 +141,20 @@ std::vector<std::shared_ptr<T>> shared_ptr_vector(const std::vector<T>& vec) {
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<fs::FileInfo>> fs___FileSystem__GetTargetInfos_Paths(
+cpp11::list fs___FileSystem__GetTargetInfos_Paths(
     const std::shared_ptr<fs::FileSystem>& file_system,
     const std::vector<std::string>& paths) {
   auto results = ValueOrStop(file_system->GetFileInfo(paths));
-  return shared_ptr_vector(results);
+  return arrow::r::to_r_list(shared_ptr_vector(results));
 }
 
 // [[arrow::export]]
-std::vector<std::shared_ptr<fs::FileInfo>> fs___FileSystem__GetTargetInfos_FileSelector(
+cpp11::list fs___FileSystem__GetTargetInfos_FileSelector(
     const std::shared_ptr<fs::FileSystem>& file_system,
     const std::shared_ptr<fs::FileSelector>& selector) {
   auto results = ValueOrStop(file_system->GetFileInfo(*selector));
-  return shared_ptr_vector(results);
+
+  return arrow::r::to_r_list(shared_ptr_vector(results));
 }
 
 // [[arrow::export]]
@@ -212,7 +231,9 @@ std::string fs___FileSystem__type_name(
 
 // [[arrow::export]]
 std::shared_ptr<fs::LocalFileSystem> fs___LocalFileSystem__create() {
-  return std::make_shared<fs::LocalFileSystem>();
+  // Affects OpenInputFile/OpenInputStream
+  auto io_context = arrow::io::IOContext(gc_memory_pool());
+  return std::make_shared<fs::LocalFileSystem>(io_context);
 }
 
 // [[arrow::export]]
@@ -222,12 +243,35 @@ std::shared_ptr<fs::SubTreeFileSystem> fs___SubTreeFileSystem__create(
 }
 
 // [[arrow::export]]
+std::shared_ptr<fs::FileSystem> fs___SubTreeFileSystem__base_fs(
+    const std::shared_ptr<fs::SubTreeFileSystem>& file_system) {
+  return file_system->base_fs();
+}
+
+// [[arrow::export]]
+std::string fs___SubTreeFileSystem__base_path(
+    const std::shared_ptr<fs::SubTreeFileSystem>& file_system) {
+  return file_system->base_path();
+}
+
+// [[arrow::export]]
 cpp11::writable::list fs___FileSystemFromUri(const std::string& path) {
   using cpp11::literals::operator"" _nm;
 
   std::string out_path;
-  auto file_system = ValueOrStop(fs::FileSystemFromUri(path, &out_path));
-  return cpp11::writable::list({"fs"_nm = file_system, "path"_nm = out_path});
+  return cpp11::writable::list(
+      {"fs"_nm = cpp11::to_r6(ValueOrStop(fs::FileSystemFromUri(path, &out_path))),
+       "path"_nm = out_path});
+}
+
+// [[arrow::export]]
+void fs___CopyFiles(const std::shared_ptr<fs::FileSystem>& source_fs,
+                    const std::shared_ptr<fs::FileSelector>& source_sel,
+                    const std::shared_ptr<fs::FileSystem>& destination_fs,
+                    const std::string& destination_base_dir,
+                    int64_t chunk_size = 1024 * 1024, bool use_threads = true) {
+  StopIfNotOk(fs::CopyFiles(source_fs, *source_sel, destination_fs, destination_base_dir,
+                            io::default_io_context(), chunk_size, use_threads));
 }
 
 #endif
@@ -237,12 +281,49 @@ cpp11::writable::list fs___FileSystemFromUri(const std::string& path) {
 #include <arrow/filesystem/s3fs.h>
 
 // [[s3::export]]
-void fs___EnsureS3Initialized() { StopIfNotOk(fs::EnsureS3Initialized()); }
+std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create(
+    bool anonymous = false, std::string access_key = "", std::string secret_key = "",
+    std::string session_token = "", std::string role_arn = "",
+    std::string session_name = "", std::string external_id = "", int load_frequency = 900,
+    std::string region = "", std::string endpoint_override = "", std::string scheme = "",
+    bool background_writes = true) {
+  fs::S3Options s3_opts;
+  // Handle auth (anonymous, keys, default)
+  // (validation/internal coherence handled in R)
+  if (anonymous) {
+    s3_opts = fs::S3Options::Anonymous();
+  } else if (access_key != "" && secret_key != "") {
+    s3_opts = fs::S3Options::FromAccessKey(access_key, secret_key, session_token);
+  } else if (role_arn != "") {
+    s3_opts = fs::S3Options::FromAssumeRole(role_arn, session_name, external_id,
+                                            load_frequency);
+  } else {
+    s3_opts = fs::S3Options::Defaults();
+  }
+
+  // Now handle the rest of the options
+  /// AWS region to connect to (default determined by AWS SDK)
+  if (region != "") {
+    s3_opts.region = region;
+  }
+  /// If non-empty, override region with a connect string such as "localhost:9000"
+  s3_opts.endpoint_override = endpoint_override;
+  /// S3 connection transport, default "https"
+  if (scheme != "") {
+    s3_opts.scheme = scheme;
+  }
+  /// Whether OutputStream writes will be issued in the background, without blocking
+  /// default true
+  s3_opts.background_writes = background_writes;
+
+  StopIfNotOk(fs::EnsureS3Initialized());
+  auto io_context = arrow::io::IOContext(gc_memory_pool());
+  return ValueOrStop(fs::S3FileSystem::Make(s3_opts, io_context));
+}
 
 // [[s3::export]]
-std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create() {
-  auto opts = fs::S3Options::Defaults();
-  return ValueOrStop(fs::S3FileSystem::Make(opts));
+std::string fs___S3FileSystem__region(const std::shared_ptr<fs::S3FileSystem>& fs) {
+  return fs->region();
 }
 
 #endif

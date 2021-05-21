@@ -26,11 +26,12 @@
 #include "arrow/io/caching.h"
 #include "arrow/type.h"
 #include "arrow/util/compression.h"
-#include "parquet/encryption.h"
+#include "parquet/encryption/encryption.h"
 #include "parquet/exception.h"
 #include "parquet/parquet_version.h"
 #include "parquet/platform.h"
 #include "parquet/schema.h"
+#include "parquet/type_fwd.h"
 #include "parquet/types.h"
 
 namespace parquet {
@@ -45,9 +46,7 @@ namespace parquet {
 /// Note that the 2.x format version series also introduced new serialized
 /// data page metadata and on disk data page layout. To enable this, use
 /// ParquetDataPageVersion.
-struct ParquetVersion {
-  enum type { PARQUET_1_0, PARQUET_2_0 };
-};
+struct ParquetVersion;
 
 /// Controls serialization format of data pages.  parquet-format v2.0.0
 /// introduced a new data page metadata type DataPageV2 and serialized page
@@ -617,16 +616,16 @@ class PARQUET_EXPORT ArrowReaderProperties {
   ::arrow::io::CacheOptions cache_options() const { return cache_options_; }
 
   /// Set execution context for read coalescing.
-  void set_async_context(::arrow::io::AsyncContext ctx) { async_context_ = ctx; }
+  void set_io_context(const ::arrow::io::IOContext& ctx) { io_context_ = ctx; }
 
-  ::arrow::io::AsyncContext async_context() const { return async_context_; }
+  const ::arrow::io::IOContext& io_context() const { return io_context_; }
 
  private:
   bool use_threads_;
   std::unordered_set<int> read_dict_indices_;
   int64_t batch_size_;
   bool pre_buffer_;
-  ::arrow::io::AsyncContext async_context_;
+  ::arrow::io::IOContext io_context_;
   ::arrow::io::CacheOptions cache_options_;
 };
 

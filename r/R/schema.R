@@ -50,6 +50,31 @@
 #' - `$metadata`: returns the key-value metadata as a named list.
 #'    Modify or replace by assigning in (`sch$metadata <- new_metadata`).
 #'    All list elements are coerced to string.
+#'
+#' @section R Metadata:
+#'
+#'   When converting a data.frame to an Arrow Table or RecordBatch, attributes
+#'   from the `data.frame` are saved alongside tables so that the object can be
+#'   reconstructed faithfully in R (e.g. with `as.data.frame()`). This metadata
+#'   can be both at the top-level of the `data.frame` (e.g. `attributes(df)`) or
+#'   at the column (e.g. `attributes(df$col_a)`) or for list columns only:
+#'   element level (e.g. `attributes(df[1, "col_a"])`). For example, this allows
+#'   for storing `haven` columns in a table and being able to faithfully
+#'   re-create them when pulled back into R. This metadata is separate from the
+#'   schema (column names and types) which is compatible with other Arrow
+#'   clients. The R metadata is only read by R and is ignored by other clients
+#'   (e.g. Pandas has its own custom metadata). This metadata is stored in
+#'   `$metadata$r`.
+#'
+#'   Since Schema metadata keys and values must be strings, this metadata is
+#'   saved by serializing R's attribute list structure to a string. If the
+#'   serialized metadata exceeds 100Kb in size, by default it is compressed
+#'   starting in version 3.0.0. To disable this compression (e.g. for tables
+#'   that are compatible with Arrow versions before 3.0.0 and include large
+#'   amounts of metadata), set the option `arrow.compress_metadata` to `FALSE`.
+#'   Files with compressed metadata are readable by older versions of arrow, but
+#'   the metadata is dropped.
+#'
 #' @rdname Schema
 #' @name Schema
 #' @examples
@@ -71,12 +96,21 @@ Schema <- R6Class("Schema",
       }
       fields
     },
-    field = function(i) shared_ptr(Field, Schema__field(self, i)),
-    GetFieldByName = function(x) shared_ptr(Field, Schema__GetFieldByName(self, x)),
+    field = function(i) Schema__field(self, i),
+    GetFieldByName = function(x) Schema__GetFieldByName(self, x),
+    AddField = function(i, field) {
+      assert_is(field, "Field")
+      Schema__AddField(self, i, field)
+    },
+    SetField = function(i, field) {
+      assert_is(field, "Field")
+      Schema__SetField(self, i, field)
+    },
+    RemoveField = function(i) Schema__RemoveField(self, i),
     serialize = function() Schema__serialize(self),
     WithMetadata = function(metadata = NULL) {
       metadata <- prepare_key_value_metadata(metadata)
-      shared_ptr(Schema, Schema__WithMetadata(self, metadata))
+      Schema__WithMetadata(self, metadata)
     },
     Equals = function(other, check_metadata = FALSE, ...) {
       inherits(other, "Schema") && Schema__Equals(self, other, isTRUE(check_metadata))
@@ -87,7 +121,7 @@ Schema <- R6Class("Schema",
       Schema__field_names(self)
     },
     num_fields = function() Schema__num_fields(self),
-    fields = function() map(Schema__fields(self), shared_ptr, class = Field),
+    fields = function() Schema__fields(self),
     HasMetadata = function() Schema__HasMetadata(self),
     metadata = function(new_metadata) {
       if (missing(new_metadata)) {
@@ -103,7 +137,7 @@ Schema <- R6Class("Schema",
     }
   )
 )
-Schema$create <- function(...) shared_ptr(Schema, schema_(.fields(list2(...))))
+Schema$create <- function(...) schema_(.fields(list2(...)))
 
 prepare_key_value_metadata <- function(metadata) {
   # key-value-metadata must be a named character vector;
@@ -149,6 +183,47 @@ length.Schema <- function(x) x$num_fields
 }
 
 #' @export
+`[[<-.Schema` <- function(x, i, value) {
+  assert_that(length(i) == 1)
+  if (is.character(i)) {
+    field_names <- names(x)
+    if (anyDuplicated(field_names)) {
+      stop("Cannot update field by name with duplicates", call. = FALSE)
+    }
+
+    # If i is character, it's the field name
+    if (!is.null(value) && !inherits(value, "Field")) {
+      value <- field(i, as_type(value, "value"))
+    }
+
+    # No match means we're adding to the end
+    i <- match(i, field_names, nomatch = length(field_names) + 1L)
+  } else {
+    assert_that(is.numeric(i), !is.na(i), i > 0)
+    # If i is numeric and we have a type,
+    # we need to grab the existing field name for the new one
+    if (!is.null(value) && !inherits(value, "Field")) {
+      value <- field(names(x)[i], as_type(value, "value"))
+    }
+  }
+
+  i <- as.integer(i - 1L)
+  if (i >= length(x)) {
+    if (!is.null(value)) {
+      x <- x$AddField(i, value)
+    }
+  } else if (is.null(value)) {
+    x <- x$RemoveField(i)
+  } else {
+    x <- x$SetField(i, value)
+  }
+  x
+}
+
+#' @export
+`$<-.Schema` <- `$<-.ArrowTabular`
+
+#' @export
 `[.Schema` <- function(x, i, ...) {
   if (is.logical(i)) {
     i <- rep_len(i, length(x)) # For R recycling behavior
@@ -169,7 +244,7 @@ length.Schema <- function(x) x$num_fields
       call. = FALSE
     )
   }
-  shared_ptr(Schema, schema_(fields))
+  schema_(fields)
 }
 
 #' @export
@@ -182,6 +257,9 @@ length.Schema <- function(x) x$num_fields
   }
 }
 
+#' @export
+as.list.Schema <- function(x, ...) x$fields
+
 #' read a Schema from a stream
 #'
 #' @param stream a `Message`, `InputStream`, or `Buffer`
@@ -190,13 +268,13 @@ length.Schema <- function(x) x$num_fields
 #' @export
 read_schema <- function(stream, ...) {
   if (inherits(stream, "Message")) {
-    return(shared_ptr(Schema, ipc___ReadSchema_Message(stream)))
+    return(ipc___ReadSchema_Message(stream))
   } else {
     if (!inherits(stream, "InputStream")) {
       stream <- BufferReader$create(stream)
       on.exit(stream$close())
     }
-    return(shared_ptr(Schema, ipc___ReadSchema_InputStream(stream)))
+    return(ipc___ReadSchema_InputStream(stream))
   }
 }
 
@@ -213,7 +291,7 @@ read_schema <- function(stream, ...) {
 #' unify_schemas(a, z)
 #' }
 unify_schemas <- function(..., schemas = list(...)) {
-  shared_ptr(Schema, arrow__UnifySchemas(schemas))
+  arrow__UnifySchemas(schemas)
 }
 
 #' @export

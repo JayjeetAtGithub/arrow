@@ -53,11 +53,10 @@
 #'
 #' - `$column(i)`: Extract a `ChunkedArray` by integer position from the table
 #' - `$ColumnNames()`: Get all column names (called by `names(tab)`)
+#' - `$RenameColumns(value)`: Set all column names (called by `names(tab) <- value`)
 #' - `$GetColumnByName(name)`: Extract a `ChunkedArray` by string name
 #' - `$field(i)`: Extract a `Field` from the table schema by integer position
-#' - `$select(spec)`: Return a new table with a selection of columns.
-#'    This supports the usual `character`, `numeric`, and `logical` selection
-#'    methods as well as "tidy select" expressions.
+#' - `$SelectColumns(indices)`: Return new `Table` with specified columns, expressed as 0-based integers.
 #' - `$Slice(offset, length = NULL)`: Create a zero-copy view starting at the
 #'    indicated integer offset and going for the given length, or to the end
 #'    of the table if `NULL`, the default.
@@ -66,6 +65,11 @@
 #'    coerced to an R vector before taking.
 #' - `$Filter(i, keep_na = TRUE)`: return an `Table` with rows at positions where logical
 #'    vector or Arrow boolean-type `(Chunked)Array` `i` is `TRUE`.
+#' - `$SortIndices(names, descending = FALSE)`: return an `Array` of integer row
+#'    positions that can be used to rearrange the `Table` in ascending or descending
+#'    order by the first named column, breaking ties with further named columns.
+#'    `descending` can be a logical vector of length one or of the same length as
+#'    `names`.
 #' - `$serialize(output_stream, ...)`: Write the table to the given
 #'    [OutputStream]
 #' - `$cast(target_schema, safe = TRUE, options = cast_options(safe))`: Alter
@@ -77,7 +81,7 @@
 #' - `$schema`
 #' - `$metadata`: Returns the key-value metadata of the `Schema` as a named list.
 #'    Modify or replace by assigning in (`tab$metadata <- new_metadata`).
-#'    All list elements are coerced to string.
+#'    All list elements are coerced to string. See `schema()` for more information.
 #' - `$columns`: Returns a list of `ChunkedArray`s
 #' @rdname Table
 #' @name Table
@@ -92,81 +96,53 @@
 #' as.data.frame(tab[4:8, c("gear", "hp", "wt")])
 #' }
 #' @export
-Table <- R6Class("Table", inherit = ArrowObject,
+Table <- R6Class("Table", inherit = ArrowTabular,
   public = list(
-    column = function(i) {
-      shared_ptr(ChunkedArray, Table__column(self, i))
-    },
+    column = function(i) Table__column(self, i),
     ColumnNames = function() Table__ColumnNames(self),
+    RenameColumns = function(value) Table__RenameColumns(self, value),
     GetColumnByName = function(name) {
       assert_is(name, "character")
       assert_that(length(name) == 1)
-      shared_ptr(ChunkedArray, Table__GetColumnByName(self, name))
+      Table__GetColumnByName(self, name)
     },
-    field = function(i) shared_ptr(Field, Table__field(self, i)),
-
+    RemoveColumn = function(i) Table__RemoveColumn(self, i),
+    AddColumn = function(i, new_field, value) Table__AddColumn(self, i, new_field, value),
+    SetColumn = function(i, new_field, value) Table__SetColumn(self, i, new_field, value),
+    field = function(i) Table__field(self, i),
     serialize = function(output_stream, ...) write_table(self, output_stream, ...),
-    ToString = function() ToString_tabular(self),
-
-    cast = function(target_schema, safe = TRUE, options = cast_options(safe)) {
+    to_data_frame = function() {
+      Table__to_dataframe(self, use_threads = option_use_threads())
+    },
+    cast = function(target_schema, safe = TRUE, ..., options = cast_options(safe, ...)) {
       assert_is(target_schema, "Schema")
-      assert_is(options, "CastOptions")
       assert_that(identical(self$schema$names, target_schema$names), msg = "incompatible schemas")
-      shared_ptr(Table, Table__cast(self, target_schema, options))
+      Table__cast(self, target_schema, options)
     },
-
-    select = function(spec) {
-      spec <- enquo(spec)
-      if (quo_is_null(spec)) {
-        self
-      } else {
-        all_vars <- self$ColumnNames()
-        vars <- vars_select(all_vars, !!spec)
-        indices <- match(vars, all_vars)
-        shared_ptr(Table, Table__select(self, indices))
-      }
-    },
-
+    SelectColumns = function(indices) Table__SelectColumns(self, indices),
     Slice = function(offset, length = NULL) {
       if (is.null(length)) {
-        shared_ptr(Table, Table__Slice1(self, offset))
+        Table__Slice1(self, offset)
       } else {
-        shared_ptr(Table, Table__Slice2(self, offset, length))
+        Table__Slice2(self, offset, length)
       }
     },
-    Take = function(i) {
-      if (is.numeric(i)) {
-        i <- as.integer(i)
-      }
-      if (is.integer(i)) {
-        i <- Array$create(i)
-      }
-      shared_ptr(Table, call_function("take", self, i))
-    },
-    Filter = function(i, keep_na = TRUE) {
-      if (is.logical(i)) {
-        i <- Array$create(i)
-      }
-      shared_ptr(Table, call_function("filter", self, i, options = list(keep_na = keep_na)))
-    },
-
+    # Take, Filter, and SortIndices are methods on ArrowTabular
     Equals = function(other, check_metadata = FALSE, ...) {
       inherits(other, "Table") && Table__Equals(self, other, isTRUE(check_metadata))
     },
-
-    Validate = function() {
-      Table__Validate(self)
-    },
-
-    ValidateFull = function() {
-      Table__ValidateFull(self)
+    Validate = function() Table__Validate(self),
+    ValidateFull = function() Table__ValidateFull(self),
+    invalidate = function() {
+      .Call(`_arrow_Table__Reset`, self)
+      super$invalidate()
     }
   ),
 
   active = list(
     num_columns = function() Table__num_columns(self),
     num_rows = function() Table__num_rows(self),
-    schema = function() shared_ptr(Schema, Table__schema(self)),
+    schema = function() Table__schema(self),
     metadata = function(new) {
       if (missing(new)) {
         # Get the metadata (from the schema)
@@ -177,11 +153,11 @@ Table <- R6Class("Table", inherit = ArrowObject,
         out <- Table__ReplaceSchemaMetadata(self, new)
         # ReplaceSchemaMetadata returns a new object but we're modifying in place,
         # so swap in that new C++ object pointer into our R6 object
-        self$set_pointer(out)
+        self$set_pointer(out$pointer())
         self
       }
     },
-    columns = function() map(Table__columns(self), shared_ptr, class = ChunkedArray)
+    columns = function() Table__columns(self)
   )
 )
 
@@ -192,48 +168,19 @@ Table$create <- function(..., schema = NULL) {
     names(dots) <- rep_len("", length(dots))
   }
   stopifnot(length(dots) > 0)
+  
+  # Preserve any grouping
+  if (length(dots) == 1 && inherits(dots[[1]], "grouped_df")) {
+    out <- Table__from_dots(dots, schema)
+    return(dplyr::group_by(out, !!!dplyr::groups(dots[[1]])))
+  }
+  
   if (all_record_batches(dots)) {
-    shared_ptr(Table, Table__from_record_batches(dots, schema))
+    Table__from_record_batches(dots, schema)
   } else {
-    shared_ptr(Table, Table__from_dots(dots, schema))
+    Table__from_dots(dots, schema)
   }
 }
-
-#' @export
-as.data.frame.Table <- function(x, row.names = NULL, optional = FALSE, ...) {
-  df <- Table__to_dataframe(x, use_threads = option_use_threads())
-  if (!is.null(r_metadata <- x$metadata$r)) {
-    df <- apply_arrow_r_metadata(df, .unserialize_arrow_r_metadata(r_metadata))
-  }
-  df
-}
-
-#' @export
-as.list.Table <- as.list.RecordBatch
-
-#' @export
-row.names.Table <- row.names.RecordBatch
-
-#' @export
-dimnames.Table <- dimnames.RecordBatch
-
-#' @export
-dim.Table <- function(x) c(x$num_rows, x$num_columns)
 
 #' @export
 names.Table <- function(x) x$ColumnNames()
-
-#' @export
-`[.Table` <- `[.RecordBatch`
-
-#' @export
-`[[.Table` <- `[[.RecordBatch`
-
-#' @export
-`$.Table` <- `$.RecordBatch`
-
-#' @export
-head.Table <- head.RecordBatch
-
-#' @export
-tail.Table <- tail.RecordBatch

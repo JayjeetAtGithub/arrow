@@ -27,11 +27,12 @@
 #include "arrow/array.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/bitmap_reader.h"
+#include "arrow/util/bit_run_reader.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/optional.h"
 #include "arrow/util/ubsan.h"
+#include "arrow/visitor_inline.h"
 #include "parquet/encoding.h"
 #include "parquet/exception.h"
 #include "parquet/platform.h"
@@ -42,9 +43,13 @@ using arrow::MemoryPool;
 using arrow::internal::checked_cast;
 
 namespace parquet {
+namespace {
 
 // ----------------------------------------------------------------------
 // Comparator implementations
+
+constexpr int value_length(int value_length, const ByteArray& value) { return value.len; }
+constexpr int value_length(int type_length, const FLBA& value) { return type_length; }
 
 template <typename DType, bool is_signed>
 struct CompareHelper {
@@ -56,14 +61,14 @@ struct CompareHelper {
   // MSVC17 fix, isnan is not overloaded for IntegralType as per C++11
   // standard requirements.
   template <typename T1 = T>
-  static arrow::enable_if_t<std::is_floating_point<T1>::value, T> Coalesce(T val,
-                                                                           T fallback) {
+  static ::arrow::enable_if_t<std::is_floating_point<T1>::value, T> Coalesce(T val,
+                                                                             T fallback) {
     return std::isnan(val) ? fallback : val;
   }
 
   template <typename T1 = T>
-  static arrow::enable_if_t<!std::is_floating_point<T1>::value, T> Coalesce(T val,
-                                                                            T fallback) {
+  static ::arrow::enable_if_t<!std::is_floating_point<T1>::value, T> Coalesce(
+      T val, T fallback) {
     return val;
   }
 
@@ -83,7 +88,7 @@ struct UnsignedCompareHelperBase {
   static T Coalesce(T val, T fallback) { return val; }
 
   static inline bool Compare(int type_length, T a, T b) {
-    return arrow::util::SafeCopy<UCType>(a) < arrow::util::SafeCopy<UCType>(b);
+    return ::arrow::util::SafeCopy<UCType>(a) < ::arrow::util::SafeCopy<UCType>(b);
   }
 
   static T Min(int type_length, T a, T b) { return Compare(type_length, a, b) ? a : b; }
@@ -117,8 +122,8 @@ struct CompareHelper<Int96Type, is_signed> {
     if (a.value[2] != b.value[2]) {
       // Only the MSB bit is by Signed comparison. For little-endian, this is the
       // last bit of Int96 type.
-      return arrow::util::SafeCopy<msb_type>(a.value[2]) <
-             arrow::util::SafeCopy<msb_type>(b.value[2]);
+      return ::arrow::util::SafeCopy<msb_type>(a.value[2]) <
+             ::arrow::util::SafeCopy<msb_type>(b.value[2]);
     } else if (a.value[1] != b.value[1]) {
       return (a.value[1] < b.value[1]);
     }
@@ -131,56 +136,110 @@ struct CompareHelper<Int96Type, is_signed> {
   static T Max(int type_length, const T& a, const T& b) {
     return Compare(0, a, b) ? b : a;
   }
-};  // namespace parquet
+};
 
-template <typename DType, bool is_signed>
-struct ByteLikeCompareHelperBase {
-  using T = ByteArrayType::c_type;
-  using PtrType = typename std::conditional<is_signed, int8_t, uint8_t>::type;
+template <typename T, bool is_signed>
+struct BinaryLikeComparer {};
 
-  static T DefaultMin() { return {}; }
-  static T DefaultMax() { return {}; }
-  static T Coalesce(T val, T fallback) { return val; }
-
-  static inline bool Compare(int type_length, const T& a, const T& b) {
-    const auto* aptr = reinterpret_cast<const PtrType*>(a.ptr);
-    const auto* bptr = reinterpret_cast<const PtrType*>(b.ptr);
-    return std::lexicographical_compare(aptr, aptr + a.len, bptr, bptr + b.len);
+template <typename T>
+struct BinaryLikeComparer<T, /*is_signed=*/false> {
+  static bool Compare(int type_length, const T& a, const T& b) {
+    int a_length = value_length(type_length, a);
+    int b_length = value_length(type_length, b);
+    // Unsigned comparison is used for non-numeric types so straight
+    // lexiographic comparison makes sense. (a.ptr is always unsigned)....
+    return std::lexicographical_compare(a.ptr, a.ptr + a_length, b.ptr, b.ptr + b_length);
   }
+};
 
-  static T Min(int type_length, const T& a, const T& b) {
-    if (a.ptr == nullptr) return b;
-    if (b.ptr == nullptr) return a;
-    return Compare(type_length, a, b) ? a : b;
-  }
+template <typename T>
+struct BinaryLikeComparer<T, /*is_signed=*/true> {
+  static bool Compare(int type_length, const T& a, const T& b) {
+    // Is signed is used for integers encoded as big-endian twos
+    // complement integers. (e.g. decimals).
+    int a_length = value_length(type_length, a);
+    int b_length = value_length(type_length, b);
 
-  static T Max(int type_length, const T& a, const T& b) {
-    if (a.ptr == nullptr) return b;
-    if (b.ptr == nullptr) return a;
-    return Compare(type_length, a, b) ? b : a;
+    // At least of the lengths is zero.
+    if (a_length == 0 || b_length == 0) {
+      return a_length == 0 && b_length > 0;
+    }
+
+    int8_t first_a = *a.ptr;
+    int8_t first_b = *b.ptr;
+    // We can short circuit for different signed numbers or
+    // for equal length bytes arrays that have different first bytes.
+    // The equality requirement is necessary for sign extension cases.
+    // 0xFF10 should be eqaul to 0x10 (due to big endian sign extension).
+    if ((0x80 & first_a) != (0x80 & first_b) ||
+        (a_length == b_length && first_a != first_b)) {
+      return first_a < first_b;
+    }
+    // When the lengths are unequal and the numbers are of the same
+    // sign we need to do comparison by sign extending the shorter
+    // value first, and once we get to equal sized arrays, lexicographical
+    // unsigned comparison of everything but the first byte is sufficient.
+    const uint8_t* a_start = a.ptr;
+    const uint8_t* b_start = b.ptr;
+    if (a_length != b_length) {
+      const uint8_t* lead_start = nullptr;
+      const uint8_t* lead_end = nullptr;
+      if (a_length > b_length) {
+        int lead_length = a_length - b_length;
+        lead_start = a.ptr;
+        lead_end = a.ptr + lead_length;
+        a_start += lead_length;
+      } else {
+        DCHECK_LT(a_length, b_length);
+        int lead_length = b_length - a_length;
+        lead_start = b.ptr;
+        lead_end = b.ptr + lead_length;
+        b_start += lead_length;
+      }
+      // Compare extra bytes to the sign extension of the first
+      // byte of the other number.
+      uint8_t extension = first_a < 0 ? 0xFF : 0;
+      bool not_equal = std::any_of(lead_start, lead_end,
+                                   [extension](uint8_t a) { return extension != a; });
+      if (not_equal) {
+        // Since sign extension are extrema values for unsigned bytes:
+        //
+        // Four cases exist:
+        //    negative values:
+        //      b is the longer value.
+        //        b must be the lesser value: return false
+        //      else:
+        //        a must be the lesser value: return true
+        //
+        //    positive values:
+        //      b  is the longer value.
+        //        values in b must be greater than a: return true
+        //      else:
+        //        values in a must be greater than b: return false
+        bool negative_values = first_a < 0;
+        bool b_longer = a_length < b_length;
+        return negative_values != b_longer;
+      }
+    } else {
+      a_start++;
+      b_start++;
+    }
+    return std::lexicographical_compare(a_start, a.ptr + a_length, b_start,
+                                        b.ptr + b_length);
   }
 };
 
 template <typename DType, bool is_signed>
 struct BinaryLikeCompareHelperBase {
   using T = typename DType::c_type;
-  using PtrType = typename std::conditional<is_signed, int8_t, uint8_t>::type;
 
   static T DefaultMin() { return {}; }
   static T DefaultMax() { return {}; }
   static T Coalesce(T val, T fallback) { return val; }
 
-  static int value_length(int value_length, const ByteArray& value) { return value.len; }
-
-  static int value_length(int type_length, const FLBA& value) { return type_length; }
-
   static inline bool Compare(int type_length, const T& a, const T& b) {
-    const auto* aptr = reinterpret_cast<const PtrType*>(a.ptr);
-    const auto* bptr = reinterpret_cast<const PtrType*>(b.ptr);
-    return std::lexicographical_compare(aptr, aptr + value_length(type_length, a), bptr,
-                                        bptr + value_length(type_length, b));
+    return BinaryLikeComparer<T, is_signed>::Compare(type_length, a, b);
   }
-
   static T Min(int type_length, const T& a, const T& b) {
     if (a.ptr == nullptr) return b;
     if (b.ptr == nullptr) return a;
@@ -223,11 +282,11 @@ CleanStatistic(std::pair<T, T> min_max) {
 
   // Ignore if one of the value is nan.
   if (std::isnan(min) || std::isnan(max)) {
-    return nonstd::nullopt;
+    return ::arrow::util::nullopt;
   }
 
   if (min == std::numeric_limits<T>::max() && max == std::numeric_limits<T>::lowest()) {
-    return nonstd::nullopt;
+    return ::arrow::util::nullopt;
   }
 
   T zero{};
@@ -245,7 +304,7 @@ CleanStatistic(std::pair<T, T> min_max) {
 
 optional<std::pair<FLBA, FLBA>> CleanStatistic(std::pair<FLBA, FLBA> min_max) {
   if (min_max.first.ptr == nullptr || min_max.second.ptr == nullptr) {
-    return nonstd::nullopt;
+    return ::arrow::util::nullopt;
   }
   return min_max;
 }
@@ -253,7 +312,7 @@ optional<std::pair<FLBA, FLBA>> CleanStatistic(std::pair<FLBA, FLBA> min_max) {
 optional<std::pair<ByteArray, ByteArray>> CleanStatistic(
     std::pair<ByteArray, ByteArray> min_max) {
   if (min_max.first.ptr == nullptr || min_max.second.ptr == nullptr) {
-    return nonstd::nullopt;
+    return ::arrow::util::nullopt;
   }
   return min_max;
 }
@@ -295,14 +354,16 @@ class TypedComparatorImpl : virtual public TypedComparator<DType> {
     T min = Helper::DefaultMin();
     T max = Helper::DefaultMax();
 
-    ::arrow::internal::BitmapReader reader(valid_bits, valid_bits_offset, length);
-    for (int64_t i = 0; i < length; i++, reader.Next()) {
-      if (reader.IsSet()) {
-        auto val = values[i];
-        min = Helper::Min(type_length_, min, Helper::Coalesce(val, Helper::DefaultMin()));
-        max = Helper::Max(type_length_, max, Helper::Coalesce(val, Helper::DefaultMax()));
-      }
-    }
+    ::arrow::internal::VisitSetBitRunsVoid(
+        valid_bits, valid_bits_offset, length, [&](int64_t position, int64_t length) {
+          for (int64_t i = 0; i < length; i++) {
+            const auto val = values[i + position];
+            min = Helper::Min(type_length_, min,
+                              Helper::Coalesce(val, Helper::DefaultMin()));
+            max = Helper::Max(type_length_, max,
+                              Helper::Coalesce(val, Helper::DefaultMax()));
+          }
+        });
 
     return {min, max};
   }
@@ -323,35 +384,25 @@ template <bool is_signed>
 std::pair<ByteArray, ByteArray> GetMinMaxBinaryHelper(
     const TypedComparatorImpl<is_signed, ByteArrayType>& comparator,
     const ::arrow::Array& values) {
-  const auto& data = checked_cast<const ::arrow::BinaryArray&>(values);
+  using Helper = CompareHelper<ByteArrayType, is_signed>;
 
-  ByteArray min, max;
-  if (data.null_count() > 0) {
-    ::arrow::internal::BitmapReader reader(data.null_bitmap_data(), data.offset(),
-                                           data.length());
-    int64_t i = 0;
-    while (!reader.IsSet()) {
-      ++i;
-      reader.Next();
-    }
+  ByteArray min = Helper::DefaultMin();
+  ByteArray max = Helper::DefaultMax();
+  constexpr int type_length = -1;
 
-    min = data.GetView(i);
-    max = data.GetView(i);
-    for (; i < data.length(); i++, reader.Next()) {
-      ByteArray val = data.GetView(i);
-      if (reader.IsSet()) {
-        min = comparator.CompareInline(val, min) ? val : min;
-        max = comparator.CompareInline(max, val) ? val : max;
-      }
-    }
+  const auto valid_func = [&](ByteArray val) {
+    min = Helper::Min(type_length, val, min);
+    max = Helper::Max(type_length, val, max);
+  };
+  const auto null_func = [&]() {};
+
+  if (::arrow::is_binary_like(values.type_id())) {
+    ::arrow::VisitArrayDataInline<::arrow::BinaryType>(
+        *values.data(), std::move(valid_func), std::move(null_func));
   } else {
-    min = data.GetView(0);
-    max = data.GetView(0);
-    for (int64_t i = 0; i < data.length(); i++) {
-      ByteArray val = data.GetView(i);
-      min = comparator.CompareInline(val, min) ? val : min;
-      max = comparator.CompareInline(max, val) ? val : max;
-    }
+    DCHECK(::arrow::is_large_binary_like(values.type_id()));
+    ::arrow::VisitArrayDataInline<::arrow::LargeBinaryType>(
+        *values.data(), std::move(valid_func), std::move(null_func));
   }
 
   return {min, max};
@@ -369,55 +420,6 @@ std::pair<ByteArray, ByteArray> TypedComparatorImpl<false, ByteArrayType>::GetMi
   return GetMinMaxBinaryHelper<false>(*this, values);
 }
 
-std::shared_ptr<Comparator> Comparator::Make(Type::type physical_type,
-                                             SortOrder::type sort_order,
-                                             int type_length) {
-  if (SortOrder::SIGNED == sort_order) {
-    switch (physical_type) {
-      case Type::BOOLEAN:
-        return std::make_shared<TypedComparatorImpl<true, BooleanType>>();
-      case Type::INT32:
-        return std::make_shared<TypedComparatorImpl<true, Int32Type>>();
-      case Type::INT64:
-        return std::make_shared<TypedComparatorImpl<true, Int64Type>>();
-      case Type::INT96:
-        return std::make_shared<TypedComparatorImpl<true, Int96Type>>();
-      case Type::FLOAT:
-        return std::make_shared<TypedComparatorImpl<true, FloatType>>();
-      case Type::DOUBLE:
-        return std::make_shared<TypedComparatorImpl<true, DoubleType>>();
-      case Type::BYTE_ARRAY:
-        return std::make_shared<TypedComparatorImpl<true, ByteArrayType>>();
-      case Type::FIXED_LEN_BYTE_ARRAY:
-        return std::make_shared<TypedComparatorImpl<true, FLBAType>>(type_length);
-      default:
-        ParquetException::NYI("Signed Compare not implemented");
-    }
-  } else if (SortOrder::UNSIGNED == sort_order) {
-    switch (physical_type) {
-      case Type::INT32:
-        return std::make_shared<TypedComparatorImpl<false, Int32Type>>();
-      case Type::INT64:
-        return std::make_shared<TypedComparatorImpl<false, Int64Type>>();
-      case Type::INT96:
-        return std::make_shared<TypedComparatorImpl<false, Int96Type>>();
-      case Type::BYTE_ARRAY:
-        return std::make_shared<TypedComparatorImpl<false, ByteArrayType>>();
-      case Type::FIXED_LEN_BYTE_ARRAY:
-        return std::make_shared<TypedComparatorImpl<false, FLBAType>>(type_length);
-      default:
-        ParquetException::NYI("Unsigned Compare not implemented");
-    }
-  } else {
-    throw ParquetException("UNKNOWN Sort Order");
-  }
-  return nullptr;
-}
-
-std::shared_ptr<Comparator> Comparator::Make(const ColumnDescriptor* descr) {
-  return Make(descr->physical_type(), descr->sort_order(), descr->type_length());
-}
-
 template <typename DType>
 class TypedStatisticsImpl : public TypedStatistics<DType> {
  public:
@@ -431,6 +433,8 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
     auto comp = Comparator::Make(descr);
     comparator_ = std::static_pointer_cast<TypedComparator<DType>>(comp);
     Reset();
+    has_null_count_ = true;
+    has_distinct_count_ = true;
   }
 
   TypedStatisticsImpl(const T& min, const T& max, int64_t num_values, int64_t null_count,
@@ -450,11 +454,15 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
   TypedStatisticsImpl(const ColumnDescriptor* descr, const std::string& encoded_min,
                       const std::string& encoded_max, int64_t num_values,
                       int64_t null_count, int64_t distinct_count, bool has_min_max,
-                      MemoryPool* pool)
+                      bool has_null_count, bool has_distinct_count, MemoryPool* pool)
       : TypedStatisticsImpl(descr, pool) {
     IncrementNumValues(num_values);
-    IncrementNullCount(null_count);
-    IncrementDistinctCount(distinct_count);
+    if (has_null_count_) {
+      IncrementNullCount(null_count);
+    }
+    if (has_distinct_count) {
+      IncrementDistinctCount(distinct_count);
+    }
 
     if (!encoded_min.empty()) {
       PlainDecode(encoded_min, &min_);
@@ -465,11 +473,29 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
     has_min_max_ = has_min_max;
   }
 
+  bool HasDistinctCount() const override { return has_distinct_count_; };
   bool HasMinMax() const override { return has_min_max_; }
+  bool HasNullCount() const override { return has_null_count_; };
+
+  bool Equals(const Statistics& raw_other) const override {
+    if (physical_type() != raw_other.physical_type()) return false;
+
+    const auto& other = checked_cast<const TypedStatisticsImpl&>(raw_other);
+
+    if (has_min_max_ != other.has_min_max_) return false;
+
+    return (has_min_max_ && MinMaxEqual(other)) && null_count() == other.null_count() &&
+           distinct_count() == other.distinct_count() &&
+           num_values() == other.num_values();
+  }
+
+  bool MinMaxEqual(const TypedStatisticsImpl& other) const;
 
   void Reset() override {
     ResetCounts();
     has_min_max_ = false;
+    has_distinct_count_ = false;
+    has_null_count_ = false;
   }
 
   void SetMinMax(const T& arg_min, const T& arg_max) override {
@@ -477,9 +503,16 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
   }
 
   void Merge(const TypedStatistics<DType>& other) override {
-    this->MergeCounts(other);
-    if (!other.HasMinMax()) return;
-    SetMinMax(other.min(), other.max());
+    this->num_values_ += other.num_values();
+    if (other.HasNullCount()) {
+      this->statistics_.null_count += other.null_count();
+    }
+    if (other.HasDistinctCount()) {
+      this->statistics_.distinct_count += other.distinct_count();
+    }
+    if (other.HasMinMax()) {
+      SetMinMax(other.min(), other.max());
+    }
   }
 
   void Update(const T* values, int64_t num_not_null, int64_t num_null) override;
@@ -523,7 +556,9 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
       s.set_min(this->EncodeMin());
       s.set_max(this->EncodeMax());
     }
-    s.set_null_count(this->null_count());
+    if (HasNullCount()) {
+      s.set_null_count(this->null_count());
+    }
     return s;
   }
 
@@ -534,6 +569,8 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
  private:
   const ColumnDescriptor* descr_;
   bool has_min_max_ = false;
+  bool has_null_count_ = false;
+  bool has_distinct_count_ = false;
   T min_;
   T max_;
   ::arrow::MemoryPool* pool_;
@@ -547,16 +584,16 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
 
   void Copy(const T& src, T* dst, ResizableBuffer*) { *dst = src; }
 
-  void IncrementNullCount(int64_t n) { statistics_.null_count += n; }
+  void IncrementNullCount(int64_t n) {
+    statistics_.null_count += n;
+    has_null_count_ = true;
+  }
 
   void IncrementNumValues(int64_t n) { num_values_ += n; }
 
-  void IncrementDistinctCount(int64_t n) { statistics_.distinct_count += n; }
-
-  void MergeCounts(const Statistics& other) {
-    this->statistics_.null_count += other.null_count();
-    this->statistics_.distinct_count += other.distinct_count();
-    this->num_values_ += other.num_values();
+  void IncrementDistinctCount(int64_t n) {
+    statistics_.distinct_count += n;
+    has_distinct_count_ = true;
   }
 
   void ResetCounts() {
@@ -583,6 +620,20 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
     }
   }
 };
+
+template <>
+inline bool TypedStatisticsImpl<FLBAType>::MinMaxEqual(
+    const TypedStatisticsImpl<FLBAType>& other) const {
+  uint32_t len = descr_->type_length();
+  return std::memcmp(min_.ptr, other.min_.ptr, len) == 0 &&
+         std::memcmp(max_.ptr, other.max_.ptr, len) == 0;
+}
+
+template <typename DType>
+bool TypedStatisticsImpl<DType>::MinMaxEqual(
+    const TypedStatisticsImpl<DType>& other) const {
+  return min_ != other.min_ && max_ != other.max_;
+}
 
 template <>
 inline void TypedStatisticsImpl<FLBAType>::Copy(const FLBA& src, FLBA* dst,
@@ -663,8 +714,59 @@ void TypedStatisticsImpl<ByteArrayType>::PlainDecode(const std::string& src,
   dst->ptr = reinterpret_cast<const uint8_t*>(src.c_str());
 }
 
+}  // namespace
+
 // ----------------------------------------------------------------------
 // Public factory functions
+
+std::shared_ptr<Comparator> Comparator::Make(Type::type physical_type,
+                                             SortOrder::type sort_order,
+                                             int type_length) {
+  if (SortOrder::SIGNED == sort_order) {
+    switch (physical_type) {
+      case Type::BOOLEAN:
+        return std::make_shared<TypedComparatorImpl<true, BooleanType>>();
+      case Type::INT32:
+        return std::make_shared<TypedComparatorImpl<true, Int32Type>>();
+      case Type::INT64:
+        return std::make_shared<TypedComparatorImpl<true, Int64Type>>();
+      case Type::INT96:
+        return std::make_shared<TypedComparatorImpl<true, Int96Type>>();
+      case Type::FLOAT:
+        return std::make_shared<TypedComparatorImpl<true, FloatType>>();
+      case Type::DOUBLE:
+        return std::make_shared<TypedComparatorImpl<true, DoubleType>>();
+      case Type::BYTE_ARRAY:
+        return std::make_shared<TypedComparatorImpl<true, ByteArrayType>>();
+      case Type::FIXED_LEN_BYTE_ARRAY:
+        return std::make_shared<TypedComparatorImpl<true, FLBAType>>(type_length);
+      default:
+        ParquetException::NYI("Signed Compare not implemented");
+    }
+  } else if (SortOrder::UNSIGNED == sort_order) {
+    switch (physical_type) {
+      case Type::INT32:
+        return std::make_shared<TypedComparatorImpl<false, Int32Type>>();
+      case Type::INT64:
+        return std::make_shared<TypedComparatorImpl<false, Int64Type>>();
+      case Type::INT96:
+        return std::make_shared<TypedComparatorImpl<false, Int96Type>>();
+      case Type::BYTE_ARRAY:
+        return std::make_shared<TypedComparatorImpl<false, ByteArrayType>>();
+      case Type::FIXED_LEN_BYTE_ARRAY:
+        return std::make_shared<TypedComparatorImpl<false, FLBAType>>(type_length);
+      default:
+        ParquetException::NYI("Unsigned Compare not implemented");
+    }
+  } else {
+    throw ParquetException("UNKNOWN Sort Order");
+  }
+  return nullptr;
+}
+
+std::shared_ptr<Comparator> Comparator::Make(const ColumnDescriptor* descr) {
+  return Make(descr->physical_type(), descr->sort_order(), descr->type_length());
+}
 
 std::shared_ptr<Statistics> Statistics::Make(const ColumnDescriptor* descr,
                                              ::arrow::MemoryPool* pool) {
@@ -719,12 +821,13 @@ std::shared_ptr<Statistics> Statistics::Make(const ColumnDescriptor* descr,
                                              const std::string& encoded_max,
                                              int64_t num_values, int64_t null_count,
                                              int64_t distinct_count, bool has_min_max,
+                                             bool has_null_count, bool has_distinct_count,
                                              ::arrow::MemoryPool* pool) {
 #define MAKE_STATS(CAP_TYPE, KLASS)                                              \
   case Type::CAP_TYPE:                                                           \
     return std::make_shared<TypedStatisticsImpl<KLASS>>(                         \
         descr, encoded_min, encoded_max, num_values, null_count, distinct_count, \
-        has_min_max, pool)
+        has_min_max, has_null_count, has_distinct_count, pool)
 
   switch (descr->physical_type()) {
     MAKE_STATS(BOOLEAN, BooleanType);

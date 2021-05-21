@@ -33,6 +33,8 @@ namespace compute {
 class FunctionRegistry::FunctionRegistryImpl {
  public:
   Status AddFunction(std::shared_ptr<Function> function, bool allow_overwrite) {
+    RETURN_NOT_OK(function->Validate());
+
     std::lock_guard<std::mutex> mutation_guard(lock_);
 
     const std::string& name = function->name();
@@ -124,14 +126,19 @@ static std::unique_ptr<FunctionRegistry> CreateBuiltInRegistry() {
   RegisterScalarValidity(registry.get());
   RegisterScalarFillNull(registry.get());
 
-  // Aggregate functions
-  RegisterScalarAggregateBasic(registry.get());
-
   // Vector functions
   RegisterVectorHash(registry.get());
   RegisterVectorSelection(registry.get());
   RegisterVectorNested(registry.get());
   RegisterVectorSort(registry.get());
+
+  // Aggregate functions
+  RegisterScalarAggregateBasic(registry.get());
+  RegisterScalarAggregateMode(registry.get());
+  RegisterScalarAggregateQuantile(registry.get());
+  RegisterScalarAggregateTDigest(registry.get());
+  RegisterScalarAggregateVariance(registry.get());
+  RegisterHashAggregateBasic(registry.get());
 
   return registry;
 }

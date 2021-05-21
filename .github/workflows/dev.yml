@@ -23,15 +23,13 @@ on:
   pull_request:
 
 env:
-  DOCKER_BUILDKIT: 0
-  COMPOSE_DOCKER_CLI_BUILD: 1
   ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
   ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
 
 jobs:
 
   lint:
-    name: Lint C++, Python, R, Rust, Docker, RAT
+    name: Lint C++, Python, R, Docker, RAT
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
     steps:
@@ -59,46 +57,9 @@ jobs:
         continue-on-error: true
         run: archery docker push ubuntu-lint
 
-  docs:
-    name: Sphinx and API documentations
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Checkout Arrow
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      - name: Fetch Submodules and Tags
-        shell: bash
-        run: ci/scripts/util_checkout.sh
-      - name: Free Up Disk Space
-        shell: bash
-        run: ci/scripts/util_cleanup.sh
-      - name: Cache Docker Volumes
-        uses: actions/cache@v1
-        with:
-          path: .docker
-          key: ubuntu-18.04-${{ hashFiles('cpp/**') }}
-          restore-keys: ubuntu-18.04-
-      - name: Setup Python
-        uses: actions/setup-python@v1
-        with:
-          python-version: 3.8
-      - name: Setup Archery
-        run: pip install -e dev/archery[docker]
-      - name: Execute Docker Build
-        run: |
-          sudo sysctl -w kernel.core_pattern="core.%e.%p"
-          ulimit -c unlimited
-          archery docker run ubuntu-docs
-      - name: Docker Push
-        if: success() && github.event_name == 'push' && github.repository == 'apache/arrow'
-        continue-on-error: true
-        run: archery docker push ubuntu-docs
-
   release:
     name: Source Release and Merge Script
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
     env:
       GIT_AUTHOR_NAME: Github Actions
@@ -118,18 +79,13 @@ jobs:
         with:
           python-version: '3.6'
       - name: Install Ruby
-        uses: actions/setup-ruby@v1
+        uses: ruby/setup-ruby@v1
         with:
           ruby-version: '2.6'
       - name: Install Dependencies
         shell: bash
         run: |
-          pip install cython setuptools pytest jira
-          wget -q https://packages.microsoft.com/config/ubuntu/16.04/packages-microsoft-prod.deb
-          sudo dpkg -i packages-microsoft-prod.deb
-          sudo apt-get install apt-transport-https
-          sudo apt-get update
-          sudo apt-get install dotnet-sdk-2.2
+          pip install cython setuptools six pytest jira
       - name: Run Release Test
         shell: bash
         run: |

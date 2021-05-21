@@ -211,7 +211,7 @@ PrimitiveNode::PrimitiveNode(const std::string& name, Repetition::type repetitio
       break;
     default:
       ss << ConvertedTypeToString(converted_type);
-      ss << " can not be applied to a primitive type";
+      ss << " cannot be applied to a primitive type";
       throw ParquetException(ss.str());
   }
   // For forward compatibility, create an equivalent logical type
@@ -448,7 +448,7 @@ std::unique_ptr<Node> PrimitiveNode::FromParquet(const void* opaque_element,
                           LogicalType::FromThrift(element->logicalType),
                           LoadEnumSafe(&element->type), element->type_length, field_id));
   } else if (element->__isset.converted_type) {
-    // legacy writer with logical type present
+    // legacy writer with converted type present
     primitive_node = std::unique_ptr<PrimitiveNode>(new PrimitiveNode(
         element->name, LoadEnumSafe(&element->repetition_type),
         LoadEnumSafe(&element->type), LoadEnumSafe(&element->converted_type),
@@ -500,7 +500,16 @@ void PrimitiveNode::ToParquet(void* opaque_element) const {
   element->__set_name(name_);
   element->__set_repetition_type(ToThrift(repetition_));
   if (converted_type_ != ConvertedType::NONE) {
-    element->__set_converted_type(ToThrift(converted_type_));
+    if (converted_type_ != ConvertedType::NA) {
+      element->__set_converted_type(ToThrift(converted_type_));
+    } else {
+      // ConvertedType::NA is an unreleased, obsolete synonym for LogicalType::Null.
+      // Never emit it (see PARQUET-1990 for discussion).
+      if (!logical_type_ || !logical_type_->is_null()) {
+        throw ParquetException(
+            "ConvertedType::NA is obsolete, please use LogicalType::Null instead");
+      }
+    }
   }
   if (field_id_ >= 0) {
     element->__set_field_id(field_id_);
@@ -550,11 +559,11 @@ std::unique_ptr<Node> Unflatten(const format::SchemaElement* elements, int lengt
     int field_id = current_id++;
     const void* opaque_element = static_cast<const void*>(&element);
 
-    if (element.num_children == 0) {
-      // Leaf (primitive) node
+    if (element.num_children == 0 && element.__isset.type) {
+      // Leaf (primitive) node: always has a type
       return PrimitiveNode::FromParquet(opaque_element, field_id);
     } else {
-      // Group
+      // Group node (may have 0 children, but cannot have a type)
       NodeVector fields;
       for (int i = 0; i < element.num_children; ++i) {
         std::unique_ptr<Node> field = NextNode();

@@ -15,21 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <string>
-#include <utility>
-#include <vector>
+#include "arrow/json/parser.h"
 
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "arrow/json/options.h"
-#include "arrow/json/parser.h"
 #include "arrow/json/test_common.h"
 #include "arrow/status.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/string_view.h"
 
 namespace arrow {
+
+using internal::checked_cast;
+
 namespace json {
 
 using util::string_view;
@@ -45,7 +50,7 @@ void AssertUnconvertedArraysEqual(const Array& expected, const Array& actual) {
     case Type::DICTIONARY: {
       ASSERT_EQ(expected.type_id(), Type::STRING);
       std::shared_ptr<Array> actual_decoded;
-      ASSERT_OK(DecodeStringDictionary(static_cast<const DictionaryArray&>(actual),
+      ASSERT_OK(DecodeStringDictionary(checked_cast<const DictionaryArray&>(actual),
                                        &actual_decoded));
       return AssertArraysEqual(expected, *actual_decoded);
     }
@@ -58,14 +63,15 @@ void AssertUnconvertedArraysEqual(const Array& expected, const Array& actual) {
       const auto& expected_offsets = expected.data()->buffers[1];
       const auto& actual_offsets = actual.data()->buffers[1];
       AssertBufferEqual(*expected_offsets, *actual_offsets);
-      auto expected_values = static_cast<const ListArray&>(expected).values();
-      auto actual_values = static_cast<const ListArray&>(actual).values();
+      auto expected_values = checked_cast<const ListArray&>(expected).values();
+      auto actual_values = checked_cast<const ListArray&>(actual).values();
       return AssertUnconvertedArraysEqual(*expected_values, *actual_values);
     }
     case Type::STRUCT:
       ASSERT_EQ(expected.type_id(), Type::STRUCT);
-      return AssertUnconvertedStructArraysEqual(static_cast<const StructArray&>(expected),
-                                                static_cast<const StructArray&>(actual));
+      return AssertUnconvertedStructArraysEqual(
+          checked_cast<const StructArray&>(expected),
+          checked_cast<const StructArray&>(actual));
     default:
       FAIL();
   }
@@ -188,7 +194,7 @@ TEST(BlockParserWithSchema, Nested) {
                       field("nuf", struct_({field("ps", utf8())}))},
                      {"[\"thing\", null, \"\xe5\xbf\x8d\", null]",
                       R"([["1", "2", "3"], ["2"], [], null])",
-                      R"([{"ps":null}, null, {"ps":"78"}, {"ps":"90"}])"});
+                      R"([{"ps":null}, {}, {"ps":"78"}, {"ps":"90"}])"});
 }
 
 TEST(BlockParserWithSchema, FailOnIncompleteJson) {
@@ -217,7 +223,18 @@ TEST(BlockParser, Nested) {
                       field("nuf", struct_({field("ps", utf8())}))},
                      {"[\"thing\", null, \"\xe5\xbf\x8d\", null]",
                       R"([["1", "2", "3"], ["2"], [], null])",
-                      R"([{"ps":null}, null, {"ps":"78"}, {"ps":"90"}])"});
+                      R"([{"ps":null}, {}, {"ps":"78"}, {"ps":"90"}])"});
+}
+
+TEST(BlockParser, Null) {
+  auto options = ParseOptions::Defaults();
+  options.unexpected_field_behavior = UnexpectedFieldBehavior::InferType;
+  AssertParseColumns(
+      options, null_src(),
+      {field("plain", null()), field("list1", list(null())), field("list2", list(null())),
+       field("struct", struct_({field("plain", null())}))},
+      {"[null, null]", "[[], []]", "[[], [null]]",
+       R"([{"plain": null}, {"plain": null}])"});
 }
 
 TEST(BlockParser, AdHoc) {

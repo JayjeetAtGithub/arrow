@@ -23,7 +23,6 @@ import java.nio.charset.StandardCharsets;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.util.DataSizeRoundingUtil;
 import org.apache.arrow.vector.complex.DenseUnionVector;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
@@ -37,6 +36,7 @@ import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.util.DataSizeRoundingUtil;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -148,6 +148,30 @@ public class TestVectorReAlloc {
       vector.reAlloc();
       assertEquals(1024, vector.getValueCapacity());
       assertNull(vector.getObject(513));
+    }
+  }
+
+  @Test
+  public void testVariableWidthTypeSetNullValues() {
+    // Test ARROW-11223 bug is fixed
+    try (final BaseVariableWidthVector v1 = new VarCharVector("var1", allocator)) {
+      v1.setInitialCapacity(512);
+      v1.allocateNew();
+      int numNullValues1 = v1.getValueCapacity() + 1;
+      for (int i = 0; i < numNullValues1; i++) {
+        v1.setNull(i);
+      }
+      Assert.assertTrue(v1.getBufferSizeFor(numNullValues1) > 0);
+    }
+
+    try (final BaseLargeVariableWidthVector v2 = new LargeVarCharVector("var2", allocator)) {
+      v2.setInitialCapacity(512);
+      v2.allocateNew();
+      int numNullValues2 = v2.getValueCapacity() + 1;
+      for (int i = 0; i < numNullValues2; i++) {
+        v2.setNull(i);
+      }
+      Assert.assertTrue(v2.getBufferSizeFor(numNullValues2) > 0);
     }
   }
 

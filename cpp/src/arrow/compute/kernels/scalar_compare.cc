@@ -30,28 +30,28 @@ namespace {
 
 struct Equal {
   template <typename T>
-  static constexpr bool Call(KernelContext*, const T& left, const T& right) {
+  static constexpr bool Call(KernelContext*, const T& left, const T& right, Status*) {
     return left == right;
   }
 };
 
 struct NotEqual {
   template <typename T>
-  static constexpr bool Call(KernelContext*, const T& left, const T& right) {
+  static constexpr bool Call(KernelContext*, const T& left, const T& right, Status*) {
     return left != right;
   }
 };
 
 struct Greater {
   template <typename T>
-  static constexpr bool Call(KernelContext*, const T& left, const T& right) {
+  static constexpr bool Call(KernelContext*, const T& left, const T& right, Status*) {
     return left > right;
   }
 };
 
 struct GreaterEqual {
   template <typename T>
-  static constexpr bool Call(KernelContext*, const T& left, const T& right) {
+  static constexpr bool Call(KernelContext*, const T& left, const T& right, Status*) {
     return left >= right;
   }
 };
@@ -72,9 +72,35 @@ void AddGenericCompare(const std::shared_ptr<DataType>& ty, ScalarFunction* func
                       applicator::ScalarBinaryEqualTypes<BooleanType, InType, Op>::Exec));
 }
 
+struct CompareFunction : ScalarFunction {
+  using ScalarFunction::ScalarFunction;
+
+  Result<const Kernel*> DispatchBest(std::vector<ValueDescr>* values) const override {
+    RETURN_NOT_OK(CheckArity(*values));
+
+    using arrow::compute::detail::DispatchExactImpl;
+    if (auto kernel = DispatchExactImpl(this, *values)) return kernel;
+
+    EnsureDictionaryDecoded(values);
+    ReplaceNullWithOtherType(values);
+
+    if (auto type = CommonNumeric(*values)) {
+      ReplaceTypes(type, values);
+    } else if (auto type = CommonTimestamp(*values)) {
+      ReplaceTypes(type, values);
+    } else if (auto type = CommonBinary(*values)) {
+      ReplaceTypes(type, values);
+    }
+
+    if (auto kernel = DispatchExactImpl(this, *values)) return kernel;
+    return arrow::compute::detail::NoMatchingKernel(this, *values);
+  }
+};
+
 template <typename Op>
-std::shared_ptr<ScalarFunction> MakeCompareFunction(std::string name) {
-  auto func = std::make_shared<ScalarFunction>(name, Arity::Binary());
+std::shared_ptr<ScalarFunction> MakeCompareFunction(std::string name,
+                                                    const FunctionDoc* doc) {
+  auto func = std::make_shared<CompareFunction>(name, Arity::Binary(), doc);
 
   DCHECK_OK(func->AddKernel(
       {boolean(), boolean()}, boolean(),
@@ -133,8 +159,9 @@ std::shared_ptr<ScalarFunction> MakeCompareFunction(std::string name) {
 }
 
 std::shared_ptr<ScalarFunction> MakeFlippedFunction(std::string name,
-                                                    const ScalarFunction& func) {
-  auto flipped_func = std::make_shared<ScalarFunction>(name, Arity::Binary());
+                                                    const ScalarFunction& func,
+                                                    const FunctionDoc* doc) {
+  auto flipped_func = std::make_shared<CompareFunction>(name, Arity::Binary(), doc);
   for (const ScalarKernel* kernel : func.kernels()) {
     ScalarKernel flipped_kernel = *kernel;
     flipped_kernel.exec = MakeFlippedBinaryExec(kernel->exec);
@@ -143,17 +170,45 @@ std::shared_ptr<ScalarFunction> MakeFlippedFunction(std::string name,
   return flipped_func;
 }
 
+const FunctionDoc equal_doc{"Compare values for equality (x == y)",
+                            ("A null on either side emits a null comparison result."),
+                            {"x", "y"}};
+
+const FunctionDoc not_equal_doc{"Compare values for inequality (x != y)",
+                                ("A null on either side emits a null comparison result."),
+                                {"x", "y"}};
+
+const FunctionDoc greater_doc{"Compare values for ordered inequality (x > y)",
+                              ("A null on either side emits a null comparison result."),
+                              {"x", "y"}};
+
+const FunctionDoc greater_equal_doc{
+    "Compare values for ordered inequality (x >= y)",
+    ("A null on either side emits a null comparison result."),
+    {"x", "y"}};
+
+const FunctionDoc less_doc{"Compare values for ordered inequality (x < y)",
+                           ("A null on either side emits a null comparison result."),
+                           {"x", "y"}};
+
+const FunctionDoc less_equal_doc{
+    "Compare values for ordered inequality (x <= y)",
+    ("A null on either side emits a null comparison result."),
+    {"x", "y"}};
+
 }  // namespace
 
 void RegisterScalarComparison(FunctionRegistry* registry) {
-  DCHECK_OK(registry->AddFunction(MakeCompareFunction<Equal>("equal")));
-  DCHECK_OK(registry->AddFunction(MakeCompareFunction<NotEqual>("not_equal")));
+  DCHECK_OK(registry->AddFunction(MakeCompareFunction<Equal>("equal", &equal_doc)));
+  DCHECK_OK(
+      registry->AddFunction(MakeCompareFunction<NotEqual>("not_equal", &not_equal_doc)));
 
-  auto greater = MakeCompareFunction<Greater>("greater");
-  auto greater_equal = MakeCompareFunction<GreaterEqual>("greater_equal");
+  auto greater = MakeCompareFunction<Greater>("greater", &greater_doc);
+  auto greater_equal =
+      MakeCompareFunction<GreaterEqual>("greater_equal", &greater_equal_doc);
 
-  auto less = MakeFlippedFunction("less", *greater);
-  auto less_equal = MakeFlippedFunction("less_equal", *greater_equal);
+  auto less = MakeFlippedFunction("less", *greater, &less_doc);
+  auto less_equal = MakeFlippedFunction("less_equal", *greater_equal, &less_equal_doc);
   DCHECK_OK(registry->AddFunction(std::move(less)));
   DCHECK_OK(registry->AddFunction(std::move(less_equal)));
   DCHECK_OK(registry->AddFunction(std::move(greater)));

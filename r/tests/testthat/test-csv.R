@@ -15,10 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-context("CsvTableReader")
-
 # Not all types round trip via CSV 100% identical by default
 tbl <- example_data[, c("dbl", "lgl", "false", "chr")]
+tbl_no_dates <- tbl
+# Add a date to test its parsing
+tbl$date <- Sys.Date() + 1:10
+
+csv_file <- tempfile()
 
 test_that("Can read csv file", {
   tf <- tempfile()
@@ -173,4 +176,154 @@ test_that("read_csv_arrow() can detect compression from file name", {
   write.csv(tbl, gzfile(tf), row.names = FALSE, quote = FALSE)
   tab1 <- read_csv_arrow(tf)
   expect_equivalent(tbl, tab1)
+})
+
+test_that("read_csv_arrow(schema=)", {
+  tbl <- example_data[, "int"]
+  tf <- tempfile(); on.exit(unlink(tf))
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(tf, schema = schema(int = float64()), skip = 1)
+  expect_identical(df, tibble::tibble(int = as.numeric(tbl$int)))
+})
+
+test_that("read_csv_arrow(col_types = <Schema>)", {
+  tbl <- example_data[, "int"]
+  tf <- tempfile(); on.exit(unlink(tf))
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(tf, col_types = schema(int = float64()))
+  expect_identical(df, tibble::tibble(int = as.numeric(tbl$int)))
+})
+
+test_that("read_csv_arrow(col_types=string, col_names)", {
+  tbl <- example_data[, "int"]
+  tf <- tempfile(); on.exit(unlink(tf))
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(tf, col_names = "int", col_types = "d", skip = 1)
+  expect_identical(df, tibble::tibble(int = as.numeric(tbl$int)))
+
+  expect_error(read_csv_arrow(tf, col_types = c("i", "d")))
+  expect_error(read_csv_arrow(tf, col_types = "d"))
+  expect_error(read_csv_arrow(tf, col_types = "i", col_names = c("a", "b")))
+  expect_error(read_csv_arrow(tf, col_types = "y", col_names = "a"))
+})
+
+test_that("read_csv_arrow() can read timestamps", {
+  tbl <- tibble::tibble(time = as.POSIXct("2020-07-20 16:20", tz = "UTC"))
+  tf <- tempfile(); on.exit(unlink(tf))
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(tf, col_types = schema(time = timestamp(timezone = "UTC")))
+  expect_equal(tbl, df)
+
+  df <- read_csv_arrow(tf, col_types = "t", col_names = "time", skip = 1)
+  expect_equal(tbl, df, check.tzone = FALSE) # col_types = "t" makes timezone-naive timestamp
+})
+
+test_that("read_csv_arrow(timestamp_parsers=)", {
+  tf <- tempfile(); on.exit(unlink(tf))
+  tbl <- tibble::tibble(time = "23/09/2020")
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(
+    tf,
+    col_types = schema(time = timestamp(timezone = "UTC")),
+    timestamp_parsers = "%d/%m/%Y"
+  )
+  expect_equal(df$time, as.POSIXct(tbl$time, format = "%d/%m/%Y", tz = "UTC"))
+})
+
+test_that("Skipping columns with null()", {
+  tf <- tempfile(); on.exit(unlink(tf))
+  cols <- c("dbl", "lgl", "false", "chr")
+  tbl <- example_data[, cols]
+  write.csv(tbl, tf, row.names = FALSE)
+
+  df <- read_csv_arrow(tf, col_types = "d-_c", col_names = cols, skip = 1)
+  expect_identical(df, tbl[, c("dbl", "chr")])
+})
+
+test_that("Mix of guessing and declaring types", {
+  tf <- tempfile(); on.exit(unlink(tf))
+  cols <- c("dbl", "lgl", "false", "chr")
+  tbl <- example_data[, cols]
+  write.csv(tbl, tf, row.names = FALSE)
+
+  tab <- read_csv_arrow(tf, col_types = schema(dbl = float32()), as_data_frame = FALSE)
+  expect_equal(tab$schema, schema(dbl = float32(), lgl = bool(), false = bool(), chr = utf8()))
+
+  df <- read_csv_arrow(tf, col_types = "d-?c", col_names = cols, skip = 1)
+  expect_identical(df, tbl[, c("dbl", "false", "chr")])
+})
+
+
+test_that("Write a CSV file with header", {
+  tbl_out <- write_csv_arrow(tbl_no_dates, csv_file)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out, tbl_no_dates)
+  
+  tbl_in <- read_csv_arrow(csv_file)
+  expect_identical(tbl_in, tbl_no_dates)
+  
+  skip("Doesn't yet work with date columns due to ARROW-12540")
+  
+  tbl_out <- write_csv_arrow(tbl, csv_file)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out, tbl)
+  
+  tbl_in <- read_csv_arrow(csv_file)
+  expect_identical(tbl_in, tbl)
+})
+
+
+test_that("Write a CSV file with no header", {
+  
+  tbl_out <- write_csv_arrow(tbl_no_dates, csv_file, include_header = FALSE)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out, tbl_no_dates)
+  tbl_in <- read_csv_arrow(csv_file, col_names = FALSE)
+  
+  tbl_expected <- tbl_no_dates
+  names(tbl_expected) <- c("f0", "f1", "f2", "f3")
+  
+  expect_identical(tbl_in, tbl_expected)
+  
+})
+
+test_that("Write a CSV file with different batch sizes", {
+  
+  tbl_out1 <- write_csv_arrow(tbl_no_dates, csv_file, batch_size = 1)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out1, tbl_no_dates)
+  tbl_in1 <- read_csv_arrow(csv_file)
+  expect_identical(tbl_in1, tbl_no_dates)
+  
+  tbl_out2 <- write_csv_arrow(tbl_no_dates, csv_file, batch_size = 2)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out2, tbl_no_dates)
+  tbl_in2 <- read_csv_arrow(csv_file)
+  expect_identical(tbl_in2, tbl_no_dates)
+  
+  tbl_out3 <- write_csv_arrow(tbl_no_dates, csv_file, batch_size = 12)
+  expect_true(file.exists(csv_file))
+  expect_identical(tbl_out3, tbl_no_dates)
+  tbl_in3 <- read_csv_arrow(csv_file)
+  expect_identical(tbl_in3, tbl_no_dates)
+  
+})
+
+test_that("Write a CSV file with invalid input type", {
+  expect_error(
+    write_csv_arrow(Array$create(1:5), csv_file),
+    regexp = 'x must be a "ArrowTabular"'
+    )
+})
+
+test_that("Write a CSV file with invalid batch size", {
+  expect_error(
+    write_csv_arrow(tbl_no_dates, csv_file, batch_size = -1),
+    regexp = 'batch_size not greater than 0'
+  )
 })

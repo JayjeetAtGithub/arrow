@@ -23,22 +23,16 @@ FROM ${repo}:${arch}-conda-python-${python}
 ARG jdk=8
 ARG maven=3.5
 
-# The Spark tests currently break with pandas >= 1.0
 RUN conda install -q \
-        patch \
-        pandas=0.25.3 \
         openjdk=${jdk} \
-        maven=${maven} && \
+        maven=${maven} \
+        pandas && \
     conda clean --all
 
 # installing specific version of spark
 ARG spark=master
 COPY ci/scripts/install_spark.sh /arrow/ci/scripts/
 RUN /arrow/ci/scripts/install_spark.sh ${spark} /spark
-
-# patch spark to build with current Arrow Java
-COPY ci/etc/integration_spark_ARROW-9438.patch /arrow/ci/etc/
-RUN patch -d /spark -p1 -i /arrow/ci/etc/integration_spark_ARROW-9438.patch
 
 # build cpp with tests
 ENV CC=gcc \

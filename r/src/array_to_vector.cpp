@@ -28,6 +28,8 @@
 #include <arrow/util/parallel.h>
 #include <arrow/util/task_group.h>
 
+#include <type_traits>
+
 namespace arrow {
 
 using internal::checked_cast;
@@ -86,11 +88,14 @@ class Converter {
   // for each array, add a task to the task group
   //
   // The task group is Finish() in the caller
-  void IngestParallel(SEXP data, const std::shared_ptr<arrow::internal::TaskGroup>& tg) {
+  // The converter itself is passed as `self` so that if one of the parallel ops
+  // hits `stop()`, we don't bail before `tg` is destroyed, which would cause a crash
+  void IngestParallel(SEXP data, const std::shared_ptr<arrow::internal::TaskGroup>& tg,
+                      std::shared_ptr<Converter> self) {
     R_xlen_t k = 0, i = 0;
     for (const auto& array : arrays_) {
       auto n_chunk = array->length();
-      tg->Append([=] { return IngestOne(data, array, k, n_chunk, i); });
+      tg->Append([=] { return self->IngestOne(data, array, k, n_chunk, i); });
       k += n_chunk;
       i++;
     }
@@ -288,28 +293,104 @@ struct Converter_String : public Converter {
     }
 
     StringArrayType* string_array = static_cast<StringArrayType*>(array.get());
-    if (array->null_count()) {
-      // need to watch for nulls
-      arrow::internal::BitmapReader null_reader(array->null_bitmap_data(),
-                                                array->offset(), n);
-      for (int i = 0; i < n; i++, null_reader.Next()) {
-        if (null_reader.IsSet()) {
-          SET_STRING_ELT(data, start + i, cpp11::r_string(string_array->GetString(i)));
-        } else {
-          SET_STRING_ELT(data, start + i, NA_STRING);
-        }
-      }
 
+    const bool all_valid = array->null_count() == 0;
+    const bool strip_out_nuls = GetBoolOption("arrow.skip_nul", false);
+
+    bool nul_was_stripped = false;
+
+    if (all_valid) {
+      // no need to watch for missing strings
+      cpp11::unwind_protect([&] {
+        if (strip_out_nuls) {
+          for (int i = 0; i < n; i++) {
+            SET_STRING_ELT(data, start + i,
+                           r_string_from_view_strip_nul(string_array->GetView(i),
+                                                        &nul_was_stripped));
+          }
+          return;
+        }
+
+        for (int i = 0; i < n; i++) {
+          SET_STRING_ELT(data, start + i, r_string_from_view(string_array->GetView(i)));
+        }
+      });
     } else {
-      for (int i = 0; i < n; i++) {
-        SET_STRING_ELT(data, start + i, cpp11::r_string(string_array->GetString(i)));
-      }
+      cpp11::unwind_protect([&] {
+        arrow::internal::BitmapReader validity_reader(array->null_bitmap_data(),
+                                                      array->offset(), n);
+
+        if (strip_out_nuls) {
+          for (int i = 0; i < n; i++, validity_reader.Next()) {
+            if (validity_reader.IsSet()) {
+              SET_STRING_ELT(data, start + i,
+                             r_string_from_view_strip_nul(string_array->GetView(i),
+                                                          &nul_was_stripped));
+            } else {
+              SET_STRING_ELT(data, start + i, NA_STRING);
+            }
+          }
+          return;
+        }
+
+        for (int i = 0; i < n; i++, validity_reader.Next()) {
+          if (validity_reader.IsSet()) {
+            SET_STRING_ELT(data, start + i, r_string_from_view(string_array->GetView(i)));
+          } else {
+            SET_STRING_ELT(data, start + i, NA_STRING);
+          }
+        }
+      });
+    }
+
+    if (nul_was_stripped) {
+      cpp11::warning("Stripping '\\0' (nul) from character vector");
     }
 
     return Status::OK();
   }
 
   bool Parallel() const { return false; }
+
+ private:
+  static SEXP r_string_from_view(arrow::util::string_view view) {
+    return Rf_mkCharLenCE(view.data(), view.size(), CE_UTF8);
+  }
+
+  static SEXP r_string_from_view_strip_nul(arrow::util::string_view view,
+                                           bool* nul_was_stripped) {
+    const char* old_string = view.data();
+
+    std::string stripped_string;
+    size_t stripped_len = 0, nul_count = 0;
+
+    for (size_t i = 0; i < view.size(); i++) {
+      if (old_string[i] == '\0') {
+        ++nul_count;
+
+        if (nul_count == 1) {
+          // first nul spotted: allocate stripped string storage
+          stripped_string = view.to_string();
+          stripped_len = i;
+        }
+
+        // don't copy old_string[i] (which is \0) into stripped_string
+        continue;
+      }
+
+      if (nul_count > 0) {
+        stripped_string[stripped_len++] = old_string[i];
+      }
+    }
+
+    if (nul_count > 0) {
+      *nul_was_stripped = true;
+      stripped_string.resize(stripped_len);
+      return r_string_from_view(stripped_string);
+    }
+
+    return r_string_from_view(view);
+  }
 };
 
 class Converter_Boolean : public Converter {
@@ -390,6 +471,8 @@ class Converter_Binary : public Converter {
 
     return IngestSome(array, n, ingest_one);
   }
+
+  virtual bool Parallel() const { return false; }
 };
 
 class Converter_FixedSizeBinary : public Converter {
@@ -428,6 +511,8 @@ class Converter_FixedSizeBinary : public Converter {
 
     return IngestSome(array, n, ingest_one);
   }
+
+  virtual bool Parallel() const { return false; }
 
  private:
   int byte_width_;
@@ -639,13 +724,22 @@ class Converter_Struct : public Converter {
     auto struct_array = checked_cast<const arrow::StructArray*>(array.get());
     int nf = converters.size();
     // Flatten() deals with merging of nulls
-    auto arrays = ValueOrStop(struct_array->Flatten(default_memory_pool()));
+    auto arrays = ValueOrStop(struct_array->Flatten(gc_memory_pool()));
     for (int i = 0; i < nf; i++) {
       StopIfNotOk(converters[i]->Ingest_some_nulls(VECTOR_ELT(data, i), arrays[i], start,
                                                    n, chunk_index));
     }
 
     return Status::OK();
+  }
+
+  virtual bool Parallel() const {
+    // this can only run in parallel if all the
+    // inner converters can
+    for (const auto& converter : converters) {
+      if (!converter->Parallel()) return false;
+    }
+    return true;
   }
 
  private:
@@ -805,7 +899,7 @@ class Converter_List : public Converter {
 
     // Build an empty array to match value_type
     std::unique_ptr<arrow::ArrayBuilder> builder;
-    StopIfNotOk(arrow::MakeBuilder(arrow::default_memory_pool(), value_type_, &builder));
+    StopIfNotOk(arrow::MakeBuilder(gc_memory_pool(), value_type_, &builder));
 
     std::shared_ptr<arrow::Array> array;
     StopIfNotOk(builder->Finish(&array));
@@ -856,7 +950,7 @@ class Converter_FixedSizeList : public Converter {
 
     // Build an empty array to match value_type
     std::unique_ptr<arrow::ArrayBuilder> builder;
-    StopIfNotOk(arrow::MakeBuilder(arrow::default_memory_pool(), value_type_, &builder));
+    StopIfNotOk(arrow::MakeBuilder(gc_memory_pool(), value_type_, &builder));
 
     std::shared_ptr<arrow::Array> array;
     StopIfNotOk(builder->Finish(&array));
@@ -950,14 +1044,25 @@ class Converter_Null : public Converter {
 };
 
 bool ArraysCanFitInteger(ArrayVector arrays) {
-  bool out = false;
+  bool all_can_fit = true;
   auto i32 = arrow::int32();
   for (const auto& array : arrays) {
-    if (!out) {
-      out = arrow::IntegersCanFit(arrow::Datum(array), *i32).ok();
+    if (all_can_fit) {
+      all_can_fit = arrow::IntegersCanFit(arrow::Datum(array), *i32).ok();
     }
   }
-  return out;
+  return all_can_fit;
+}
+
+bool GetBoolOption(const std::string& name, bool default_) {
+  SEXP getOption = Rf_install("getOption");
+  cpp11::sexp call = Rf_lang2(getOption, Rf_mkString(name.c_str()));
+  cpp11::sexp res = Rf_eval(call, R_BaseEnv);
+  if (TYPEOF(res) == LGLSXP) {
+    return LOGICAL(res)[0] == TRUE;
+  } else {
+    return default_;
+  }
 }
 
 std::shared_ptr<Converter> Converter::Make(const std::shared_ptr<DataType>& type,
@@ -1068,8 +1173,8 @@ std::shared_ptr<Converter> Converter::Make(const std::shared_ptr<DataType>& type
       return std::make_shared<arrow::r::Converter_Timestamp<int64_t>>(std::move(arrays));
 
     case Type::INT64:
-      // Prefer integer if it fits
-      if (ArraysCanFitInteger(arrays)) {
+      // Prefer integer if it fits, unless option arrow.int64_downcast is `false`
+      if (GetBoolOption("arrow.int64_downcast", true) && ArraysCanFitInteger(arrays)) {
         return std::make_shared<arrow::r::Converter_Int<arrow::Int64Type>>(
             std::move(arrays));
       } else {
@@ -1140,7 +1245,7 @@ cpp11::writable::list to_dataframe_parallel(
 
     // add a task to ingest data of that column if that can be done in parallel
     if (converters[i]->Parallel()) {
-      converters[i]->IngestParallel(column, tg);
+      converters[i]->IngestParallel(column, tg, converters[i]);
     }
   }
 

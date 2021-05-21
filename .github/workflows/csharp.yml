@@ -35,10 +35,11 @@ jobs:
     name: AMD64 Ubuntu 18.04 C# ${{ matrix.dotnet }}
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        dotnet: [2.2.103]
+        dotnet: ['3.1.x']
     steps:
       - name: Install C#
         uses: actions/setup-dotnet@v1
@@ -65,10 +66,11 @@ jobs:
     name: AMD64 Windows 2019 18.04 C# ${{ matrix.dotnet }}
     runs-on: windows-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        dotnet: [2.2.103]
+        dotnet: ['3.1.x']
     steps:
       - name: Install C#
         uses: actions/setup-dotnet@v1
@@ -94,10 +96,11 @@ jobs:
     name: AMD64 MacOS 10.15 C# ${{ matrix.dotnet }}
     runs-on: macos-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        dotnet: [2.2.103]
+        dotnet: ['3.1.x']
     steps:
       - name: Install C#
         uses: actions/setup-dotnet@v1

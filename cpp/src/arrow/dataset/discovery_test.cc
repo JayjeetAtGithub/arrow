@@ -23,7 +23,6 @@
 #include <memory>
 #include <utility>
 
-#include "arrow/dataset/filter.h"
 #include "arrow/dataset/partition.h"
 #include "arrow/dataset/test_util.h"
 #include "arrow/filesystem/test_util.h"
@@ -137,9 +136,12 @@ class FileSystemDatasetFactoryTest : public DatasetFactoryTest {
     if (schema == nullptr) {
       ASSERT_OK_AND_ASSIGN(schema, factory_->Inspect(options));
     }
-    options_ = ScanOptions::Make(schema);
+    options_ = std::make_shared<ScanOptions>();
+    options_->dataset_schema = schema;
+    ASSERT_OK(SetProjection(options_.get(), schema->field_names()));
     ASSERT_OK_AND_ASSIGN(dataset_, factory_->Finish(schema));
-    AssertFragmentsAreFromPath(dataset_->GetFragments(), paths);
+    ASSERT_OK_AND_ASSIGN(auto fragment_it, dataset_->GetFragments());
+    AssertFragmentsAreFromPath(std::move(fragment_it), paths);
   }
 
  protected:
@@ -368,10 +370,13 @@ TEST_F(FileSystemDatasetFactoryTest, FilenameNotPartOfPartitions) {
   // column. In such case, the filename should not be used.
   MakeFactory({fs::File("one/file.parquet")});
 
+  auto expected = equal(field_ref("first"), literal("one"));
+
   ASSERT_OK_AND_ASSIGN(auto dataset, factory_->Finish());
-  for (const auto& maybe_fragment : dataset->GetFragments()) {
+  ASSERT_OK_AND_ASSIGN(auto fragment_it, dataset->GetFragments());
+  for (const auto& maybe_fragment : fragment_it) {
     ASSERT_OK_AND_ASSIGN(auto fragment, maybe_fragment);
-    ASSERT_TRUE(fragment->partition_expression()->Equals(("first"_ == "one")));
+    EXPECT_EQ(fragment->partition_expression(), expected);
   }
 }
 

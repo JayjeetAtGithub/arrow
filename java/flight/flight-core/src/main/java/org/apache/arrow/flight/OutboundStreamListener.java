@@ -37,12 +37,25 @@ public interface OutboundStreamListener {
   boolean isReady();
 
   /**
+   * Set a callback for when the listener is ready for new calls to putNext(), i.e. {@link #isReady()}
+   * has become true.
+   *
+   * <p>Note that this callback may only be called some time after {@link #isReady()} becomes true, and may never
+   * be called if all executor threads on the server are busy, or the RPC method body is implemented in a blocking
+   * fashion. Note that isReady() must still be checked after the callback is run as it may have been run
+   * spuriously.
+   */
+  default void setOnReadyHandler(Runnable handler) {
+    throw new UnsupportedOperationException("Not yet implemented.");
+  }
+
+  /**
    * Start sending data, using the schema of the given {@link VectorSchemaRoot}.
    *
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
    */
   default void start(VectorSchemaRoot root) {
-    start(root, null, new IpcOption());
+    start(root, null, IpcOption.DEFAULT);
   }
 
   /**
@@ -51,7 +64,7 @@ public interface OutboundStreamListener {
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
    */
   default void start(VectorSchemaRoot root, DictionaryProvider dictionaries) {
-    start(root, dictionaries, new IpcOption());
+    start(root, dictionaries, IpcOption.DEFAULT);
   }
 
   /**
@@ -91,4 +104,20 @@ public interface OutboundStreamListener {
    * Indicate that transmission is finished.
    */
   void completed();
+
+  /**
+   * Toggle whether to ues the zero-copy write optimization.
+   *
+   * <p>By default or when disabled, Arrow may copy data into a buffer for the underlying implementation to
+   * send. When enabled, Arrow will instead try to directly enqueue the Arrow buffer for sending. Not all
+   * implementations support this optimization, so even if enabled, you may not see a difference.
+   *
+   * <p>In this mode, buffers must not be reused after they are written with {@link #putNext()}. For example,
+   * you would have to call {@link VectorSchemaRoot#allocateNew()} after every call to {@link #putNext()}.
+   * Hence, this is not enabled by default.
+   *
+   * <p>The default value can be toggled globally by setting the JVM property arrow.flight.enable_zero_copy_write
+   * or the environment variable ARROW_FLIGHT_ENABLE_ZERO_COPY_WRITE.
+   */
+  default void setUseZeroCopy(boolean enabled) {}
 }

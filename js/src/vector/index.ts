@@ -90,9 +90,9 @@ function newVector<T extends DataType>(data: Data<T>, ...args: VectorCtorArgs<V<
 }
 
 /** @ignore */
-export interface VectorBuilderOptions<T extends DataType, TNull = any> extends IterableBuilderOptions<T, TNull> { values: Iterable<T['TValue'] | TNull>; }
+export interface VectorBuilderOptions<T extends DataType, TNull = any> extends IterableBuilderOptions<T, TNull> { values: Iterable<T['TValue'] | TNull> }
 /** @ignore */
-export interface VectorBuilderOptionsAsync<T extends DataType, TNull = any> extends IterableBuilderOptions<T, TNull> { values: AsyncIterable<T['TValue'] | TNull>; }
+export interface VectorBuilderOptionsAsync<T extends DataType, TNull = any> extends IterableBuilderOptions<T, TNull> { values: AsyncIterable<T['TValue'] | TNull> }
 
 /** @ignore */
 export function vectorFromValuesWithType<T extends DataType, TNull = any>(newDataType: () => T, input: Iterable<T['TValue'] | TNull> | AsyncIterable<T['TValue'] | TNull> | VectorBuilderOptions<T, TNull> | VectorBuilderOptionsAsync<T, TNull>) {
@@ -118,14 +118,14 @@ function vectorFrom<T extends DataType = any, TNull = any>(input: VectorBuilderO
     const { 'values': values = [], ...options } = { 'nullValues': [null, undefined], ...input } as VectorBuilderOptions<T, TNull> | VectorBuilderOptionsAsync<T, TNull>;
     if (isIterable<T['TValue'] | TNull>(values)) {
         const chunks = [...Builder.throughIterable(options)(values)];
-        return chunks.length === 1 ? chunks[0] : Chunked.concat<T>(chunks);
+        return (chunks.length === 1 ? chunks[0] : Chunked.concat<T>(chunks)) as Vector<T>;
     }
     return (async (chunks: V<T>[]) => {
         const transform = Builder.throughAsyncIterable(options);
         for await (const chunk of transform(values)) {
             chunks.push(chunk);
         }
-        return chunks.length === 1 ? chunks[0] : Chunked.concat<T>(chunks);
+        return (chunks.length === 1 ? chunks[0] : Chunked.concat<T>(chunks)) as Vector<T>;
     })([]);
 }
 

@@ -17,10 +17,6 @@
  * under the License.
  */
 
-#ifdef HAVE_CONFIG_H
-#  include <config.h>
-#endif
-
 #include <arrow/io/memory.h>
 #include <arrow/ipc/writer.h>
 
@@ -688,7 +684,7 @@ garrow_compressed_output_stream_new(GArrowCodec *codec,
                                     GArrowOutputStream *raw,
                                     GError **error)
 {
-  auto arrow_codec = garrow_codec_get_raw(codec);
+  auto arrow_codec = garrow_codec_get_raw(codec).get();
   auto arrow_raw = garrow_output_stream_get_raw(raw);
   auto arrow_stream = arrow::io::CompressedOutputStream::Make(arrow_codec,
                                                               arrow_raw);

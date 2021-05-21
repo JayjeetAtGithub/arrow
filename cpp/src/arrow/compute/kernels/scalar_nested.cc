@@ -18,6 +18,7 @@
 // Vector kernels involving nested types
 
 #include "arrow/array/array_base.h"
+#include "arrow/compute/api_scalar.h"
 #include "arrow/compute/kernels/common.h"
 #include "arrow/result.h"
 #include "arrow/util/bit_block_counter.h"
@@ -28,7 +29,7 @@ namespace internal {
 namespace {
 
 template <typename Type, typename offset_type = typename Type::offset_type>
-void ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+Status ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
   using ScalarType = typename TypeTraits<Type>::ScalarType;
   using OffsetScalarType = typename TypeTraits<Type>::OffsetScalarType;
 
@@ -50,18 +51,120 @@ void ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
           static_cast<offset_type>(arg0.value->length());
     }
   }
+
+  return Status::OK();
 }
+
+const FunctionDoc list_value_length_doc{
+    "Compute list lengths",
+    ("`lists` must have a list-like type.\n"
+     "For each non-null value in `lists`, its length is emitted.\n"
+     "Null values emit a null in the output."),
+    {"lists"}};
+
+Result<ValueDescr> ProjectResolve(KernelContext* ctx,
+                                  const std::vector<ValueDescr>& descrs) {
+  const auto& names = OptionsWrapper<ProjectOptions>::Get(ctx).field_names;
+  const auto& nullable = OptionsWrapper<ProjectOptions>::Get(ctx).field_nullability;
+  const auto& metadata = OptionsWrapper<ProjectOptions>::Get(ctx).field_metadata;
+
+  if (names.size() != descrs.size() || nullable.size() != descrs.size() ||
+      metadata.size() != descrs.size()) {
+    return Status::Invalid("project() was passed ", descrs.size(), " arguments but ",
+                           names.size(), " field names, ", nullable.size(),
+                           " nullability bits, and ", metadata.size(),
+                           " metadata dictionaries.");
+  }
+
+  size_t i = 0;
+  FieldVector fields(descrs.size());
+
+  ValueDescr::Shape shape = ValueDescr::SCALAR;
+  for (const ValueDescr& descr : descrs) {
+    if (descr.shape != ValueDescr::SCALAR) {
+      shape = ValueDescr::ARRAY;
+    } else {
+      switch (descr.type->id()) {
+        case Type::EXTENSION:
+        case Type::DENSE_UNION:
+        case Type::SPARSE_UNION:
+          return Status::NotImplemented("Broadcasting scalars of type ", *descr.type);
+        default:
+          break;
+      }
+    }
+
+    fields[i] = field(names[i], descr.type, nullable[i], metadata[i]);
+    ++i;
+  }
+
+  return ValueDescr{struct_(std::move(fields)), shape};
+}
+
+Status ProjectExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+  ARROW_ASSIGN_OR_RAISE(auto descr, ProjectResolve(ctx, batch.GetDescriptors()));
+
+  for (int i = 0; i < batch.num_values(); ++i) {
+    const auto& field = checked_cast<const StructType&>(*descr.type).field(i);
+    if (batch[i].null_count() > 0 && !field->nullable()) {
+      return Status::Invalid("Output field ", field, " (#", i,
+                             ") does not allow nulls but the corresponding "
+                             "argument was not entirely valid.");
+    }
+  }
+
+  if (descr.shape == ValueDescr::SCALAR) {
+    ScalarVector scalars(batch.num_values());
+    for (int i = 0; i < batch.num_values(); ++i) {
+      scalars[i] = batch[i].scalar();
+    }
+
+    *out =
+        Datum(std::make_shared<StructScalar>(std::move(scalars), std::move(descr.type)));
+    return Status::OK();
+  }
+
+  ArrayVector arrays(batch.num_values());
+  for (int i = 0; i < batch.num_values(); ++i) {
+    if (batch[i].is_array()) {
+      arrays[i] = batch[i].make_array();
+      continue;
+    }
+
+    ARROW_ASSIGN_OR_RAISE(arrays[i], MakeArrayFromScalar(*batch[i].scalar(), batch.length,
+                                                         ctx->memory_pool()));
+  }
+
+  *out = std::make_shared<StructArray>(descr.type, batch.length, std::move(arrays));
+  return Status::OK();
+}
+
+const FunctionDoc project_doc{"Wrap Arrays into a StructArray",
+                              ("Names of the StructArray's fields are\n"
+                               "specified through ProjectOptions."),
+                              {"*args"},
+                              "ProjectOptions"};
 
 }  // namespace
 
 void RegisterScalarNested(FunctionRegistry* registry) {
-  auto list_value_length =
-      std::make_shared<ScalarFunction>("list_value_length", Arity::Unary());
+  auto list_value_length = std::make_shared<ScalarFunction>(
+      "list_value_length", Arity::Unary(), &list_value_length_doc);
   DCHECK_OK(list_value_length->AddKernel({InputType(Type::LIST)}, int32(),
                                          ListValueLength<ListType>));
   DCHECK_OK(list_value_length->AddKernel({InputType(Type::LARGE_LIST)}, int64(),
                                          ListValueLength<LargeListType>));
   DCHECK_OK(registry->AddFunction(std::move(list_value_length)));
+
+  auto project_function =
+      std::make_shared<ScalarFunction>("project", Arity::VarArgs(), &project_doc);
+  ScalarKernel kernel{KernelSignature::Make({InputType{}}, OutputType{ProjectResolve},
+                                            /*is_varargs=*/true),
+                      ProjectExec, OptionsWrapper<ProjectOptions>::Init};
+  kernel.null_handling = NullHandling::OUTPUT_NOT_NULL;
+  kernel.mem_allocation = MemAllocation::NO_PREALLOCATE;
+  DCHECK_OK(project_function->AddKernel(std::move(kernel)));
+  DCHECK_OK(registry->AddFunction(std::move(project_function)));
 }
 
 }  // namespace internal

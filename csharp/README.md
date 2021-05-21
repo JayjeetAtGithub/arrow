@@ -90,10 +90,12 @@ This implementation is under development and may not be suitable for use in prod
 - Timestamp
 - Date32
 - Date64
+- Decimal
 - Time32
 - Time64
 - Binary (fixed-length)
 - List
+- Struct
 
 ### Type Metadata
 
@@ -119,12 +121,10 @@ This implementation is under development and may not be suitable for use in prod
     - Tensor
     - Table
 - Arrays
-    - Struct
     - Union
         - Dense
         - Sparse
     - Half-Float
-    - Decimal
     - Dictionary
 - Array Operations
 	- Equality / Comparison

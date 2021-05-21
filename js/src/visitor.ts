@@ -54,11 +54,10 @@ export abstract class Visitor {
 function getVisitFn<T extends DataType>(visitor: Visitor, node: any, throwIfNotFound = true) {
     let fn: any = null;
     let dtype: T['TType'] = Type.NONE;
-    // tslint:disable
-    if      (node instanceof Data    ) { dtype = inferDType(node.type as T); }
-    else if (node instanceof Vector  ) { dtype = inferDType(node.type as T); }
-    else if (node instanceof DataType) { dtype = inferDType(node      as T); }
-    else if (typeof (dtype = node) !== 'number') { dtype = Type[node] as any as T['TType']; }
+    if      (node instanceof Data    ) dtype = inferDType(node.type as T);
+    else if (node instanceof Vector  ) dtype = inferDType(node.type as T);
+    else if (node instanceof DataType) dtype = inferDType(node      as T);
+    else if (typeof (dtype = node) !== 'number') dtype = Type[node] as any as T['TType'];
 
     switch (dtype) {
         case Type.Null:                 fn = visitor.visitNull; break;
@@ -114,7 +113,7 @@ function getVisitFn<T extends DataType>(visitor: Visitor, node: any, throwIfNotF
 function inferDType<T extends DataType>(type: T): Type {
     switch (type.typeId) {
         case Type.Null: return Type.Null;
-        case Type.Int:
+        case Type.Int: {
             const { bitWidth, isSigned } = (type as any as Int);
             switch (bitWidth) {
                 case  8: return isSigned ? Type.Int8  : Type.Uint8 ;
@@ -122,13 +121,16 @@ function inferDType<T extends DataType>(type: T): Type {
                 case 32: return isSigned ? Type.Int32 : Type.Uint32;
                 case 64: return isSigned ? Type.Int64 : Type.Uint64;
             }
+            // @ts-ignore
             return Type.Int;
+        }
         case Type.Float:
             switch((type as any as Float).precision) {
                 case Precision.HALF: return Type.Float16;
                 case Precision.SINGLE: return Type.Float32;
                 case Precision.DOUBLE: return Type.Float64;
             }
+            // @ts-ignore
             return Type.Float;
         case Type.Binary: return Type.Binary;
         case Type.Utf8: return Type.Utf8;
@@ -141,6 +143,7 @@ function inferDType<T extends DataType>(type: T): Type {
                 case TimeUnit.MICROSECOND: return Type.TimeMicrosecond;
                 case TimeUnit.NANOSECOND: return Type.TimeNanosecond;
             }
+            // @ts-ignore
             return Type.Time;
         case Type.Timestamp:
             switch ((type as any as Timestamp).unit) {
@@ -149,18 +152,21 @@ function inferDType<T extends DataType>(type: T): Type {
                 case TimeUnit.MICROSECOND: return Type.TimestampMicrosecond;
                 case TimeUnit.NANOSECOND: return Type.TimestampNanosecond;
             }
+            // @ts-ignore
             return Type.Timestamp;
         case Type.Date:
             switch ((type as any as Date_).unit) {
                 case DateUnit.DAY: return Type.DateDay;
                 case DateUnit.MILLISECOND: return Type.DateMillisecond;
             }
+            // @ts-ignore
             return Type.Date;
         case Type.Interval:
             switch ((type as any as Interval).unit) {
                 case IntervalUnit.DAY_TIME: return Type.IntervalDayTime;
                 case IntervalUnit.YEAR_MONTH: return Type.IntervalYearMonth;
             }
+            // @ts-ignore
             return Type.Interval;
         case Type.Map: return Type.Map;
         case Type.List: return Type.List;
@@ -170,6 +176,7 @@ function inferDType<T extends DataType>(type: T): Type {
                 case UnionMode.Dense: return Type.DenseUnion;
                 case UnionMode.Sparse: return Type.SparseUnion;
             }
+            // @ts-ignore
             return Type.Union;
         case Type.FixedSizeBinary: return Type.FixedSizeBinary;
         case Type.FixedSizeList: return Type.FixedSizeList;

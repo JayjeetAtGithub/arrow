@@ -42,9 +42,10 @@ TEST_F(TestInMemoryFragment, Scan) {
   auto reader = ConstantArrayGenerator::Repeat(kNumberBatches, batch);
 
   // Creates a InMemoryFragment of the same repeated batch.
-  InMemoryFragment fragment({static_cast<size_t>(kNumberBatches), batch});
+  RecordBatchVector batches = {static_cast<size_t>(kNumberBatches), batch};
+  auto fragment = std::make_shared<InMemoryFragment>(batches);
 
-  AssertFragmentEquals(reader.get(), &fragment);
+  AssertFragmentEquals(reader.get(), fragment.get());
 }
 
 class TestInMemoryDataset : public DatasetFixtureMixin {};
@@ -90,6 +91,20 @@ TEST_F(TestInMemoryDataset, GetFragments) {
       schema_, RecordBatchVector{static_cast<size_t>(kNumberBatches), batch});
 
   AssertDatasetEquals(reader.get(), dataset.get());
+}
+
+TEST_F(TestInMemoryDataset, InMemoryFragment) {
+  constexpr int64_t kBatchSize = 1024;
+
+  SetSchema({field("i32", int32()), field("f64", float64())});
+  auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, schema_);
+  RecordBatchVector batches{batch};
+
+  // Regression test: previously this constructor relied on undefined behavior (order of
+  // evaluation of arguments) leading to fragments being constructed with empty schemas
+  auto fragment = std::make_shared<InMemoryFragment>(batches);
+  ASSERT_OK_AND_ASSIGN(auto schema, fragment->ReadPhysicalSchema());
+  AssertSchemaEqual(batch->schema(), schema);
 }
 
 class TestUnionDataset : public DatasetFixtureMixin {};
@@ -211,6 +226,7 @@ TEST(TestProjector, CheckProjectable) {
   auto i8_req = field("i8", int8(), false);
   auto u16_req = field("u16", uint16(), false);
   auto str_req = field("str", utf8(), false);
+  auto str_nil = field("str", null());
 
   // trivial
   Assert({}).ProjectableTo({});
@@ -235,110 +251,12 @@ TEST(TestProjector, CheckProjectable) {
   Assert({i8}).NotProjectableTo({i8_req},
                                 "not nullable but is not required in origin schema");
   Assert({i8_req}).ProjectableTo({i8});
+  Assert({str_nil}).ProjectableTo({str});
+  Assert({str_nil}).NotProjectableTo({str_req});
 
   // change field type
   Assert({i8}).NotProjectableTo({field("i8", utf8())},
                                 "fields had matching names but differing types");
-}
-
-TEST(TestProjector, MismatchedType) {
-  constexpr int64_t kBatchSize = 1024;
-
-  auto from_schema = schema({field("f64", float64())});
-  auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, from_schema);
-
-  auto to_schema = schema({field("f64", int32())});
-  RecordBatchProjector projector(to_schema);
-
-  auto result = projector.Project(*batch);
-  ASSERT_RAISES(TypeError, result.status());
-}
-
-TEST(TestProjector, AugmentWithNull) {
-  constexpr int64_t kBatchSize = 1024;
-
-  auto from_schema = schema({field("f64", float64()), field("b", boolean())});
-  auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, from_schema);
-  auto to_schema = schema({field("i32", int32()), field("f64", float64())});
-
-  RecordBatchProjector projector(to_schema);
-
-  ASSERT_OK_AND_ASSIGN(auto null_i32, MakeArrayOfNull(int32(), batch->num_rows()));
-  auto expected_batch =
-      RecordBatch::Make(to_schema, batch->num_rows(), {null_i32, batch->column(0)});
-
-  ASSERT_OK_AND_ASSIGN(auto reconciled_batch, projector.Project(*batch));
-  AssertBatchesEqual(*expected_batch, *reconciled_batch);
-}
-
-TEST(TestProjector, AugmentWithScalar) {
-  static constexpr int64_t kBatchSize = 1024;
-  static constexpr int32_t kScalarValue = 3;
-
-  auto from_schema = schema({field("f64", float64()), field("b", boolean())});
-  auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, from_schema);
-  auto to_schema = schema({field("i32", int32()), field("f64", float64())});
-
-  auto scalar_i32 = std::make_shared<Int32Scalar>(kScalarValue);
-
-  RecordBatchProjector projector(to_schema);
-  ASSERT_OK(projector.SetDefaultValue(to_schema->GetFieldIndex("i32"), scalar_i32));
-
-  ASSERT_OK_AND_ASSIGN(auto array_i32,
-                       ArrayFromBuilderVisitor(int32(), kBatchSize, [](Int32Builder* b) {
-                         b->UnsafeAppend(kScalarValue);
-                       }));
-
-  auto expected_batch =
-      RecordBatch::Make(to_schema, batch->num_rows(), {array_i32, batch->column(0)});
-
-  ASSERT_OK_AND_ASSIGN(auto reconciled_batch, projector.Project(*batch));
-  AssertBatchesEqual(*expected_batch, *reconciled_batch);
-}
-
-TEST(TestProjector, NonTrivial) {
-  static constexpr int64_t kBatchSize = 1024;
-
-  static constexpr float kScalarValue = 3.14f;
-
-  auto from_schema =
-      schema({field("i8", int8()), field("u8", uint8()), field("i16", int16()),
-              field("u16", uint16()), field("i32", int32()), field("u32", uint32())});
-
-  auto batch = ConstantArrayGenerator::Zeroes(kBatchSize, from_schema);
-
-  auto to_schema =
-      schema({field("i32", int32()), field("f64", float64()), field("u16", uint16()),
-              field("u8", uint8()), field("b", boolean()), field("u32", uint32()),
-              field("f32", float32())});
-
-  auto scalar_f32 = std::make_shared<FloatScalar>(kScalarValue);
-  auto scalar_f64 = std::make_shared<DoubleScalar>(kScalarValue);
-
-  RecordBatchProjector projector(to_schema);
-  ASSERT_OK(projector.SetDefaultValue(to_schema->GetFieldIndex("f64"), scalar_f64));
-  ASSERT_OK(projector.SetDefaultValue(to_schema->GetFieldIndex("f32"), scalar_f32));
-
-  ASSERT_OK_AND_ASSIGN(
-      auto array_f32, ArrayFromBuilderVisitor(float32(), kBatchSize, [](FloatBuilder* b) {
-        b->UnsafeAppend(kScalarValue);
-      }));
-  ASSERT_OK_AND_ASSIGN(auto array_f64, ArrayFromBuilderVisitor(
-                                           float64(), kBatchSize, [](DoubleBuilder* b) {
-                                             b->UnsafeAppend(kScalarValue);
-                                           }));
-  ASSERT_OK_AND_ASSIGN(
-      auto null_b, ArrayFromBuilderVisitor(boolean(), kBatchSize, [](BooleanBuilder* b) {
-        b->UnsafeAppendNull();
-      }));
-
-  auto expected_batch = RecordBatch::Make(
-      to_schema, batch->num_rows(),
-      {batch->GetColumnByName("i32"), array_f64, batch->GetColumnByName("u16"),
-       batch->GetColumnByName("u8"), null_b, batch->GetColumnByName("u32"), array_f32});
-
-  ASSERT_OK_AND_ASSIGN(auto reconciled_batch, projector.Project(*batch));
-  AssertBatchesEqual(*expected_batch, *reconciled_batch);
 }
 
 class TestEndToEnd : public TestUnionDataset {
@@ -499,20 +417,18 @@ TEST_F(TestEndToEnd, EndToEndSingleDataset) {
   // The following filter tests both predicate pushdown and post filtering
   // without partition information because `year` is a partition and `sales` is
   // not.
-  auto filter = ("year"_ == 2019 && "sales"_ > 100.0);
+  auto filter = and_(equal(field_ref("year"), literal(2019)),
+                     greater(field_ref("sales"), literal(100.0)));
   ASSERT_OK(scanner_builder->Filter(filter));
 
   ASSERT_OK_AND_ASSIGN(auto scanner, scanner_builder->Finish());
   // In the simplest case, consumption is simply conversion to a Table.
   ASSERT_OK_AND_ASSIGN(auto table, scanner->ToTable());
 
-  using row_type = std::tuple<double, std::string, util::optional<std::string>>;
-  std::vector<row_type> rows{
-      row_type{152.25, "3", "CA"},
-      row_type{273.5, "3", "US"},
-  };
-  std::shared_ptr<Table> expected;
-  ASSERT_OK(stl::TableFromTupleRange(default_memory_pool(), rows, columns, &expected));
+  auto expected = TableFromJSON(scanner_builder->projected_schema(), {R"([
+    {"sales": 152.25, "model": "3", "country": "CA"},
+    {"sales": 273.5, "model": "3", "country": "US"}
+  ])"});
   AssertTablesEqual(*expected, *table, false, true);
 }
 
@@ -614,7 +530,7 @@ class TestSchemaUnification : public TestUnionDataset {
   void AssertScanEquals(std::shared_ptr<Scanner> scanner,
                         const std::vector<TupleType>& expected_rows) {
     std::vector<std::string> columns;
-    for (const auto& field : scanner->schema()->fields()) {
+    for (const auto& field : scanner->options()->projected_schema->fields()) {
       columns.push_back(field->name());
     }
 
@@ -698,13 +614,36 @@ TEST_F(TestSchemaUnification, SelectPhysicalColumnsFilterPartitionColumn) {
   //   when some of the columns may not be materialized
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
   ASSERT_OK(scan_builder->Project({"phy_2", "phy_3", "phy_4"}));
-  ASSERT_OK(scan_builder->Filter(("part_df"_ == 1 && "phy_2"_ == 211) ||
-                                 ("part_ds"_ == 2 && "phy_4"_ != 422)));
+  ASSERT_OK(scan_builder->Filter(or_(and_(equal(field_ref("part_df"), literal(1)),
+                                          equal(field_ref("phy_2"), literal(211))),
+                                     and_(equal(field_ref("part_ds"), literal(2)),
+                                          not_equal(field_ref("phy_4"), literal(422))))));
 
   using TupleType = std::tuple<i32, i32, i32>;
   std::vector<TupleType> rows = {
       TupleType(211, nullopt, nullopt),
       TupleType(nullopt, 321, 421),
+  };
+
+  AssertBuilderEquals(scan_builder, rows);
+}
+
+TEST_F(TestSchemaUnification, SelectSyntheticColumn) {
+  // Select only a synthetic column
+  ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
+  ASSERT_OK(scan_builder->Project(
+      {call("add", {field_ref("phy_1"), field_ref("part_df")})}, {"phy_1 + part_df"}));
+
+  ASSERT_OK_AND_ASSIGN(auto scanner, scan_builder->Finish());
+  AssertSchemaEqual(Schema({field("phy_1 + part_df", int32())}),
+                    *scanner->options()->projected_schema);
+
+  using TupleType = std::tuple<i32>;
+  std::vector<TupleType> rows = {
+      TupleType(111 + 1),
+      TupleType(nullopt),
+      TupleType(nullopt),
+      TupleType(nullopt),
   };
 
   AssertBuilderEquals(scan_builder, rows);
@@ -730,7 +669,7 @@ TEST_F(TestSchemaUnification, SelectPartitionColumns) {
 TEST_F(TestSchemaUnification, SelectPartitionColumnsFilterPhysicalColumn) {
   // Selects re-ordered virtual columns with a filter on a physical columns
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_1"_ == 111));
+  ASSERT_OK(scan_builder->Filter(equal(field_ref("phy_1"), literal(111))));
 
   ASSERT_OK(scan_builder->Project({"part_df", "part_ds"}));
   using TupleType = std::tuple<i32, i32>;
@@ -741,10 +680,10 @@ TEST_F(TestSchemaUnification, SelectPartitionColumnsFilterPhysicalColumn) {
 }
 
 TEST_F(TestSchemaUnification, SelectMixedColumnsAndFilter) {
-  // Selects mix of phyical/virtual with a different order and uses a filter on
+  // Selects mix of physical/virtual with a different order and uses a filter on
   // a physical column not selected.
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset_->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_2"_ >= 212));
+  ASSERT_OK(scan_builder->Filter(greater_equal(field_ref("phy_2"), literal(212))));
   ASSERT_OK(scan_builder->Project({"part_df", "phy_3", "part_ds", "phy_1"}));
 
   using TupleType = std::tuple<i32, i32, i32, i32>;
@@ -782,14 +721,13 @@ TEST(TestDictPartitionColumn, SelectPartitionColumnFilterPhysicalColumn) {
 
   // Selects re-ordered virtual column with a filter on a physical column
   ASSERT_OK_AND_ASSIGN(auto scan_builder, dataset->NewScan());
-  ASSERT_OK(scan_builder->Filter("phy_1"_ == 111));
-
+  ASSERT_OK(scan_builder->Filter(equal(field_ref("phy_1"), literal(111))));
   ASSERT_OK(scan_builder->Project({"part"}));
 
   ASSERT_OK_AND_ASSIGN(auto scanner, scan_builder->Finish());
   ASSERT_OK_AND_ASSIGN(auto table, scanner->ToTable());
   AssertArraysEqual(*table->column(0)->chunk(0),
-                    *DictArrayFromJSON(partition_field->type(), "[0]", "[\"one\"]"));
+                    *ArrayFromJSON(partition_field->type(), R"(["one"])"));
 }
 
 }  // namespace dataset

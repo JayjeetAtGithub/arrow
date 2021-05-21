@@ -19,17 +19,23 @@
 import functools
 import operator
 import sys
-from setuptools import setup
+from setuptools import setup, find_packages
 
-if sys.version_info < (3, 5):
-    sys.exit('Python < 3.5 is not supported')
+if sys.version_info < (3, 6):
+    sys.exit('Python < 3.6 is not supported')
+
+# For pathlib.Path compatibility
+jinja_req = 'jinja2>=2.11'
 
 extras = {
+    'lint': ['numpydoc==1.1.0', 'autopep8', 'flake8', 'cmake_format==0.5.2'],
     'benchmark': ['pandas'],
-    'bot': ['ruamel.yaml', 'pygithub'],
     'docker': ['ruamel.yaml', 'python-dotenv'],
-    'release': ['jinja2', 'jira', 'semver', 'gitpython']
+    'release': [jinja_req, 'jira', 'semver', 'gitpython'],
+    'crossbow': ['github3.py', jinja_req, 'pygit2', 'ruamel.yaml',
+                 'setuptools_scm'],
 }
+extras['bot'] = extras['crossbow'] + ['pygithub', 'jira']
 extras['all'] = list(set(functools.reduce(operator.add, extras.values())))
 
 setup(
@@ -39,13 +45,7 @@ setup(
     url='http://github.com/apache/arrow',
     maintainer='Arrow Developers',
     maintainer_email='dev@arrow.apache.org',
-    packages=[
-        'archery',
-        'archery.benchmark',
-        'archery.integration',
-        'archery.lang',
-        'archery.utils'
-    ],
+    packages=find_packages(),
     include_package_data=True,
     install_requires=['click>=7'],
     tests_require=['pytest', 'responses'],

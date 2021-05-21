@@ -27,16 +27,17 @@
 
 #include "arrow/io/caching.h"
 #include "arrow/io/file.h"
+#include "arrow/io/memory.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/future.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/ubsan.h"
 #include "parquet/column_reader.h"
 #include "parquet/column_scanner.h"
-#include "parquet/deprecated_io.h"
-#include "parquet/encryption_internal.h"
+#include "parquet/encryption/encryption_internal.h"
+#include "parquet/encryption/internal_file_decryptor.h"
 #include "parquet/exception.h"
 #include "parquet/file_writer.h"
-#include "parquet/internal_file_decryptor.h"
 #include "parquet/metadata.h"
 #include "parquet/platform.h"
 #include "parquet/properties.h"
@@ -88,9 +89,9 @@ const RowGroupMetaData* RowGroupReader::metadata() const { return contents_->met
 
 /// Compute the section of the file that should be read for the given
 /// row group and column chunk.
-arrow::io::ReadRange ComputeColumnChunkRange(FileMetaData* file_metadata,
-                                             int64_t source_size, int row_group_index,
-                                             int column_index) {
+::arrow::io::ReadRange ComputeColumnChunkRange(FileMetaData* file_metadata,
+                                               int64_t source_size, int row_group_index,
+                                               int column_index) {
   auto row_group_metadata = file_metadata->RowGroup(row_group_index);
   auto column_metadata = row_group_metadata->ColumnChunk(column_index);
 
@@ -142,7 +143,7 @@ class SerializedRowGroup : public RowGroupReader::Contents {
     // Read column chunk from the file
     auto col = row_group_metadata_->ColumnChunk(i);
 
-    arrow::io::ReadRange col_range =
+    ::arrow::io::ReadRange col_range =
         ComputeColumnChunkRange(file_metadata_, source_size_, row_group_ordinal_, i);
     std::shared_ptr<ArrowInputStream> stream;
     if (cached_source_) {
@@ -249,13 +250,13 @@ class SerializedFile : public ParquetFileReader::Contents {
     file_metadata_ = std::move(metadata);
   }
 
-  void PreBuffer(const std::vector<int>& row_groups,
-                 const std::vector<int>& column_indices,
-                 const ::arrow::io::AsyncContext& ctx,
-                 const ::arrow::io::CacheOptions& options) {
+  ::arrow::Future<> PreBuffer(const std::vector<int>& row_groups,
+                              const std::vector<int>& column_indices,
+                              const ::arrow::io::IOContext& ctx,
+                              const ::arrow::io::CacheOptions& options) {
     cached_source_ =
-        std::make_shared<arrow::io::internal::ReadRangeCache>(source_, ctx, options);
-    std::vector<arrow::io::ReadRange> ranges;
+        std::make_shared<::arrow::io::internal::ReadRangeCache>(source_, ctx, options);
+    std::vector<::arrow::io::ReadRange> ranges;
     for (int row : row_groups) {
       for (int col : column_indices) {
         ranges.push_back(
@@ -263,6 +264,7 @@ class SerializedFile : public ParquetFileReader::Contents {
       }
     }
     PARQUET_THROW_NOT_OK(cached_source_->Cache(ranges));
+    return cached_source_->Wait();
   }
 
   void ParseMetaData() {
@@ -316,7 +318,7 @@ class SerializedFile : public ParquetFileReader::Contents {
 
  private:
   std::shared_ptr<ArrowInputFile> source_;
-  std::shared_ptr<arrow::io::internal::ReadRangeCache> cached_source_;
+  std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
   int64_t source_size_;
   std::shared_ptr<FileMetaData> file_metadata_;
   ReaderProperties properties_;
@@ -344,7 +346,7 @@ void SerializedFile::ParseUnencryptedFileMetadata(
     const std::shared_ptr<Buffer>& footer_buffer, int64_t footer_read_size,
     std::shared_ptr<Buffer>* metadata_buffer, uint32_t* metadata_len,
     uint32_t* read_metadata_len) {
-  *metadata_len = arrow::util::SafeLoadAs<uint32_t>(
+  *metadata_len = ::arrow::util::SafeLoadAs<uint32_t>(
       reinterpret_cast<const uint8_t*>(footer_buffer->data()) + footer_read_size -
       kFooterSize);
   int64_t metadata_start = source_size_ - kFooterSize - *metadata_len;
@@ -376,7 +378,7 @@ void SerializedFile::ParseMetaDataOfEncryptedFileWithEncryptedFooter(
     const std::shared_ptr<Buffer>& footer_buffer, int64_t footer_read_size) {
   // encryption with encrypted footer
   // both metadata & crypto metadata length
-  uint32_t footer_len = arrow::util::SafeLoadAs<uint32_t>(
+  uint32_t footer_len = ::arrow::util::SafeLoadAs<uint32_t>(
       reinterpret_cast<const uint8_t*>(footer_buffer->data()) + footer_read_size -
       kFooterSize);
   int64_t crypto_metadata_start = source_size_ - kFooterSize - footer_len;
@@ -546,13 +548,6 @@ std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
   return result;
 }
 
-std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
-    std::unique_ptr<RandomAccessSource> source, const ReaderProperties& props,
-    std::shared_ptr<FileMetaData> metadata) {
-  auto wrapper = std::make_shared<ParquetInputWrapper>(std::move(source));
-  return Open(std::move(wrapper), props, std::move(metadata));
-}
-
 std::unique_ptr<ParquetFileReader> ParquetFileReader::OpenFile(
     const std::string& path, bool memory_map, const ReaderProperties& props,
     std::shared_ptr<FileMetaData> metadata) {
@@ -592,14 +587,14 @@ std::shared_ptr<RowGroupReader> ParquetFileReader::RowGroup(int i) {
   return contents_->GetRowGroup(i);
 }
 
-void ParquetFileReader::PreBuffer(const std::vector<int>& row_groups,
-                                  const std::vector<int>& column_indices,
-                                  const ::arrow::io::AsyncContext& ctx,
-                                  const ::arrow::io::CacheOptions& options) {
+::arrow::Future<> ParquetFileReader::PreBuffer(const std::vector<int>& row_groups,
+                                               const std::vector<int>& column_indices,
+                                               const ::arrow::io::IOContext& ctx,
+                                               const ::arrow::io::CacheOptions& options) {
   // Access private methods here
   SerializedFile* file =
       ::arrow::internal::checked_cast<SerializedFile*>(contents_.get());
-  file->PreBuffer(row_groups, column_indices, ctx, options);
+  return file->PreBuffer(row_groups, column_indices, ctx, options);
 }
 
 // ----------------------------------------------------------------------

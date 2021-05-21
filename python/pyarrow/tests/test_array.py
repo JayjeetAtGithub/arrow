@@ -386,6 +386,10 @@ def test_array_getitem():
         with pytest.raises(IndexError):
             arr[idx]
 
+    # check that numpy scalars are supported
+    for idx in range(-len(arr), len(arr)):
+        assert arr[np.int32(idx)].as_py() == lst[idx]
+
 
 def test_array_slice():
     arr = pa.array(range(10))
@@ -403,9 +407,14 @@ def test_array_slice():
 
     # Slice past end of array
     assert len(arr.slice(len(arr))) == 0
+    assert len(arr.slice(len(arr) + 2)) == 0
+    assert len(arr.slice(len(arr) + 2, 100)) == 0
 
     with pytest.raises(IndexError):
         arr.slice(-1)
+
+    with pytest.raises(ValueError):
+        arr.slice(2, -1)
 
     # Test slice notation
     assert arr[2:].equals(arr.slice(2))
@@ -415,7 +424,11 @@ def test_array_slice():
     n = len(arr)
     for start in range(-n * 2, n * 2):
         for stop in range(-n * 2, n * 2):
-            assert arr[start:stop].to_pylist() == arr.to_pylist()[start:stop]
+            res = arr[start:stop]
+            res.validate()
+            expected = arr.to_pylist()[start:stop]
+            assert res.to_pylist() == expected
+            assert res.to_numpy().tolist() == expected
 
 
 def test_array_slice_negative_step():
@@ -515,6 +528,9 @@ def test_array_eq():
     assert (arr1 != arr2) is False
     assert (arr1 == arr3) is False
     assert (arr1 != arr3) is True
+
+    assert (arr1 == 1) is False
+    assert (arr1 == None) is False  # noqa: E711
 
 
 def test_array_from_buffers():
@@ -659,6 +675,38 @@ def test_struct_from_arrays():
     with pytest.raises(ValueError, match="int64 vs int32"):
         pa.StructArray.from_arrays([a, b, c], fields=[fa2, fb, fc])
 
+    arrays = [a, b, c]
+    fields = [fa, fb, fc]
+    # With mask
+    mask = pa.array([True, False, False])
+    arr = pa.StructArray.from_arrays(arrays, fields=fields, mask=mask)
+    assert arr.to_pylist() == [None] + expected_list[1:]
+
+    arr = pa.StructArray.from_arrays(arrays, names=['a', 'b', 'c'], mask=mask)
+    assert arr.to_pylist() == [None] + expected_list[1:]
+
+    # Bad masks
+    with pytest.raises(ValueError, match='Mask must be'):
+        pa.StructArray.from_arrays(arrays, fields, mask=[True, False, False])
+
+    with pytest.raises(ValueError, match='not contain nulls'):
+        pa.StructArray.from_arrays(
+            arrays, fields, mask=pa.array([True, False, None]))
+
+    with pytest.raises(ValueError, match='Mask must be'):
+        pa.StructArray.from_arrays(
+            arrays, fields, mask=pa.chunked_array([mask]))
+
+
+def test_struct_array_from_chunked():
+    # ARROW-11780
+    # Check that we don't segfault when trying to build
+    # a StructArray from a chunked array.
+    chunked_arr = pa.chunked_array([[1, 2, 3], [4, 5, 6]])
+
+    with pytest.raises(TypeError, match="Expected Array"):
+        pa.StructArray.from_arrays([chunked_arr], ["foo"])
+
 
 def test_dictionary_from_numpy():
     indices = np.repeat([0, 1, 2], 2)
@@ -680,6 +728,76 @@ def test_dictionary_from_numpy():
             assert d2[i].as_py() is None
         else:
             assert d2[i].as_py() == dictionary[indices[i]]
+
+
+def test_dictionary_to_numpy():
+    expected = pa.array(
+        ["foo", "bar", None, "foo"]
+    ).to_numpy(zero_copy_only=False)
+    a = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 0]),
+        pa.array(['foo', 'bar'])
+    )
+    np.testing.assert_array_equal(a.to_numpy(zero_copy_only=False),
+                                  expected)
+
+    with pytest.raises(pa.ArrowInvalid):
+        # If this would be changed to no longer raise in the future,
+        # ensure to test the actual result because, currently, to_numpy takes
+        # for granted that when zero_copy_only=True there will be no nulls
+        # (it's the decoding of the DictionaryArray that handles the nulls and
+        # this is only activated with zero_copy_only=False)
+        a.to_numpy(zero_copy_only=True)
+
+    anonulls = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 1, 0]),
+        pa.array(['foo', 'bar'])
+    )
+    expected = pa.array(
+        ["foo", "bar", "bar", "foo"]
+    ).to_numpy(zero_copy_only=False)
+    np.testing.assert_array_equal(anonulls.to_numpy(zero_copy_only=False),
+                                  expected)
+
+    with pytest.raises(pa.ArrowInvalid):
+        anonulls.to_numpy(zero_copy_only=True)
+
+    afloat = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 1, 0]),
+        pa.array([13.7, 11.0])
+    )
+    expected = pa.array([13.7, 11.0, 11.0, 13.7]).to_numpy()
+    np.testing.assert_array_equal(afloat.to_numpy(zero_copy_only=True),
+                                  expected)
+    np.testing.assert_array_equal(afloat.to_numpy(zero_copy_only=False),
+                                  expected)
+
+    afloat2 = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 0]),
+        pa.array([13.7, 11.0])
+    )
+    expected = pa.array(
+        [13.7, 11.0, None, 13.7]
+    ).to_numpy(zero_copy_only=False)
+    np.testing.assert_allclose(
+        afloat2.to_numpy(zero_copy_only=False),
+        expected,
+        equal_nan=True
+    )
+
+    # Testing for integers can reveal problems related to dealing
+    # with None values, as a numpy array of int dtype
+    # can't contain NaN nor None.
+    aints = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 0]),
+        pa.array([7, 11])
+    )
+    expected = pa.array([7, 11, None, 7]).to_numpy(zero_copy_only=False)
+    np.testing.assert_allclose(
+        aints.to_numpy(zero_copy_only=False),
+        expected,
+        equal_nan=True
+    )
 
 
 def test_dictionary_from_boxed_arrays():
@@ -843,13 +961,32 @@ def test_fixed_size_list_from_arrays():
         pa.FixedSizeListArray.from_arrays(values, 5)
 
 
+def test_variable_list_from_arrays():
+    values = pa.array([1, 2, 3, 4], pa.int64())
+    offsets = pa.array([0, 2, 4])
+    result = pa.ListArray.from_arrays(offsets, values)
+    assert result.to_pylist() == [[1, 2], [3, 4]]
+    assert result.type.equals(pa.list_(pa.int64()))
+
+    offsets = pa.array([0, None, 2, 4])
+    result = pa.ListArray.from_arrays(offsets, values)
+    assert result.to_pylist() == [[1, 2], None, [3, 4]]
+
+    # raise if offset out of bounds
+    with pytest.raises(ValueError):
+        pa.ListArray.from_arrays(pa.array([-1, 2, 4]), values)
+
+    with pytest.raises(ValueError):
+        pa.ListArray.from_arrays(pa.array([0, 2, 5]), values)
+
+
 def test_union_from_dense():
     binary = pa.array([b'a', b'b', b'c', b'd'], type='binary')
     int64 = pa.array([1, 2, 3], type='int64')
     types = pa.array([0, 1, 0, 0, 1, 1, 0], type='int8')
     logical_types = pa.array([11, 13, 11, 11, 13, 13, 11], type='int8')
-    value_offsets = pa.array([1, 0, 0, 2, 1, 2, 3], type='int32')
-    py_value = [b'b', 1, b'a', b'c', 2, 3, b'd']
+    value_offsets = pa.array([0, 0, 1, 2, 1, 2, 3], type='int32')
+    py_value = [b'a', 1, b'b', b'c', 2, 3, b'd']
 
     def check_result(result, expected_field_names, expected_type_codes,
                      expected_type_code_values):
@@ -1277,7 +1414,7 @@ def test_decimal_to_int_non_integer():
 
     for case in non_integer_cases:
         # test safe casting raises
-        msg_regexp = 'Rescaling decimal value would cause data loss'
+        msg_regexp = 'Rescaling Decimal128 value would cause data loss'
         with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
             _check_cast_case(case)
 
@@ -1296,8 +1433,8 @@ def test_decimal_to_decimal():
     )
     assert result.equals(expected)
 
-    with pytest.raises(pa.ArrowInvalid,
-                       match='Rescaling decimal value would cause data loss'):
+    msg_regexp = 'Rescaling Decimal128 value would cause data loss'
+    with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
         result = arr.cast(pa.decimal128(9, 1))
 
     result = arr.cast(pa.decimal128(9, 1), safe=False)
@@ -1352,12 +1489,13 @@ def test_cast_from_null():
         pa.struct([pa.field('a', pa.int32()),
                    pa.field('b', pa.list_(pa.int8())),
                    pa.field('c', pa.string())]),
+        pa.dictionary(pa.int32(), pa.string()),
     ]
     for out_type in out_types:
         _check_cast_case((in_data, in_type, in_data, out_type))
 
     out_types = [
-        pa.dictionary(pa.int32(), pa.string()),
+
         pa.union([pa.field('a', pa.binary(10)),
                   pa.field('b', pa.string())], mode=pa.lib.UnionMode_DENSE),
         pa.union([pa.field('a', pa.binary(10)),
@@ -1520,6 +1658,26 @@ def test_dictionary_encode_zero_length():
     encoded = arr.dictionary_encode()
     assert len(encoded.dictionary) == 0
     encoded.validate(full=True)
+
+
+def test_dictionary_decode():
+    cases = [
+        (pa.array([1, 2, 3, None, 1, 2, 3]),
+         pa.DictionaryArray.from_arrays(
+             pa.array([0, 1, 2, None, 0, 1, 2], type='int32'),
+             [1, 2, 3])),
+        (pa.array(['foo', None, 'bar', 'foo']),
+         pa.DictionaryArray.from_arrays(
+             pa.array([0, None, 1, 0], type='int32'),
+             ['foo', 'bar'])),
+        (pa.array(['foo', None, 'bar', 'foo'], type=pa.large_binary()),
+         pa.DictionaryArray.from_arrays(
+             pa.array([0, None, 1, 0], type='int32'),
+             pa.array(['foo', 'bar'], type=pa.large_binary()))),
+    ]
+    for expected, arr in cases:
+        result = arr.dictionary_decode()
+        assert result.equals(expected)
 
 
 def test_cast_time32_to_int():
@@ -2140,12 +2298,12 @@ def test_buffers_nested():
     assert bytearray(null_bitmap)[0] == 0b00000101
     # The child buffers: 'a'
     null_bitmap = buffers[1].to_pybytes()
-    assert bytearray(null_bitmap)[0] == 0b00000001
+    assert bytearray(null_bitmap)[0] == 0b00000011
     values = buffers[2].to_pybytes()
     assert struct.unpack('bxx', values) == (42,)
     # The child buffers: 'b'
     null_bitmap = buffers[3].to_pybytes()
-    assert bytearray(null_bitmap)[0] == 0b00000100
+    assert bytearray(null_bitmap)[0] == 0b00000110
     values = buffers[4].to_pybytes()
     assert struct.unpack('4xh', values) == (43,)
 
@@ -2513,9 +2671,20 @@ def test_numpy_binary_overflow_to_chunked():
 
 @pytest.mark.large_memory
 def test_list_child_overflow_to_chunked():
-    vals = [['x' * 1024]] * ((2 << 20) + 1)
-    with pytest.raises(ValueError, match="overflowed"):
-        pa.array(vals)
+    kilobyte_string = 'x' * 1024
+    two_mega = 2**21
+
+    vals = [[kilobyte_string]] * (two_mega - 1)
+    arr = pa.array(vals)
+    assert isinstance(arr, pa.Array)
+    assert len(arr) == two_mega - 1
+
+    vals = [[kilobyte_string]] * two_mega
+    arr = pa.array(vals)
+    assert isinstance(arr, pa.ChunkedArray)
+    assert len(arr) == two_mega
+    assert len(arr.chunk(0)) == two_mega - 1
+    assert len(arr.chunk(1)) == 1
 
 
 def test_infer_type_masked():
@@ -2543,6 +2712,32 @@ def test_array_masked():
     arr = pa.array(np.array([4, None, 4, 3.], dtype="O"),
                    mask=np.array([False, True, False, True]))
     assert arr.type == pa.int64()
+
+
+def test_array_invalid_mask_raises():
+    # ARROW-10742
+    cases = [
+        ([1, 2], np.array([False, False], dtype="O"),
+         pa.ArrowInvalid, "must be boolean dtype"),
+
+        ([1, 2], np.array([[False], [False]]),
+         pa.ArrowInvalid, "must be 1D array"),
+
+        ([1, 2, 3], np.array([False, False]),
+         pa.ArrowInvalid, "different length"),
+
+        (np.array([1, 2]), np.array([False, False], dtype="O"),
+         TypeError, "must be boolean dtype"),
+
+        (np.array([1, 2]), np.array([[False], [False]]),
+         ValueError, "must be 1D array"),
+
+        (np.array([1, 2, 3]), np.array([False, False]),
+         ValueError, "different length"),
+    ]
+    for obj, mask, ex, msg in cases:
+        with pytest.raises(ex, match=msg):
+            pa.array(obj, mask=mask)
 
 
 def test_array_from_large_pyints():

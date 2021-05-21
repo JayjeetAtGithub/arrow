@@ -192,6 +192,41 @@ class BaseTestJSONRead:
             'e': [None, True, False],
         }
 
+    def test_empty_lists(self):
+        # ARROW-10955: Infer list(null)
+        rows = b'{"a": []}'
+        table = self.read_bytes(rows)
+        schema = pa.schema([('a', pa.list_(pa.null()))])
+        assert table.schema == schema
+        assert table.to_pydict() == {'a': [[]]}
+
+    def test_empty_rows(self):
+        rows = b'{}\n{}\n'
+        table = self.read_bytes(rows)
+        schema = pa.schema([])
+        assert table.schema == schema
+        assert table.num_columns == 0
+        assert table.num_rows == 2
+
+    def test_reconcile_accross_blocks(self):
+        # ARROW-12065: reconciling inferred types accross blocks
+        first_row = b'{                               }\n'
+        read_options = ReadOptions(block_size=len(first_row))
+        for next_rows, expected_pylist in [
+            (b'{"a": 0}', [None, 0]),
+            (b'{"a": []}', [None, []]),
+            (b'{"a": []}\n{"a": [[1]]}', [None, [], [[1]]]),
+            (b'{"a": {}}', [None, {}]),
+            (b'{"a": {}}\n{"a": {"b": {"c": 1}}}',
+             [None, {"b": None}, {"b": {"c": 1}}]),
+        ]:
+            table = self.read_bytes(first_row + next_rows,
+                                    read_options=read_options)
+            expected = {"a": expected_pylist}
+            assert table.to_pydict() == expected
+            # Check that the issue was exercised
+            assert table.column("a").num_chunks > 1
+
     def test_explicit_schema_with_unexpected_behaviour(self):
         # infer by default
         rows = (b'{"foo": "bar", "num": 0}\n'

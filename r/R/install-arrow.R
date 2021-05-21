@@ -21,6 +21,10 @@
 #' from a nightly development version, or on Linux to try reinstalling with
 #' all necessary C++ dependencies.
 #'
+#' Note that, unlike packages like `tensorflow`, `blogdown`, and others that
+#' require external dependencies, you do not need to run `install_arrow()`
+#' after a successful `arrow` installation.
+#'
 #' @param nightly logical: Should we install a development version of the
 #' package, or should we install from CRAN (the default).
 #' @param binary On Linux, value to set for the environment variable
@@ -33,10 +37,13 @@
 #' See `vignette("install", package = "arrow")` for further details.
 #' @param use_system logical: Should we use `pkg-config` to look for Arrow
 #' system packages? Default is `FALSE`. If `TRUE`, source installation may be
-#' faster, but there is a risk of version mismatch.
+#' faster, but there is a risk of version mismatch. This sets the
+#' `ARROW_USE_PKG_CONFIG` environment variable.
 #' @param minimal logical: If building from source, should we build without
 #' optional dependencies (compression libraries, for example)? Default is
-#' `FALSE`.
+#' `FALSE`. This sets the `LIBARROW_MINIMAL` environment variable.
+#' @param verbose logical: Print more debugging output when installing? Default
+#' is `FALSE`. This sets the `ARROW_R_DEV` environment variable.
 #' @param repos character vector of base URLs of the repositories to install
 #' from (passed to `install.packages()`)
 #' @param ... Additional arguments passed to `install.packages()`
@@ -49,39 +56,56 @@ install_arrow <- function(nightly = FALSE,
                           binary = Sys.getenv("LIBARROW_BINARY", TRUE),
                           use_system = Sys.getenv("ARROW_USE_PKG_CONFIG", FALSE),
                           minimal = Sys.getenv("LIBARROW_MINIMAL", FALSE),
+                          verbose = Sys.getenv("ARROW_R_DEV", FALSE),
                           repos = getOption("repos"),
                           ...) {
   sysname <- tolower(Sys.info()[["sysname"]])
   conda <- isTRUE(grepl("conda", R.Version()$platform))
 
-  if (sysname %in% c("windows", "darwin", "linux")) {
-    if (conda && !nightly) {
-      system("conda install -y -c conda-forge --strict-channel-priority r-arrow")
+  if (conda) {
+    if (nightly) {
+      system("conda install -y -c arrow-nightlies -c conda-forge --strict-channel-priority r-arrow")
     } else {
-      Sys.setenv(
-        LIBARROW_DOWNLOAD = "true",
-        LIBARROW_BINARY = binary,
-        LIBARRWOW_MINIMAL = minimal,
-        ARROW_USE_PKG_CONFIG = use_system
-      )
-      if (isTRUE(binary)) {
-        # Unless otherwise directed, don't consider newer source packages when
-        # options(pkgType) == "both" (default on win/mac)
-        opts <- options(
-          install.packages.check.source = "no",
-          install.packages.compile.from.source = "never"
-        )
-        on.exit(options(opts))
-      }
-      install.packages("arrow", repos = arrow_repos(repos, nightly), ...)
-    }
-    if ("arrow" %in% loadedNamespaces()) {
-      # If you've just sourced this file, "arrow" won't be (re)loaded
-      reload_arrow()
+      system("conda install -y -c conda-forge --strict-channel-priority r-arrow")
     }
   } else {
-    # Solaris
-    message(SEE_README)
+    Sys.setenv(
+      LIBARROW_DOWNLOAD = "true",
+      LIBARROW_BINARY = binary,
+      LIBARROW_MINIMAL = minimal,
+      ARROW_R_DEV = verbose,
+      ARROW_USE_PKG_CONFIG = use_system
+    )
+    # On the M1, we can't use the usual autobrew, which pulls Intel dependencies
+    apple_m1 <- grepl("arm-apple|aarch64.*darwin", R.Version()$platform)
+    # On Rosetta, we have to build without JEMALLOC, so we also can't autobrew
+    rosetta <- identical(sysname, "darwin") && identical(system("sysctl -n sysctl.proc_translated", intern = TRUE), "1")
+    if (rosetta) {
+      Sys.setenv(ARROW_JEMALLOC = "OFF")
+    }
+    if (apple_m1 || rosetta) {
+      Sys.setenv(FORCE_BUNDLED_BUILD = "true")
+    }
+
+    opts <- list()
+    if (apple_m1 || rosetta) {
+      # Skip binaries (esp. for rosetta)
+      opts$pkgType <- "source"
+    } else if (isTRUE(binary)) {
+      # Unless otherwise directed, don't consider newer source packages when
+      # options(pkgType) == "both" (default on win/mac)
+      opts$install.packages.check.source <- "no"
+      opts$install.packages.compile.from.source <- "never"
+    }
+    if (length(opts)) {
+      old <- options(opts)
+      on.exit(options(old))
+    }
+    install.packages("arrow", repos = arrow_repos(repos, nightly), ...)
+  }
+  if ("arrow" %in% loadedNamespaces()) {
+    # If you've just sourced this file, "arrow" won't be (re)loaded
+    reload_arrow()
   }
 }
 
@@ -90,12 +114,12 @@ arrow_repos <- function(repos = getOption("repos"), nightly = FALSE) {
     # Set the default/CDN
     repos <- "https://cloud.r-project.org/"
   }
-  bintray <- getOption("arrow.dev.repo", "https://dl.bintray.com/ursalabs/arrow-r")
+  dev_repo <- getOption("arrow.dev_repo", "https://arrow-r-nightly.s3.amazonaws.com")
   # Remove it if it's there (so nightly=FALSE won't accidentally pull from it)
-  repos <- setdiff(repos, bintray)
+  repos <- setdiff(repos, dev_repo)
   if (nightly) {
     # Add it first
-    repos <- c(bintray, repos)
+    repos <- c(dev_repo, repos)
   }
   repos
 }
@@ -113,10 +137,3 @@ reload_arrow <- function() {
     message("Please restart R to use the 'arrow' package.")
   }
 }
-
-SEE_README <- paste(
-  "Refer to the R package README",
-  "<https://github.com/apache/arrow/blob/master/r/README.md>",
-  "and `vignette('install', package = 'arrow')`",
-  "for installation guidance."
-)

@@ -43,9 +43,9 @@
 
 #include "arrow/util/logging.h"
 
+#include "parquet/encryption/internal_file_decryptor.h"
+#include "parquet/encryption/internal_file_encryptor.h"
 #include "parquet/exception.h"
-#include "parquet/internal_file_decryptor.h"
-#include "parquet/internal_file_encryptor.h"
 #include "parquet/platform.h"
 #include "parquet/statistics.h"
 #include "parquet/types.h"
@@ -101,7 +101,8 @@ static inline Compression::type FromThriftUnsafe(format::CompressionCodec::type 
     case format::CompressionCodec::BROTLI:
       return Compression::BROTLI;
     case format::CompressionCodec::LZ4:
-      // ARROW-9424: Existing files use LZ4_RAW but this may need to change
+      return Compression::LZ4_HADOOP;
+    case format::CompressionCodec::LZ4_RAW:
       return Compression::LZ4;
     case format::CompressionCodec::ZSTD:
       return Compression::ZSTD;
@@ -213,7 +214,8 @@ inline typename Compression::type LoadEnumSafe(const format::CompressionCodec::t
   // as format::CompressionCodec.
   const auto min_value =
       static_cast<decltype(raw_value)>(format::CompressionCodec::UNCOMPRESSED);
-  const auto max_value = static_cast<decltype(raw_value)>(format::CompressionCodec::ZSTD);
+  const auto max_value =
+      static_cast<decltype(raw_value)>(format::CompressionCodec::LZ4_RAW);
   if (raw_value < min_value || raw_value > max_value) {
     return Compression::UNCOMPRESSED;
   }
@@ -257,6 +259,9 @@ static inline format::Type::type ToThrift(Type::type type) {
 static inline format::ConvertedType::type ToThrift(ConvertedType::type type) {
   // item 0 is NONE
   DCHECK_NE(type, ConvertedType::NONE);
+  // it is forbidden to emit "NA" (PARQUET-1990)
+  DCHECK_NE(type, ConvertedType::NA);
+  DCHECK_NE(type, ConvertedType::UNDEFINED);
   return static_cast<format::ConvertedType::type>(static_cast<int>(type) - 1);
 }
 
@@ -281,6 +286,9 @@ static inline format::CompressionCodec::type ToThrift(Compression::type type) {
     case Compression::BROTLI:
       return format::CompressionCodec::BROTLI;
     case Compression::LZ4:
+      return format::CompressionCodec::LZ4_RAW;
+    case Compression::LZ4_HADOOP:
+      // Deprecated "LZ4" Parquet compression has Hadoop-specific framing
       return format::CompressionCodec::LZ4;
     case Compression::ZSTD:
       return format::CompressionCodec::ZSTD;

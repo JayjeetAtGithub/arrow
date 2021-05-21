@@ -17,6 +17,7 @@
 
 #include <memory>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #ifdef ARROW_WITH_UTF8PROC
@@ -48,6 +49,14 @@ class BaseTestStringKernels : public ::testing::Test {
     CheckScalarUnary(func_name, type(), json_input, out_ty, json_expected, options);
   }
 
+  void CheckBinaryScalar(std::string func_name, std::string json_left_input,
+                         std::string json_right_scalar, std::shared_ptr<DataType> out_ty,
+                         std::string json_expected,
+                         const FunctionOptions* options = nullptr) {
+    CheckScalarBinaryScalar(func_name, type(), json_left_input, json_right_scalar, out_ty,
+                            json_expected, options);
+  }
+
   std::shared_ptr<DataType> type() { return TypeTraits<TestType>::type_singleton(); }
 
   std::shared_ptr<DataType> offset_type() {
@@ -61,8 +70,8 @@ class TestBinaryKernels : public BaseTestStringKernels<TestType> {};
 TYPED_TEST_SUITE(TestBinaryKernels, BinaryTypes);
 
 TYPED_TEST(TestBinaryKernels, BinaryLength) {
-  this->CheckUnary("binary_length", R"(["aaa", null, "", "b"])", this->offset_type(),
-                   "[3, null, 0, 1]");
+  this->CheckUnary("binary_length", R"(["aaa", null, "áéíóú", "", "b"])",
+                   this->offset_type(), "[3, null, 10, 0, 1]");
 }
 
 template <typename TestType>
@@ -99,6 +108,12 @@ TEST(TestStringKernels, LARGE_MEMORY_TEST(Utf8Upper32bitGrowth)) {
   EXPECT_RAISES_WITH_MESSAGE_THAT(CapacityError,
                                   testing::HasSubstr("Result might not fit"),
                                   CallFunction("utf8_upper", {scalar}, options));
+}
+
+TYPED_TEST(TestStringKernels, Utf8Length) {
+  this->CheckUnary("utf8_length",
+                   R"(["aaa", null, "áéíóú", "ɑɽⱤoW😀", "áéí 0😀", "", "b"])",
+                   this->offset_type(), "[3, null, 5, 6, 6, 0, 1]");
 }
 
 #ifdef ARROW_WITH_UTF8PROC
@@ -334,6 +349,299 @@ TYPED_TEST(TestStringKernels, MatchSubstring) {
                    &options_double_char_2);
 }
 
+#ifdef ARROW_WITH_RE2
+TYPED_TEST(TestStringKernels, MatchSubstringRegex) {
+  MatchSubstringOptions options{"ab"};
+  this->CheckUnary("match_substring_regex", "[]", boolean(), "[]", &options);
+  this->CheckUnary("match_substring_regex", R"(["abc", "acb", "cab", null, "bac"])",
+                   boolean(), "[true, false, true, null, false]", &options);
+  MatchSubstringOptions options_repeated{"(ab){2}"};
+  this->CheckUnary("match_substring_regex", R"(["abab", "ab", "cababc", null, "bac"])",
+                   boolean(), "[true, false, true, null, false]", &options_repeated);
+  MatchSubstringOptions options_digit{"\\d"};
+  this->CheckUnary("match_substring_regex", R"(["aacb", "a2ab", "", "24"])", boolean(),
+                   "[false, true, false, true]", &options_digit);
+  MatchSubstringOptions options_star{"a*b"};
+  this->CheckUnary("match_substring_regex", R"(["aacb", "aab", "dab", "caaab", "b", ""])",
+                   boolean(), "[true, true, true, true, true, false]", &options_star);
+  MatchSubstringOptions options_plus{"a+b"};
+  this->CheckUnary("match_substring_regex", R"(["aacb", "aab", "dab", "caaab", "b", ""])",
+                   boolean(), "[false, true, true, true, false, false]", &options_plus);
+
+  // Unicode character semantics
+  // "\pL" means: unicode category "letter"
+  // (re2 interprets "\w" as ASCII-only: https://github.com/google/re2/wiki/Syntax)
+  MatchSubstringOptions options_unicode{"^\\pL+$"};
+  this->CheckUnary("match_substring_regex", R"(["été", "ß", "€", ""])", boolean(),
+                   "[true, true, false, false]", &options_unicode);
+}
+
+TYPED_TEST(TestStringKernels, MatchSubstringRegexNoOptions) {
+  Datum input = ArrayFromJSON(this->type(), "[]");
+  ASSERT_RAISES(Invalid, CallFunction("match_substring_regex", {input}));
+}
+
+TYPED_TEST(TestStringKernels, MatchSubstringRegexInvalid) {
+  Datum input = ArrayFromJSON(this->type(), "[null]");
+  MatchSubstringOptions options{"invalid["};
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Invalid regular expression: missing ]"),
+      CallFunction("match_substring_regex", {input}, &options));
+}
+
+TYPED_TEST(TestStringKernels, MatchLike) {
+  auto inputs = R"(["foo", "bar", "foobar", "barfoo", "o", "\nfoo", "foo\n", null])";
+
+  MatchSubstringOptions prefix_match{"foo%"};
+  this->CheckUnary("match_like", "[]", boolean(), "[]", &prefix_match);
+  this->CheckUnary("match_like", inputs, boolean(),
+                   "[true, false, true, false, false, false, true, null]", &prefix_match);
+
+  MatchSubstringOptions suffix_match{"%foo"};
+  this->CheckUnary("match_like", inputs, boolean(),
+                   "[true, false, false, true, false, true, false, null]", &suffix_match);
+
+  MatchSubstringOptions substring_match{"%foo%"};
+  this->CheckUnary("match_like", inputs, boolean(),
+                   "[true, false, true, true, false, true, true, null]",
+                   &substring_match);
+
+  MatchSubstringOptions trivial_match{"%%"};
+  this->CheckUnary("match_like", inputs, boolean(),
+                   "[true, true, true, true, true, true, true, null]", &trivial_match);
+
+  MatchSubstringOptions regex_match{"foo%bar"};
+  this->CheckUnary("match_like", inputs, boolean(),
+                   "[false, false, true, false, false, false, false, null]",
+                   &regex_match);
+}
+
+TYPED_TEST(TestStringKernels, MatchLikeEscaping) {
+  auto inputs = R"(["%%foo", "_bar", "({", "\\baz"])";
+
+  MatchSubstringOptions escape_percent{"\\%%"};
+  this->CheckUnary("match_like", inputs, boolean(), "[true, false, false, false]",
+                   &escape_percent);
+
+  MatchSubstringOptions escape_underscore{"\\____"};
+  this->CheckUnary("match_like", inputs, boolean(), "[false, true, false, false]",
+                   &escape_underscore);
+
+  MatchSubstringOptions escape_regex{"(%"};
+  this->CheckUnary("match_like", inputs, boolean(), "[false, false, true, false]",
+                   &escape_regex);
+
+  MatchSubstringOptions escape_escape{"\\\\%"};
+  this->CheckUnary("match_like", inputs, boolean(), "[false, false, false, true]",
+                   &escape_escape);
+
+  MatchSubstringOptions special_chars{"!@#$^&*()[]{}.?"};
+  this->CheckUnary("match_like", R"(["!@#$^&*()[]{}.?"])", boolean(), "[true]",
+                   &special_chars);
+
+  MatchSubstringOptions escape_sequences{"\n\t%"};
+  this->CheckUnary("match_like", R"(["\n\tfoo\t", "\n\t", "\n"])", boolean(),
+                   "[true, true, false]", &escape_sequences);
+}
+#endif
+
+TYPED_TEST(TestStringKernels, SplitBasics) {
+  SplitPatternOptions options{" "};
+  // basics
+  this->CheckUnary("split_pattern", R"(["foo bar", "foo"])", list(this->type()),
+                   R"([["foo", "bar"], ["foo"]])", &options);
+  this->CheckUnary("split_pattern", R"(["foo bar", "foo", null])", list(this->type()),
+                   R"([["foo", "bar"], ["foo"], null])", &options);
+  // edgy cases
+  this->CheckUnary("split_pattern", R"(["f  o o "])", list(this->type()),
+                   R"([["f", "", "o", "o", ""]])", &options);
+  this->CheckUnary("split_pattern", "[]", list(this->type()), "[]", &options);
+  // longer patterns
+  SplitPatternOptions options_long{"---"};
+  this->CheckUnary("split_pattern", R"(["-foo---bar--", "---foo---b"])",
+                   list(this->type()), R"([["-foo", "bar--"], ["", "foo", "b"]])",
+                   &options_long);
+  SplitPatternOptions options_long_reverse{"---", -1, /*reverse=*/true};
+  this->CheckUnary("split_pattern", R"(["-foo---bar--", "---foo---b"])",
+                   list(this->type()), R"([["-foo", "bar--"], ["", "foo", "b"]])",
+                   &options_long_reverse);
+}
+
+TYPED_TEST(TestStringKernels, SplitMax) {
+  SplitPatternOptions options{"---", 2};
+  SplitPatternOptions options_reverse{"---", 2, /*reverse=*/true};
+  this->CheckUnary("split_pattern", R"(["foo---bar", "foo", "foo---bar------ar"])",
+                   list(this->type()),
+                   R"([["foo", "bar"], ["foo"], ["foo", "bar", "---ar"]])", &options);
+  this->CheckUnary(
+      "split_pattern", R"(["foo---bar", "foo", "foo---bar------ar"])", list(this->type()),
+      R"([["foo", "bar"], ["foo"], ["foo---bar", "", "ar"]])", &options_reverse);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceAscii) {
+  SplitOptions options;
+  SplitOptions options_max{1};
+  // basics
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar", "ba"]])",
+                   &options);
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar \tba"]])",
+                   &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceAsciiReverse) {
+  SplitOptions options{-1, /*reverse=*/true};
+  SplitOptions options_max{1, /*reverse=*/true};
+  // basics
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo", "bar", "ba"]])",
+                   &options);
+  this->CheckUnary("ascii_split_whitespace", R"(["foo bar", "foo  bar \tba"])",
+                   list(this->type()), R"([["foo", "bar"], ["foo  bar", "ba"]])",
+                   &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceUTF8) {
+  SplitOptions options;
+  SplitOptions options_max{1};
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar", "ba"]])", &options);
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar \tba"]])", &options_max);
+}
+
+TYPED_TEST(TestStringKernels, SplitWhitespaceUTF8Reverse) {
+  SplitOptions options{-1, /*reverse=*/true};
+  SplitOptions options_max{1, /*reverse=*/true};
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   R"([["foo", "bar"], ["foo", "bar", "ba"]])", &options);
+  this->CheckUnary("utf8_split_whitespace",
+                   "[\"foo bar\", \"foo\xe2\x80\x88  bar \\tba\"]", list(this->type()),
+                   "[[\"foo\", \"bar\"], [\"foo\xe2\x80\x88  bar\", \"ba\"]]",
+                   &options_max);
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstring) {
+  ReplaceSubstringOptions options{"foo", "bazz"};
+  this->CheckUnary("replace_substring", R"(["foo", "this foo that foo", null])",
+                   this->type(), R"(["bazz", "this bazz that bazz", null])", &options);
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstringLimited) {
+  ReplaceSubstringOptions options{"foo", "bazz", 1};
+  this->CheckUnary("replace_substring", R"(["foo", "this foo that foo", null])",
+                   this->type(), R"(["bazz", "this bazz that foo", null])", &options);
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstringNoOptions) {
+  Datum input = ArrayFromJSON(this->type(), "[]");
+  ASSERT_RAISES(Invalid, CallFunction("replace_substring", {input}));
+}
+
+#ifdef ARROW_WITH_RE2
+TYPED_TEST(TestStringKernels, ReplaceSubstringRegex) {
+  ReplaceSubstringOptions options_regex{"(fo+)\\s*", "\\1-bazz"};
+  this->CheckUnary("replace_substring_regex", R"(["foo ", "this foo   that foo", null])",
+                   this->type(), R"(["foo-bazz", "this foo-bazzthat foo-bazz", null])",
+                   &options_regex);
+  // make sure we match non-overlapping
+  ReplaceSubstringOptions options_regex2{"(a.a)", "aba\\1"};
+  this->CheckUnary("replace_substring_regex", R"(["aaaaaa"])", this->type(),
+                   R"(["abaaaaabaaaa"])", &options_regex2);
+
+  // ARROW-12774
+  ReplaceSubstringOptions options_regex3{"X", "Y"};
+  this->CheckUnary("replace_substring_regex",
+                   R"(["A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A"])",
+                   this->type(),
+                   R"(["A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A"])",
+                   &options_regex3);
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstringRegexLimited) {
+  // With a finite number of replacements
+  ReplaceSubstringOptions options1{"foo", "bazz", 1};
+  this->CheckUnary("replace_substring", R"(["foo", "this foo that foo", null])",
+                   this->type(), R"(["bazz", "this bazz that foo", null])", &options1);
+  ReplaceSubstringOptions options_regex1{"(fo+)\\s*", "\\1-bazz", 1};
+  this->CheckUnary("replace_substring_regex", R"(["foo ", "this foo   that foo", null])",
+                   this->type(), R"(["foo-bazz", "this foo-bazzthat foo", null])",
+                   &options_regex1);
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstringRegexNoOptions) {
+  Datum input = ArrayFromJSON(this->type(), "[]");
+  ASSERT_RAISES(Invalid, CallFunction("replace_substring_regex", {input}));
+}
+
+TYPED_TEST(TestStringKernels, ReplaceSubstringRegexInvalid) {
+  Datum input = ArrayFromJSON(this->type(), R"(["foo"])");
+  ReplaceSubstringOptions options{"invalid[", ""};
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Invalid regular expression: missing ]"),
+      CallFunction("replace_substring_regex", {input}, &options));
+
+  // Capture group number out of range
+  options = ReplaceSubstringOptions{"(.)", "\\9"};
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Invalid replacement string"),
+      CallFunction("replace_substring_regex", {input}, &options));
+}
+
+TYPED_TEST(TestStringKernels, ExtractRegex) {
+  ExtractRegexOptions options{"(?P<letter>[ab])(?P<digit>\\d)"};
+  auto type = struct_({field("letter", this->type()), field("digit", this->type())});
+  this->CheckUnary("extract_regex", R"([])", type, R"([])", &options);
+  this->CheckUnary(
+      "extract_regex", R"(["a1", "b2", "c3", null])", type,
+      R"([{"letter": "a", "digit": "1"}, {"letter": "b", "digit": "2"}, null, null])",
+      &options);
+  this->CheckUnary(
+      "extract_regex", R"(["a1", "c3", null, "b2"])", type,
+      R"([{"letter": "a", "digit": "1"}, null, null, {"letter": "b", "digit": "2"}])",
+      &options);
+  this->CheckUnary("extract_regex", R"(["a1", "b2"])", type,
+                   R"([{"letter": "a", "digit": "1"}, {"letter": "b", "digit": "2"}])",
+                   &options);
+  this->CheckUnary("extract_regex", R"(["a1", "zb3z"])", type,
+                   R"([{"letter": "a", "digit": "1"}, {"letter": "b", "digit": "3"}])",
+                   &options);
+}
+
+TYPED_TEST(TestStringKernels, ExtractRegexNoCapture) {
+  // XXX Should we accept this or is it a user error?
+  ExtractRegexOptions options{"foo"};
+  auto type = struct_({});
+  this->CheckUnary("extract_regex", R"(["oofoo", "bar", null])", type,
+                   R"([{}, null, null])", &options);
+}
+
+TYPED_TEST(TestStringKernels, ExtractRegexNoOptions) {
+  Datum input = ArrayFromJSON(this->type(), "[]");
+  ASSERT_RAISES(Invalid, CallFunction("extract_regex", {input}));
+}
+
+TYPED_TEST(TestStringKernels, ExtractRegexInvalid) {
+  Datum input = ArrayFromJSON(this->type(), "[]");
+  ExtractRegexOptions options{"invalid["};
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Invalid regular expression: missing ]"),
+      CallFunction("extract_regex", {input}, &options));
+
+  options = ExtractRegexOptions{"(.)"};
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Regular expression contains unnamed groups"),
+      CallFunction("extract_regex", {input}, &options));
+}
+
+#endif
+
 TYPED_TEST(TestStringKernels, Strptime) {
   std::string input1 = R"(["5/1/2020", null, "12/11/1900"])";
   std::string output1 = R"(["2020-05-01", null, "1900-12-11"])";
@@ -344,6 +652,66 @@ TYPED_TEST(TestStringKernels, Strptime) {
 TYPED_TEST(TestStringKernels, StrptimeDoesNotProvideDefaultOptions) {
   auto input = ArrayFromJSON(this->type(), R"(["2020-05-01", null, "1900-12-11"])");
   ASSERT_RAISES(Invalid, CallFunction("strptime", {input}));
+}
+
+#ifdef ARROW_WITH_UTF8PROC
+
+TYPED_TEST(TestStringKernels, TrimWhitespaceUTF8) {
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("utf8_trim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"foo bar\"]");
+  this->CheckUnary("utf8_rtrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(),
+                   "[\" \\tfoo\", null, \"bar\", \" \xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("utf8_ltrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar  \", \"foo bar \"]");
+}
+
+TYPED_TEST(TestStringKernels, TrimUTF8) {
+  TrimOptions options{"ȺA"};
+  this->CheckUnary("utf8_trim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"fooȺAȺbar\"]", &options);
+  this->CheckUnary("utf8_ltrim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"fooȺAȺ\", null, \"barȺAȺ\", \"fooȺAȺbarA\"]",
+                   &options);
+  this->CheckUnary("utf8_rtrim", "[\"ȺȺfooȺAȺ\", null, \"barȺAȺ\", \"ȺAȺfooȺAȺbarA\"]",
+                   this->type(), "[\"ȺȺfoo\", null, \"bar\", \"ȺAȺfooȺAȺbar\"]",
+                   &options);
+
+  TrimOptions options_invalid{"ɑa\xFFɑ"};
+  auto input = ArrayFromJSON(this->type(), "[\"foo\"]");
+  EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr("Invalid UTF8"),
+                                  CallFunction("utf8_trim", {input}, &options_invalid));
+}
+#endif
+
+TYPED_TEST(TestStringKernels, TrimWhitespaceAscii) {
+  // \xe2\x80\x88 is punctuation space
+  this->CheckUnary("ascii_trim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"\xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("ascii_rtrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(),
+                   "[\" \\tfoo\", null, \"bar\", \" \xe2\x80\x88 foo bar\"]");
+  this->CheckUnary("ascii_ltrim_whitespace",
+                   "[\" \\tfoo\", null, \"bar  \", \" \xe2\x80\x88 foo bar \"]",
+                   this->type(), "[\"foo\", null, \"bar  \", \"\xe2\x80\x88 foo bar \"]");
+}
+
+TYPED_TEST(TestStringKernels, TrimAscii) {
+  TrimOptions options{"BA"};
+  this->CheckUnary("ascii_trim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"foo\", null, \"bar\", \"fooBABbar\"]", &options);
+  this->CheckUnary("ascii_ltrim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"fooBAB\", null, \"barBAB\", \"fooBABbarA\"]",
+                   &options);
+  this->CheckUnary("ascii_rtrim", "[\"BBfooBAB\", null, \"barBAB\", \"BABfooBABbarA\"]",
+                   this->type(), "[\"BBfoo\", null, \"bar\", \"BABfooBABbar\"]",
+                   &options);
 }
 
 #ifdef ARROW_WITH_UTF8PROC

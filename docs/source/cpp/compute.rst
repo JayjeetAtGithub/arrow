@@ -31,8 +31,8 @@ The generic Compute API
 Functions and function registry
 -------------------------------
 
-Functions represent logical compute operations over inputs of possibly
-varying types.  Internally, a function is implemented by one or several
+Functions represent compute operations over inputs of possibly varying
+types.  Internally, a function is implemented by one or several
 "kernels", depending on the concrete input types (for example, a function
 adding values from two inputs can have different kernels depending on
 whether the inputs are integral or floating-point).
@@ -82,24 +82,77 @@ Many compute functions are also available directly as concrete APIs, here
 Some functions accept or require an options structure that determines the
 exact semantics of the function::
 
-   MinMaxOptions options;
-   options.null_handling = MinMaxOptions::OUTPUT_NULL;
+   MinMaxOptions min_max_options;
+   min_max_options.null_handling = MinMaxOptions::EMIT_NULL;
 
    std::shared_ptr<arrow::Array> array = ...;
-   arrow::Datum min_max_datum;
+   arrow::Datum min_max;
 
-   ARROW_ASSIGN_OR_RAISE(min_max_datum,
-                         arrow::compute::CallFunction("min_max", {array}, &options));
+   ARROW_ASSIGN_OR_RAISE(min_max,
+                         arrow::compute::CallFunction("min_max", {array},
+                                                      &min_max_options));
 
    // Unpack struct scalar result (a two-field {"min", "max"} scalar)
-   const auto& min_max_scalar = \
-         static_cast<const arrow::StructScalar&>(*min_max_datum.scalar());
-   const auto min_value = min_max_scalar.value[0];
-   const auto max_value = min_max_scalar.value[1];
+   std::shared_ptr<arrow::Scalar> min_value, max_value;
+   min_value = min_max.scalar_as<arrow::StructScalar>().value[0];
+   max_value = min_max.scalar_as<arrow::StructScalar>().value[1];
 
 .. seealso::
    :doc:`Compute API reference <api/compute>`
 
+Implicit casts
+==============
+
+Functions may require conversion of their arguments before execution if a
+kernel does not match the argument types precisely. For example comparison
+of dictionary encoded arrays is not directly supported by any kernel, but an
+implicit cast can be made allowing comparison against the decoded array.
+
+Each function may define implicit cast behaviour as appropriate. For example
+comparison and arithmetic kernels require identically typed arguments, and
+support execution against differing numeric types by promoting their arguments
+to numeric type which can accommodate any value from either input.
+
+.. _common-numeric-type:
+
+Common numeric type
+-------------------
+
+The common numeric type of a set of input numeric types is the smallest numeric
+type which can accommodate any value of any input. If any input is a floating
+point type the common numeric type is the widest floating point type among the
+inputs. Otherwise the common numeric type is integral and is signed if any input
+is signed. For example:
+
++-------------------+----------------------+------------------------------------------------+
+| Input types       | Common numeric type  | Notes                                          |
++===================+======================+================================================+
+| int32, int32      | int32                |                                                |
++-------------------+----------------------+------------------------------------------------+
+| int16, int32      | int32                | Max width is 32, promote LHS to int32          |
++-------------------+----------------------+------------------------------------------------+
+| uint16, int32     | int32                | One input signed, override unsigned            |
++-------------------+----------------------+------------------------------------------------+
+| uint32, int32     | int64                | Widen to accommodate range of uint32           |
++-------------------+----------------------+------------------------------------------------+
+| uint16, uint32    | uint32               | All inputs unsigned, maintain unsigned         |
++-------------------+----------------------+------------------------------------------------+
+| int16, uint32     | int64                |                                                |
++-------------------+----------------------+------------------------------------------------+
+| uint64, int16     | int64                | int64 cannot accommodate all uint64 values     |
++-------------------+----------------------+------------------------------------------------+
+| float32, int32    | float32              | Promote RHS to float32                         |
++-------------------+----------------------+------------------------------------------------+
+| float32, float64  | float64              |                                                |
++-------------------+----------------------+------------------------------------------------+
+| float32, int64    | float32              | int64 is wider, still promotes to float32      |
++-------------------+----------------------+------------------------------------------------+
+
+In particulary, note that comparing a ``uint64`` column to an ``int16`` column
+may emit an error if one of the ``uint64`` values cannot be expressed as the
+common type ``int64`` (for example, ``2 ** 63``).
+
+.. _compute-function-list:
 
 Available functions
 ===================
@@ -111,7 +164,8 @@ To avoid exhaustively listing supported types, the tables below use a number
 of general type categories:
 
 * "Numeric": Integer types (Int8, etc.) and Floating-point types (Float32,
-  Float64, sometimes Float16).  Some functions also accept Decimal128 input.
+  Float64, sometimes Float16).  Some functions also accept Decimal128 and
+  Decimal256 input.
 
 * "Temporal": Date types (Date32, Date64), Time types (Time32, Time64),
   Timestamp, Duration, Interval.
@@ -132,24 +186,43 @@ Aggregations
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
 | Function name            | Arity      | Input types        | Output type           | Options class                              |
 +==========================+============+====================+=======================+============================================+
+| all                      | Unary      | Boolean            | Scalar Boolean        |                                            |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
+| any                      | Unary      | Boolean            | Scalar Boolean        |                                            |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
 | count                    | Unary      | Any                | Scalar Int64          | :struct:`CountOptions`                     |
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
 | mean                     | Unary      | Numeric            | Scalar Float64        |                                            |
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
 | min_max                  | Unary      | Numeric            | Scalar Struct  (1)    | :struct:`MinMaxOptions`                    |
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
-| mode                     | Unary      | Numeric            | Scalar Struct  (2)    |                                            |
+| mode                     | Unary      | Numeric            | Struct  (2)           | :struct:`ModeOptions`                      |
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
-| sum                      | Unary      | Numeric            | Scalar Numeric (3)    |                                            |
+| quantile                 | Unary      | Numeric            | Scalar Numeric (3)    | :struct:`QuantileOptions`                  |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
+| stddev                   | Unary      | Numeric            | Scalar Float64        | :struct:`VarianceOptions`                  |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
+| sum                      | Unary      | Numeric            | Scalar Numeric (4)    |                                            |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
+| tdigest                  | Unary      | Numeric            | Scalar Float64        | :struct:`TDigestOptions`                   |
++--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
+| variance                 | Unary      | Numeric            | Scalar Float64        | :struct:`VarianceOptions`                  |
 +--------------------------+------------+--------------------+-----------------------+--------------------------------------------+
 
 Notes:
 
-* \(1) Output is a ``{"min": input type, "max": input type}`` Struct
+* \(1) Output is a ``{"min": input type, "max": input type}`` Struct.
 
-* \(2) Output is a ``{"mode": input type, "count": Int64}`` Struct
+* \(2) Output is an array of ``{"mode": input type, "count": Int64}`` Struct.
+  It contains the *N* most common elements in the input, in descending
+  order, where *N* is given in :member:`ModeOptions::n`.
+  If two values have the same count, the smallest one comes first.
+  Note that the output can have less than *N* elements if the input has
+  less than *N* distinct values.
 
-* \(3) Output is Int64, UInt64 or Float64, depending on the input type
+* \(3) Output is Float64 or input type, depending on QuantileOptions.
+
+* \(4) Output is Int64, UInt64 or Float64, depending on the input type.
 
 Element-wise ("scalar") functions
 ---------------------------------
@@ -173,9 +246,11 @@ Binary functions have the following semantics (which is sometimes called
 Arithmetic functions
 ~~~~~~~~~~~~~~~~~~~~
 
-These functions expect two inputs of the same type and apply a given binary
-operation to each pair of elements gathered from the inputs.  If any of the
-input elements in a pair is null, the corresponding output element is null.
+These functions expect inputs of numeric type and apply a given arithmetic
+operation to each element(s) gathered from the input(s).  If any of the
+input element(s) is null, the corresponding output element is null.
+Input(s) will be cast to the :ref:`common numeric type <common-numeric-type>`
+(and dictionary decoded, if applicable) before the operation is applied.
 
 The default variant of these functions does not detect overflow (the result
 then typically wraps around).  Each function is also available in an
@@ -185,6 +260,10 @@ an ``Invalid`` :class:`Status` when overflow is detected.
 +--------------------------+------------+--------------------+---------------------+
 | Function name            | Arity      | Input types        | Output type         |
 +==========================+============+====================+=====================+
+| abs                      | Unary      | Numeric            | Numeric             |
++--------------------------+------------+--------------------+---------------------+
+| abs_checked              | Unary      | Numeric            | Numeric             |
++--------------------------+------------+--------------------+---------------------+
 | add                      | Binary     | Numeric            | Numeric             |
 +--------------------------+------------+--------------------+---------------------+
 | add_checked              | Binary     | Numeric            | Numeric             |
@@ -197,6 +276,14 @@ an ``Invalid`` :class:`Status` when overflow is detected.
 +--------------------------+------------+--------------------+---------------------+
 | multiply_checked         | Binary     | Numeric            | Numeric             |
 +--------------------------+------------+--------------------+---------------------+
+| negate                   | Unary      | Numeric            | Numeric             |
++--------------------------+------------+--------------------+---------------------+
+| negate_checked           | Unary      | Signed Numeric     | Signed Numeric      |
++--------------------------+------------+--------------------+---------------------+
+| power                    | Binary     | Numeric            | Numeric             |
++--------------------------+------------+--------------------+---------------------+
+| power_checked            | Binary     | Numeric            | Numeric             |
++--------------------------+------------+--------------------+---------------------+
 | subtract                 | Binary     | Numeric            | Numeric             |
 +--------------------------+------------+--------------------+---------------------+
 | subtract_checked         | Binary     | Numeric            | Numeric             |
@@ -205,9 +292,12 @@ an ``Invalid`` :class:`Status` when overflow is detected.
 Comparisons
 ~~~~~~~~~~~
 
-Those functions expect two inputs of the same type and apply a given
-comparison operator.  If any of the input elements in a pair is null,
-the corresponding output element is null.
+These functions expect two inputs of numeric type (in which case they will be
+cast to the :ref:`common numeric type <common-numeric-type>` before comparison),
+or two inputs of Binary- or String-like types, or two inputs of Temporal types.
+If any input is dictionary encoded it will be expanded for the purposes of
+comparison. If any of the input elements in a pair is null, the corresponding
+output element is null.
 
 +--------------------------+------------+---------------------------------------------+---------------------+
 | Function names           | Arity      | Input types                                 | Output type         |
@@ -242,7 +332,11 @@ For the Kleene logic variants, therefore:
 +==========================+============+====================+=====================+
 | and                      | Binary     | Boolean            | Boolean             |
 +--------------------------+------------+--------------------+---------------------+
+| and_not                  | Binary     | Boolean            | Boolean             |
++--------------------------+------------+--------------------+---------------------+
 | and_kleene               | Binary     | Boolean            | Boolean             |
++--------------------------+------------+--------------------+---------------------+
+| and_not_kleene           | Binary     | Boolean            | Boolean             |
 +--------------------------+------------+--------------------+---------------------+
 | invert                   | Unary      | Boolean            | Boolean             |
 +--------------------------+------------+--------------------+---------------------+
@@ -340,19 +434,25 @@ The third set of functions examines string elements on a byte-per-byte basis:
 String transforms
 ~~~~~~~~~~~~~~~~~
 
-+--------------------------+------------+-------------------------+---------------------+---------+
-| Function name            | Arity      | Input types             | Output type         | Notes   |
-+==========================+============+=========================+=====================+=========+
-| ascii_lower              | Unary      | String-like             | String-like         | \(1)    |
-+--------------------------+------------+-------------------------+---------------------+---------+
-| ascii_upper              | Unary      | String-like             | String-like         | \(1)    |
-+--------------------------+------------+-------------------------+---------------------+---------+
-| binary_length            | Unary      | Binary- or String-like  | Int32 or Int64      | \(2)    |
-+--------------------------+------------+-------------------------+---------------------+---------+
-| utf8_lower               | Unary      | String-like             | String-like         | \(3)    |
-+--------------------------+------------+-------------------------+---------------------+---------+
-| utf8_upper               | Unary      | String-like             | String-like         | \(3)    |
-+--------------------------+------------+-------------------------+---------------------+---------+
++--------------------------+------------+-------------------------+---------------------+-------------------------------------------------+
+| Function name            | Arity      | Input types             | Output type         | Notes   | Options class                         |
++==========================+============+=========================+=====================+=========+=======================================+
+| ascii_lower              | Unary      | String-like             | String-like         | \(1)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| ascii_upper              | Unary      | String-like             | String-like         | \(1)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| binary_length            | Unary      | Binary- or String-like  | Int32 or Int64      | \(2)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| replace_substring        | Unary      | String-like             | String-like         | \(3)    | :struct:`ReplaceSubstringOptions`     |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| replace_substring_regex  | Unary      | String-like             | String-like         | \(4)    | :struct:`ReplaceSubstringOptions`     |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| utf8_length              | Unary      | String-like             | Int32 or Int64      | \(5)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| utf8_lower               | Unary      | String-like             | String-like         | \(6)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
+| utf8_upper               | Unary      | String-like             | String-like         | \(6)    |                                       |
++--------------------------+------------+-------------------------+---------------------+---------+---------------------------------------+
 
 
 * \(1) Each ASCII character in the input is converted to lowercase or
@@ -361,61 +461,195 @@ String transforms
 * \(2) Output is the physical length in bytes of each input element.  Output
   type is Int32 for Binary / String, Int64 for LargeBinary / LargeString.
 
-* \(3) Each UTF8-encoded character in the input is converted to lowercase or
+* \(3) Replace non-overlapping substrings that match to
+  :member:`ReplaceSubstringOptions::pattern` by
+  :member:`ReplaceSubstringOptions::replacement`. If
+  :member:`ReplaceSubstringOptions::max_replacements` != -1, it determines the
+  maximum number of replacements made, counting from the left.
+
+* \(4) Replace non-overlapping substrings that match to the regular expression
+  :member:`ReplaceSubstringOptions::pattern` by
+  :member:`ReplaceSubstringOptions::replacement`, using the Google RE2 library. If
+  :member:`ReplaceSubstringOptions::max_replacements` != -1, it determines the
+  maximum number of replacements made, counting from the left. Note that if the
+  pattern contains groups, backreferencing can be used.
+
+* \(5) Output is the number of characters (not bytes) of each input element.
+  Output type is Int32 for String, Int64 for LargeString. 
+
+* \(6) Each UTF8-encoded character in the input is converted to lowercase or
   uppercase.
 
+
+String trimming
+~~~~~~~~~~~~~~~
+
+These functions trim off characters on both sides (trim), or the left (ltrim) or right side (rtrim).
+
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| Function name            | Arity      | Input types             | Output type         | Options class                          | Notes   |
++==========================+============+=========================+=====================+========================================+=========+
+| ascii_ltrim              | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(1)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| ascii_ltrim_whitespace   | Unary      | String-like             | String-like         |                                        | \(2)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| ascii_rtrim              | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(1)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| ascii_rtrim_whitespace   | Unary      | String-like             | String-like         |                                        | \(2)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| ascii_trim               | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(1)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| ascii_trim_whitespace    | Unary      | String-like             | String-like         |                                        | \(2)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_ltrim               | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(3)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_ltrim_whitespace    | Unary      | String-like             | String-like         |                                        | \(4)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_rtrim               | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(3)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_rtrim_whitespace    | Unary      | String-like             | String-like         |                                        | \(4)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_trim                | Unary      | String-like             | String-like         | :struct:`TrimOptions`                  | \(3)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+| utf8_trim_whitespace     | Unary      | String-like             | String-like         |                                        | \(4)    |
++--------------------------+------------+-------------------------+---------------------+----------------------------------------+---------+
+
+* \(1) Only characters specified in :member:`TrimOptions::characters` will be
+  trimmed off. Both the input string and the `characters` argument are
+  interpreted as ASCII characters.
+
+* \(2) Only trim off ASCII whitespace characters (``'\t'``, ``'\n'``, ``'\v'``,
+  ``'\f'``, ``'\r'``  and ``' '``).
+
+* \(3) Only characters specified in :member:`TrimOptions::characters` will be
+  trimmed off.
+
+* \(4) Only trim off Unicode whitespace characters.
+
+
 Containment tests
+~~~~~~~~~~~~~~~~~
+
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+| Function name             | Arity      | Input types                        | Output type   | Options class                          |
++===========================+============+====================================+===============+========================================+
+| match_like                | Unary      | String-like                        | Boolean (1)   | :struct:`MatchSubstringOptions`        |
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+| match_substring           | Unary      | String-like                        | Boolean (2)   | :struct:`MatchSubstringOptions`        |
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+| match_substring_regex     | Unary      | String-like                        | Boolean (3)   | :struct:`MatchSubstringOptions`        |
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+| index_in                  | Unary      | Boolean, Null, Numeric, Temporal,  | Int32 (4)     | :struct:`SetLookupOptions`             |
+|                           |            | Binary- and String-like            |               |                                        |
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+| is_in                     | Unary      | Boolean, Null, Numeric, Temporal,  | Boolean (5)   | :struct:`SetLookupOptions`             |
+|                           |            | Binary- and String-like            |               |                                        |
++---------------------------+------------+------------------------------------+---------------+----------------------------------------+
+
+* \(1) Output is true iff the SQL-style LIKE pattern
+  :member:`MatchSubstringOptions::pattern` fully matches the
+  corresponding input element. That is, ``%`` will match any number of
+  characters, ``_`` will match exactly one character, and any other
+  character matches itself. To match a literal percent sign or
+  underscore, precede the character with a backslash.
+
+* \(2) Output is true iff :member:`MatchSubstringOptions::pattern`
+  is a substring of the corresponding input element.
+
+* \(3) Output is true iff :member:`MatchSubstringOptions::pattern`
+  matches the corresponding input element at any position.
+
+* \(4) Output is the index of the corresponding input element in
+  :member:`SetLookupOptions::value_set`, if found there.  Otherwise,
+  output is null.
+
+* \(5) Output is true iff the corresponding input element is equal to one
+  of the elements in :member:`SetLookupOptions::value_set`.
+
+
+String splitting
+~~~~~~~~~~~~~~~~
+
+These functions split strings into lists of strings.  All kernels can optionally
+be configured with a ``max_splits`` and a ``reverse`` parameter, where
+``max_splits == -1`` means no limit (the default).  When ``reverse`` is true,
+the splitting is done starting from the end of the string; this is only relevant
+when a positive ``max_splits`` is given.
+
++--------------------------+------------+-------------------------+-------------------+----------------------------------+---------+
+| Function name            | Arity      | Input types             | Output type       | Options class                    | Notes   |
++==========================+============+=========================+===================+==================================+=========+
+| split_pattern            | Unary      | String-like             | List-like         | :struct:`SplitPatternOptions`    | \(1)    |
++--------------------------+------------+-------------------------+-------------------+----------------------------------+---------+
+| utf8_split_whitespace    | Unary      | String-like             | List-like         | :struct:`SplitOptions`           | \(2)    |
++--------------------------+------------+-------------------------+-------------------+----------------------------------+---------+
+| ascii_split_whitespace   | Unary      | String-like             | List-like         | :struct:`SplitOptions`           | \(3)    |
++--------------------------+------------+-------------------------+-------------------+----------------------------------+---------+
+
+* \(1) The string is split when an exact pattern is found (the pattern itself
+  is not included in the output).
+
+* \(2) A non-zero length sequence of Unicode defined whitespace codepoints
+  is seen as separator.
+
+* \(3) A non-zero length sequence of ASCII defined whitespace bytes
+  (``'\t'``, ``'\n'``, ``'\v'``, ``'\f'``, ``'\r'``  and ``' '``) is seen
+  as separator.
+
+
+String extraction
 ~~~~~~~~~~~~~~~~~
 
 +--------------------+------------+------------------------------------+---------------+----------------------------------------+
 | Function name      | Arity      | Input types                        | Output type   | Options class                          |
 +====================+============+====================================+===============+========================================+
-| match_substring    | Unary      | String-like                        | Boolean (1)   | :struct:`MatchSubstringOptions`        |
-+--------------------+------------+------------------------------------+---------------+----------------------------------------+
-| index_in           | Unary      | Boolean, Null, Numeric, Temporal,  | Int32 (2)     | :struct:`SetLookupOptions`             |
-|                    |            | Binary- and String-like            |               |                                        |
-+--------------------+------------+------------------------------------+---------------+----------------------------------------+
-| is_in              | Unary      | Boolean, Null, Numeric, Temporal,  | Boolean (3)   | :struct:`SetLookupOptions`             |
-|                    |            | Binary- and String-like            |               |                                        |
+| extract_regex      | Unary      | String-like                        | Struct (1)    | :struct:`ExtractRegexOptions`          |
 +--------------------+------------+------------------------------------+---------------+----------------------------------------+
 
-* \(1) Output is true iff :member:`MatchSubstringOptions::pattern`
-  is a substring of the corresponding input element.
+* \(1) Extract substrings defined by a regular expression using the Google RE2
+  library.  The output struct field names refer to the named capture groups,
+  e.g. 'letter' and 'digit' for the regular expression
+  ``(?P<letter>[ab])(?P<digit>\\d)``.
 
-* \(2) Output is the index of the corresponding input element in
-  :member:`SetLookupOptions::value_set`, if found there.  Otherwise,
-  output is null.
-
-* \(3) Output is true iff the corresponding input element is equal to one
-  of the elements in :member:`SetLookupOptions::value_set`.
 
 Structural transforms
 ~~~~~~~~~~~~~~~~~~~~~
 
 .. XXX (this category is a bit of a hodgepodge)
 
-+--------------------------+------------+---------------------------------------+---------------------+---------+
-| Function name            | Arity      | Input types                           | Output type         | Notes   |
-+==========================+============+=======================================+=====================+=========+
-| fill_null                | Binary     | Boolean, Null, Numeric, Temporal      | Boolean             | \(1)    |
-+--------------------------+------------+---------------------------------------+---------------------+---------+
-| is_null                  | Unary      | Any                                   | Boolean             | \(2)    |
-+--------------------------+------------+---------------------------------------+---------------------+---------+
-| is_valid                 | Unary      | Any                                   | Boolean             | \(2)    |
-+--------------------------+------------+---------------------------------------+---------------------+---------+
-| list_value_length        | Unary      | List-like                             | Int32 or Int64      | \(4)    |
-+--------------------------+------------+---------------------------------------+---------------------+---------+
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| Function name            | Arity      | Input types                                    | Output type         | Notes   |
++==========================+============+================================================+=====================+=========+
+| fill_null                | Binary     | Boolean, Null, Numeric, Temporal, String-like  | Input type          | \(1)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| is_nan                   | Unary      | Float, Double                                  | Boolean             | \(2)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| is_null                  | Unary      | Any                                            | Boolean             | \(3)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| is_valid                 | Unary      | Any                                            | Boolean             | \(4)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| list_value_length        | Unary      | List-like                                      | Int32 or Int64      | \(5)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
+| project                  | Varargs    | Any                                            | Struct              | \(6)    |
++--------------------------+------------+------------------------------------------------+---------------------+---------+
 
 * \(1) First input must be an array, second input a scalar of the same type.
   Output is an array of the same type as the inputs, and with the same values
   as the first input, except for nulls replaced with the second input value.
 
-* \(2) Output is true iff the corresponding input element is non-null.
+* \(2) Output is true iff the corresponding input element is NaN.
 
 * \(3) Output is true iff the corresponding input element is null.
 
-* \(4) Each output element is the length of the corresponding input element
+* \(4) Output is true iff the corresponding input element is non-null.
+
+* \(5) Each output element is the length of the corresponding input element
   (null if input is null).  Output type is Int32 for List, Int64 for LargeList.
+
+* \(6) The output struct's field types are the types of its arguments. The
+  field names are specified using an instance of :struct:`ProjectOptions`.
+  The output shape will be scalar if all inputs are scalar, otherwise any
+  scalars will be broadcast to arrays.
 
 Conversions
 ~~~~~~~~~~~
@@ -572,32 +806,43 @@ Sorts and partitions
 
 In these functions, nulls are considered greater than any other value
 (they will be sorted or partitioned at the end of the array).
+Floating-point NaN values are considered greater than any other non-null
+value, but smaller than nulls.
 
-+-----------------------+------------+-------------------------+-------------------+--------------------------------+-------------+
-| Function name         | Arity      | Input types             | Output type       | Options class                  | Notes       |
-+=======================+============+=========================+===================+================================+=============+
-| partition_nth_indices | Unary      | Binary- and String-like | UInt64            | :struct:`PartitionNthOptions`  | \(1) \(3)   |
-+-----------------------+------------+-------------------------+-------------------+--------------------------------+-------------+
-| partition_nth_indices | Unary      | Numeric                 | UInt64            | :struct:`PartitionNthOptions`  | \(1)        |
-+-----------------------+------------+-------------------------+-------------------+--------------------------------+-------------+
-| sort_indices          | Unary      | Binary- and String-like | UInt64            |                                | \(2) \(3)   |
-+-----------------------+------------+-------------------------+-------------------+--------------------------------+-------------+
-| sort_indices          | Unary      | Numeric                 | UInt64            |                                | \(2)        |
-+-----------------------+------------+-------------------------+-------------------+--------------------------------+-------------+
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| Function name         | Arity      | Input types             | Output type       | Options class                  | Notes          |
++=======================+============+=========================+===================+================================+================+
+| partition_nth_indices | Unary      | Binary- and String-like | UInt64            | :struct:`PartitionNthOptions`  | \(1) \(3)      |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| partition_nth_indices | Unary      | Numeric                 | UInt64            | :struct:`PartitionNthOptions`  | \(1)           |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| array_sort_indices    | Unary      | Binary- and String-like | UInt64            | :struct:`ArraySortOptions`     | \(2) \(3) \(4) |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| array_sort_indices    | Unary      | Numeric                 | UInt64            | :struct:`ArraySortOptions`     | \(2) \(4)      |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| sort_indices          | Unary      | Binary- and String-like | UInt64            | :struct:`SortOptions`          | \(2) \(3) \(5) |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
+| sort_indices          | Unary      | Numeric                 | UInt64            | :struct:`SortOptions`          | \(2) \(5)      |
++-----------------------+------------+-------------------------+-------------------+--------------------------------+----------------+
 
 * \(1) The output is an array of indices into the input array, that define
-  a partial sort such that the *N*'th index points to the *N*'th element
-  in sorted order, and all indices before the *N*'th point to elements
-  less or equal to elements at or after the *N*'th (similar to
+  a partial non-stable sort such that the *N*'th index points to the *N*'th
+  element in sorted order, and all indices before the *N*'th point to
+  elements less or equal to elements at or after the *N*'th (similar to
   :func:`std::nth_element`).  *N* is given in
   :member:`PartitionNthOptions::pivot`.
 
-* \(2) The output is an array of indices into the input array, that define
-  a non-stable sort of the input array.
+* \(2) The output is an array of indices into the input, that define a
+  stable sort of the input.
 
 * \(3) Input values are ordered lexicographically as bytestrings (even
   for String arrays).
 
+* \(4) The input must be an array. The default order is ascending.
+
+* \(5) The input can be an array, chunked array, record batch or
+  table. If the input is a record batch or table, one or more sort
+  keys must be specified.
 
 Structural transforms
 ~~~~~~~~~~~~~~~~~~~~~
@@ -617,3 +862,4 @@ Structural transforms
 * \(2) For each value in the list child array, the index at which it is found
   in the list array is appended to the output.  Nulls in the parent list array
   are discarded.
+

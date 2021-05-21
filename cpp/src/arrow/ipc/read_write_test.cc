@@ -27,8 +27,7 @@
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
-#include "arrow/buffer.h"
-#include "arrow/builder.h"
+#include "arrow/array/builder_primitive.h"
 #include "arrow/io/file.h"
 #include "arrow/io/memory.h"
 #include "arrow/io/test_common.h"
@@ -37,18 +36,18 @@
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/test_common.h"
 #include "arrow/ipc/writer.h"
-#include "arrow/memory_pool.h"
 #include "arrow/record_batch.h"
-#include "arrow/sparse_tensor.h"
 #include "arrow/status.h"
-#include "arrow/tensor.h"
+#include "arrow/table.h"
 #include "arrow/testing/extension_type.h"
+#include "arrow/testing/future_util.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
 #include "arrow/testing/util.h"
-#include "arrow/type.h"
+#include "arrow/type_fwd.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
 
 #include "generated/Message_generated.h"  // IWYU pragma: keep
@@ -57,14 +56,13 @@ namespace arrow {
 
 using internal::checked_cast;
 using internal::GetByteWidth;
+using internal::TemporaryDir;
 
 namespace ipc {
 
 using internal::FieldPosition;
 
 namespace test {
-
-using BatchVector = std::vector<std::shared_ptr<RecordBatch>>;
 
 const std::vector<MetadataVersion> kMetadataVersions = {MetadataVersion::V4,
                                                         MetadataVersion::V5};
@@ -375,7 +373,14 @@ class ExtensionTypesMixin {
 
 class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
  public:
-  void SetUp() { options_ = IpcWriteOptions::Defaults(); }
+  void SetUp() {
+    options_ = IpcWriteOptions::Defaults();
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("ipc-test-"));
+  }
+
+  std::string TempFile(util::string_view file) {
+    return temp_dir_->path().Join(std::string(file)).ValueOrDie().ToString();
+  }
 
   void DoSchemaRoundTrip(const Schema& schema, std::shared_ptr<Schema>* result) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Buffer> serialized_schema,
@@ -437,8 +442,8 @@ class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
                       int64_t buffer_size = 1 << 20) {
     std::stringstream ss;
     ss << "test-write-row-batch-" << g_file_number++;
-    ASSERT_OK_AND_ASSIGN(mmap_,
-                         io::MemoryMapFixture::InitMemoryMap(buffer_size, ss.str()));
+    ASSERT_OK_AND_ASSIGN(
+        mmap_, io::MemoryMapFixture::InitMemoryMap(buffer_size, TempFile(ss.str())));
 
     std::shared_ptr<Schema> schema_result;
     DoSchemaRoundTrip(*batch.schema(), &schema_result);
@@ -469,6 +474,7 @@ class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
  protected:
   std::shared_ptr<io::MemoryMappedFile> mmap_;
   IpcWriteOptions options_;
+  std::unique_ptr<TemporaryDir> temp_dir_;
 };
 
 TEST(MetadataVersion, ForwardsCompatCheck) {
@@ -611,7 +617,7 @@ TEST_F(TestWriteRecordBatch, WriteWithCompression) {
       continue;
     }
     IpcWriteOptions write_options = IpcWriteOptions::Defaults();
-    write_options.compression = codec;
+    ASSERT_OK_AND_ASSIGN(write_options.codec, util::Codec::Create(codec));
     CheckRoundtrip(*batch, write_options);
 
     // Check non-parallel read and write
@@ -628,9 +634,9 @@ TEST_F(TestWriteRecordBatch, WriteWithCompression) {
     if (!util::Codec::IsAvailable(codec)) {
       continue;
     }
-    IpcWriteOptions options = IpcWriteOptions::Defaults();
-    options.compression = codec;
-    ASSERT_RAISES(Invalid, SerializeRecordBatch(*batch, options));
+    IpcWriteOptions write_options = IpcWriteOptions::Defaults();
+    ASSERT_OK_AND_ASSIGN(write_options.codec, util::Codec::Create(codec));
+    ASSERT_RAISES(Invalid, SerializeRecordBatch(*batch, write_options));
   }
 }
 
@@ -644,10 +650,9 @@ TEST_F(TestWriteRecordBatch, SliceTruncatesBinaryOffsets) {
   auto batch = RecordBatch::Make(schema, array->length(), {array});
   auto sliced_batch = batch->Slice(0, 5);
 
-  std::stringstream ss;
-  ss << "test-truncate-offsets";
   ASSERT_OK_AND_ASSIGN(
-      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20, ss.str()));
+      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20,
+                                                 TempFile("test-truncate-offsets")));
   DictionaryMemo dictionary_memo;
   ASSERT_OK_AND_ASSIGN(
       auto result,
@@ -732,10 +737,9 @@ TEST_F(TestWriteRecordBatch, RoundtripPreservesBufferSizes) {
   auto arr = rg.String(length, 0, 10, 0.1);
   auto batch = RecordBatch::Make(::arrow::schema({field("f0", utf8())}), length, {arr});
 
-  std::stringstream ss;
-  ss << "test-roundtrip-buffer-sizes";
   ASSERT_OK_AND_ASSIGN(
-      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20, ss.str()));
+      mmap_, io::MemoryMapFixture::InitMemoryMap(
+                 /*buffer_size=*/1 << 20, TempFile("test-roundtrip-buffer-sizes")));
   DictionaryMemo dictionary_memo;
   ASSERT_OK_AND_ASSIGN(
       auto result,
@@ -787,7 +791,15 @@ TEST_F(TestWriteRecordBatch, IntegerGetRecordBatchSize) {
 
 class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
  public:
-  void SetUp() { pool_ = default_memory_pool(); }
+  void SetUp() {
+    pool_ = default_memory_pool();
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("ipc-recursion-limits-test-"));
+  }
+
+  std::string TempFile(util::string_view file) {
+    return temp_dir_->path().Join(std::string(file)).ValueOrDie().ToString();
+  }
+
   void TearDown() { io::MemoryMapFixture::TearDown(); }
 
   Status WriteToMmap(int recursion_level, bool override_level, int32_t* metadata_length,
@@ -813,8 +825,8 @@ class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
     std::stringstream ss;
     ss << "test-write-past-max-recursion-" << g_file_number++;
     const int memory_map_size = 1 << 20;
-    ARROW_ASSIGN_OR_RAISE(mmap_,
-                          io::MemoryMapFixture::InitMemoryMap(memory_map_size, ss.str()));
+    ARROW_ASSIGN_OR_RAISE(
+        mmap_, io::MemoryMapFixture::InitMemoryMap(memory_map_size, TempFile(ss.str())));
 
     auto options = IpcWriteOptions::Defaults();
     if (override_level) {
@@ -826,6 +838,7 @@ class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
 
  protected:
   std::shared_ptr<io::MemoryMappedFile> mmap_;
+  std::unique_ptr<TemporaryDir> temp_dir_;
   MemoryPool* pool_;
 };
 
@@ -897,6 +910,8 @@ TEST_F(RecursionLimits, StressLimit) {
 #endif  // !defined(_WIN32) || defined(NDEBUG)
 
 struct FileWriterHelper {
+  static constexpr bool kIsFileFormat = true;
+
   Status Init(const std::shared_ptr<Schema>& schema, const IpcWriteOptions& options,
               const std::shared_ptr<const KeyValueMetadata>& metadata = nullptr) {
     num_batches_written_ = 0;
@@ -914,18 +929,28 @@ struct FileWriterHelper {
     return Status::OK();
   }
 
-  Status Finish() {
+  Status WriteTable(const RecordBatchVector& batches) {
+    num_batches_written_ += static_cast<int>(batches.size());
+    ARROW_ASSIGN_OR_RAISE(auto table, Table::FromRecordBatches(batches));
+    return writer_->WriteTable(*table);
+  }
+
+  Status Finish(WriteStats* out_stats = nullptr) {
     RETURN_NOT_OK(writer_->Close());
+    if (out_stats) {
+      *out_stats = writer_->stats();
+    }
     RETURN_NOT_OK(sink_->Close());
     // Current offset into stream is the end of the file
     return sink_->Tell().Value(&footer_offset_);
   }
 
-  Status ReadBatches(const IpcReadOptions& options, BatchVector* out_batches) {
+  virtual Status ReadBatches(const IpcReadOptions& options,
+                             RecordBatchVector* out_batches,
+                             ReadStats* out_stats = nullptr) {
     auto buf_reader = std::make_shared<io::BufferReader>(buffer_);
-    std::shared_ptr<RecordBatchFileReader> reader;
-    ARROW_ASSIGN_OR_RAISE(
-        reader, RecordBatchFileReader::Open(buf_reader.get(), footer_offset_, options));
+    ARROW_ASSIGN_OR_RAISE(auto reader, RecordBatchFileReader::Open(
+                                           buf_reader.get(), footer_offset_, options));
 
     EXPECT_EQ(num_batches_written_, reader->num_record_batches());
     for (int i = 0; i < num_batches_written_; ++i) {
@@ -933,7 +958,9 @@ struct FileWriterHelper {
                             reader->ReadRecordBatch(i));
       out_batches->push_back(chunk);
     }
-
+    if (out_stats) {
+      *out_stats = reader->stats();
+    }
     return Status::OK();
   }
 
@@ -965,7 +992,45 @@ struct FileWriterHelper {
   int64_t footer_offset_;
 };
 
+struct FileGeneratorWriterHelper : public FileWriterHelper {
+  Status ReadBatches(const IpcReadOptions& options, RecordBatchVector* out_batches,
+                     ReadStats* out_stats = nullptr) override {
+    auto buf_reader = std::make_shared<io::BufferReader>(buffer_);
+    AsyncGenerator<std::shared_ptr<RecordBatch>> generator;
+
+    {
+      auto fut =
+          RecordBatchFileReader::OpenAsync(buf_reader.get(), footer_offset_, options);
+      // Do NOT assert OK since some tests check whether this fails properly
+      EXPECT_FINISHES(fut);
+      ARROW_ASSIGN_OR_RAISE(auto reader, fut.result());
+      EXPECT_EQ(num_batches_written_, reader->num_record_batches());
+      // Generator will keep reader alive internally
+      ARROW_ASSIGN_OR_RAISE(generator, reader->GetRecordBatchGenerator());
+    }
+
+    // Generator is async-reentrant
+    std::vector<Future<std::shared_ptr<RecordBatch>>> futures;
+    for (int i = 0; i < num_batches_written_; ++i) {
+      futures.push_back(generator());
+    }
+    auto fut = generator();
+    EXPECT_FINISHES_OK_AND_EQ(nullptr, fut);
+    for (auto& future : futures) {
+      EXPECT_FINISHES_OK_AND_ASSIGN(auto batch, future);
+      out_batches->push_back(batch);
+    }
+
+    // The generator doesn't track stats.
+    EXPECT_EQ(nullptr, out_stats);
+
+    return Status::OK();
+  }
+};
+
 struct StreamWriterHelper {
+  static constexpr bool kIsFileFormat = false;
+
   Status Init(const std::shared_ptr<Schema>& schema, const IpcWriteOptions& options) {
     ARROW_ASSIGN_OR_RAISE(buffer_, AllocateResizableBuffer(0));
     sink_.reset(new io::BufferOutputStream(buffer_));
@@ -978,16 +1043,29 @@ struct StreamWriterHelper {
     return Status::OK();
   }
 
-  Status Finish() {
+  Status WriteTable(const RecordBatchVector& batches) {
+    ARROW_ASSIGN_OR_RAISE(auto table, Table::FromRecordBatches(batches));
+    return writer_->WriteTable(*table);
+  }
+
+  Status Finish(WriteStats* out_stats = nullptr) {
     RETURN_NOT_OK(writer_->Close());
+    if (out_stats) {
+      *out_stats = writer_->stats();
+    }
     return sink_->Close();
   }
 
-  virtual Status ReadBatches(const IpcReadOptions& options, BatchVector* out_batches) {
+  virtual Status ReadBatches(const IpcReadOptions& options,
+                             RecordBatchVector* out_batches,
+                             ReadStats* out_stats = nullptr) {
     auto buf_reader = std::make_shared<io::BufferReader>(buffer_);
-    std::shared_ptr<RecordBatchReader> reader;
-    ARROW_ASSIGN_OR_RAISE(reader, RecordBatchStreamReader::Open(buf_reader, options))
-    return reader->ReadAll(out_batches);
+    ARROW_ASSIGN_OR_RAISE(auto reader, RecordBatchStreamReader::Open(buf_reader, options))
+    RETURN_NOT_OK(reader->ReadAll(out_batches));
+    if (out_stats) {
+      *out_stats = reader->stats();
+    }
+    return Status::OK();
   }
 
   Status ReadSchema(std::shared_ptr<Schema>* out) {
@@ -1009,11 +1087,15 @@ struct StreamWriterHelper {
 };
 
 struct StreamDecoderWriterHelper : public StreamWriterHelper {
-  Status ReadBatches(const IpcReadOptions& options, BatchVector* out_batches) override {
+  Status ReadBatches(const IpcReadOptions& options, RecordBatchVector* out_batches,
+                     ReadStats* out_stats = nullptr) override {
     auto listener = std::make_shared<CollectListener>();
     StreamDecoder decoder(listener, options);
     RETURN_NOT_OK(DoConsume(&decoder));
     *out_batches = listener->record_batches();
+    if (out_stats) {
+      *out_stats = decoder.stats();
+    }
     return Status::OK();
   }
 
@@ -1071,8 +1153,8 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     ASSERT_OK(param(&batch1));  // NOLINT clang-tidy gtest issue
     ASSERT_OK(param(&batch2));  // NOLINT clang-tidy gtest issue
 
-    BatchVector in_batches = {batch1, batch2};
-    BatchVector out_batches;
+    RecordBatchVector in_batches = {batch1, batch2};
+    RecordBatchVector out_batches;
 
     WriterHelper writer_helper;
     ASSERT_OK(RoundTripHelper(writer_helper, in_batches, options,
@@ -1094,8 +1176,8 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     batch1 = batch1->Slice(0, 0);
     batch2 = batch2->Slice(0, 0);
 
-    BatchVector in_batches = {batch1, batch2};
-    BatchVector out_batches;
+    RecordBatchVector in_batches = {batch1, batch2};
+    RecordBatchVector out_batches;
 
     WriterHelper writer_helper;
     ASSERT_OK(RoundTripHelper(writer_helper, in_batches, options,
@@ -1113,7 +1195,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     ASSERT_OK(MakeDictionary(&batch));
 
     WriterHelper writer_helper;
-    BatchVector out_batches;
+    RecordBatchVector out_batches;
     ASSERT_OK(RoundTripHelper(writer_helper, {batch}, IpcWriteOptions::Defaults(),
                               IpcReadOptions::Defaults(), &out_batches));
     ASSERT_EQ(out_batches.size(), 1);
@@ -1144,7 +1226,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
 
     {
       WriterHelper writer_helper;
-      BatchVector out_batches;
+      RecordBatchVector out_batches;
       std::shared_ptr<Schema> out_schema;
       ASSERT_OK(RoundTripHelper(writer_helper, {batch}, IpcWriteOptions::Defaults(),
                                 options, &out_batches, &out_schema));
@@ -1162,7 +1244,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
 
     {
       WriterHelper writer_helper;
-      BatchVector out_batches;
+      RecordBatchVector out_batches;
       std::shared_ptr<Schema> out_schema;
       ASSERT_OK(RoundTripHelper(writer_helper, {batch}, IpcWriteOptions::Defaults(),
                                 options, &out_batches, &out_schema));
@@ -1179,7 +1261,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     options.included_fields = {1, 3, 5};
     {
       WriterHelper writer_helper;
-      BatchVector out_batches;
+      RecordBatchVector out_batches;
       ASSERT_RAISES(Invalid,
                     RoundTripHelper(writer_helper, {batch}, IpcWriteOptions::Defaults(),
                                     options, &out_batches));
@@ -1187,7 +1269,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     options.included_fields = {1, 3, -1};
     {
       WriterHelper writer_helper;
-      BatchVector out_batches;
+      RecordBatchVector out_batches;
       ASSERT_RAISES(Invalid,
                     RoundTripHelper(writer_helper, {batch}, IpcWriteOptions::Defaults(),
                                     options, &out_batches));
@@ -1214,7 +1296,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     ASSERT_OK(writer_helper.Finish());
 
     // The single successful batch can be read again
-    BatchVector out_batches;
+    RecordBatchVector out_batches;
     ASSERT_OK(writer_helper.ReadBatches(IpcReadOptions::Defaults(), &out_batches));
     ASSERT_EQ(out_batches.size(), 1);
     CompareBatch(*out_batches[0], *batch_bools, false /* compare_metadata */);
@@ -1230,7 +1312,7 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
     ASSERT_OK(writer_helper.Init(schema, IpcWriteOptions::Defaults()));
     ASSERT_OK(writer_helper.Finish());
 
-    BatchVector out_batches;
+    RecordBatchVector out_batches;
     ASSERT_OK(writer_helper.ReadBatches(IpcReadOptions::Defaults(), &out_batches));
     ASSERT_EQ(out_batches.size(), 0);
 
@@ -1240,9 +1322,10 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
   }
 
  private:
-  Status RoundTripHelper(WriterHelper& writer_helper, const BatchVector& in_batches,
+  Status RoundTripHelper(WriterHelper& writer_helper, const RecordBatchVector& in_batches,
                          const IpcWriteOptions& write_options,
-                         const IpcReadOptions& read_options, BatchVector* out_batches,
+                         const IpcReadOptions& read_options,
+                         RecordBatchVector* out_batches,
                          std::shared_ptr<Schema>* out_schema = nullptr) {
     RETURN_NOT_OK(writer_helper.Init(in_batches[0]->schema(), write_options));
     for (const auto& batch : in_batches) {
@@ -1278,6 +1361,9 @@ class ReaderWriterMixin : public ExtensionTypesMixin {
 class TestFileFormat : public ReaderWriterMixin<FileWriterHelper>,
                        public ::testing::TestWithParam<MakeRecordBatch*> {};
 
+class TestFileFormatGenerator : public ReaderWriterMixin<FileGeneratorWriterHelper>,
+                                public ::testing::TestWithParam<MakeRecordBatch*> {};
+
 class TestStreamFormat : public ReaderWriterMixin<StreamWriterHelper>,
                          public ::testing::TestWithParam<MakeRecordBatch*> {};
 
@@ -1293,6 +1379,16 @@ class TestStreamDecoderLargeChunks
       public ::testing::TestWithParam<MakeRecordBatch*> {};
 
 TEST_P(TestFileFormat, RoundTrip) {
+  TestRoundTrip(*GetParam(), IpcWriteOptions::Defaults());
+  TestZeroLengthRoundTrip(*GetParam(), IpcWriteOptions::Defaults());
+
+  IpcWriteOptions options;
+  options.write_legacy_ipc_format = true;
+  TestRoundTrip(*GetParam(), options);
+  TestZeroLengthRoundTrip(*GetParam(), options);
+}
+
+TEST_P(TestFileFormatGenerator, RoundTrip) {
   TestRoundTrip(*GetParam(), IpcWriteOptions::Defaults());
   TestZeroLengthRoundTrip(*GetParam(), IpcWriteOptions::Defaults());
 
@@ -1507,6 +1603,8 @@ INSTANTIATE_TEST_SUITE_P(GenericIpcRoundTripTests, TestIpcRoundTrip,
                          ::testing::ValuesIn(kBatchCases));
 INSTANTIATE_TEST_SUITE_P(FileRoundTripTests, TestFileFormat,
                          ::testing::ValuesIn(kBatchCases));
+INSTANTIATE_TEST_SUITE_P(FileRoundTripTests, TestFileFormatGenerator,
+                         ::testing::ValuesIn(kBatchCases));
 INSTANTIATE_TEST_SUITE_P(StreamRoundTripTests, TestStreamFormat,
                          ::testing::ValuesIn(kBatchCases));
 INSTANTIATE_TEST_SUITE_P(StreamDecoderDataRoundTripTests, TestStreamDecoderData,
@@ -1571,17 +1669,25 @@ TEST_F(TestStreamFormat, DictionaryRoundTrip) { TestDictionaryRoundtrip(); }
 
 TEST_F(TestFileFormat, DictionaryRoundTrip) { TestDictionaryRoundtrip(); }
 
+TEST_F(TestFileFormatGenerator, DictionaryRoundTrip) { TestDictionaryRoundtrip(); }
+
 TEST_F(TestStreamFormat, DifferentSchema) { TestWriteDifferentSchema(); }
 
 TEST_F(TestFileFormat, DifferentSchema) { TestWriteDifferentSchema(); }
+
+TEST_F(TestFileFormatGenerator, DifferentSchema) { TestWriteDifferentSchema(); }
 
 TEST_F(TestStreamFormat, NoRecordBatches) { TestWriteNoRecordBatches(); }
 
 TEST_F(TestFileFormat, NoRecordBatches) { TestWriteNoRecordBatches(); }
 
+TEST_F(TestFileFormatGenerator, NoRecordBatches) { TestWriteNoRecordBatches(); }
+
 TEST_F(TestStreamFormat, ReadFieldSubset) { TestReadSubsetOfFields(); }
 
 TEST_F(TestFileFormat, ReadFieldSubset) { TestReadSubsetOfFields(); }
+
+TEST_F(TestFileFormatGenerator, ReadFieldSubset) { TestReadSubsetOfFields(); }
 
 TEST(TestRecordBatchStreamReader, EmptyStreamWithDictionaries) {
   // ARROW-6006
@@ -1680,450 +1786,6 @@ TEST(TestRecordBatchStreamReader, NotEnoughDictionaries) {
   AssertFailsWith(truncated_stream, ex_message);
 }
 
-class TestTensorRoundTrip : public ::testing::Test, public IpcTestFixture {
- public:
-  void SetUp() { IpcTestFixture::SetUp(); }
-  void TearDown() { IpcTestFixture::TearDown(); }
-
-  void CheckTensorRoundTrip(const Tensor& tensor) {
-    int32_t metadata_length;
-    int64_t body_length;
-    const int elem_size = GetByteWidth(*tensor.type());
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    ASSERT_OK(WriteTensor(tensor, mmap_.get(), &metadata_length, &body_length));
-
-    const int64_t expected_body_length = elem_size * tensor.size();
-    ASSERT_EQ(expected_body_length, body_length);
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    std::shared_ptr<Tensor> result;
-    ASSERT_OK_AND_ASSIGN(result, ReadTensor(mmap_.get()));
-
-    ASSERT_EQ(result->data()->size(), expected_body_length);
-    ASSERT_TRUE(tensor.Equals(*result));
-  }
-};
-
-TEST_F(TestTensorRoundTrip, BasicRoundtrip) {
-  std::string path = "test-write-tensor";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(mmap_, io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  std::vector<int64_t> shape = {4, 6};
-  std::vector<int64_t> strides = {48, 8};
-  std::vector<std::string> dim_names = {"foo", "bar"};
-  int64_t size = 24;
-
-  std::vector<int64_t> values;
-  randint(size, 0, 100, &values);
-
-  auto data = Buffer::Wrap(values);
-
-  Tensor t0(int64(), data, shape, strides, dim_names);
-  Tensor t_no_dims(int64(), data, {}, {}, {});
-  Tensor t_zero_length_dim(int64(), data, {0}, {8}, {"foo"});
-
-  CheckTensorRoundTrip(t0);
-  CheckTensorRoundTrip(t_no_dims);
-  CheckTensorRoundTrip(t_zero_length_dim);
-
-  int64_t serialized_size;
-  ASSERT_OK(GetTensorSize(t0, &serialized_size));
-  ASSERT_TRUE(serialized_size > static_cast<int64_t>(size * sizeof(int64_t)));
-
-  // ARROW-2840: Check that padding/alignment minded
-  std::vector<int64_t> shape_2 = {1, 1};
-  std::vector<int64_t> strides_2 = {8, 8};
-  Tensor t0_not_multiple_64(int64(), data, shape_2, strides_2, dim_names);
-  CheckTensorRoundTrip(t0_not_multiple_64);
-}
-
-TEST_F(TestTensorRoundTrip, NonContiguous) {
-  std::string path = "test-write-tensor-strided";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(mmap_, io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  std::vector<int64_t> values;
-  randint(24, 0, 100, &values);
-
-  auto data = Buffer::Wrap(values);
-  Tensor tensor(int64(), data, {4, 3}, {48, 16});
-
-  CheckTensorRoundTrip(tensor);
-}
-
-template <typename IndexValueType>
-class TestSparseTensorRoundTrip : public ::testing::Test, public IpcTestFixture {
- public:
-  void SetUp() { IpcTestFixture::SetUp(); }
-  void TearDown() { IpcTestFixture::TearDown(); }
-
-  void CheckSparseCOOTensorRoundTrip(const SparseCOOTensor& sparse_tensor) {
-    const int elem_size = GetByteWidth(*sparse_tensor.type());
-    const int index_elem_size = sizeof(typename IndexValueType::c_type);
-
-    int32_t metadata_length;
-    int64_t body_length;
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    ASSERT_OK(
-        WriteSparseTensor(sparse_tensor, mmap_.get(), &metadata_length, &body_length));
-
-    const auto& sparse_index =
-        checked_cast<const SparseCOOIndex&>(*sparse_tensor.sparse_index());
-    const int64_t indices_length =
-        BitUtil::RoundUpToMultipleOf8(index_elem_size * sparse_index.indices()->size());
-    const int64_t data_length =
-        BitUtil::RoundUpToMultipleOf8(elem_size * sparse_tensor.non_zero_length());
-    const int64_t expected_body_length = indices_length + data_length;
-    ASSERT_EQ(expected_body_length, body_length);
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    std::shared_ptr<SparseTensor> result;
-    ASSERT_OK_AND_ASSIGN(result, ReadSparseTensor(mmap_.get()));
-    ASSERT_EQ(SparseTensorFormat::COO, result->format_id());
-
-    const auto& resulted_sparse_index =
-        checked_cast<const SparseCOOIndex&>(*result->sparse_index());
-    ASSERT_EQ(resulted_sparse_index.indices()->data()->size(), indices_length);
-    ASSERT_EQ(resulted_sparse_index.is_canonical(), sparse_index.is_canonical());
-    ASSERT_EQ(result->data()->size(), data_length);
-    ASSERT_TRUE(result->Equals(sparse_tensor));
-  }
-
-  template <typename SparseIndexType>
-  void CheckSparseCSXMatrixRoundTrip(
-      const SparseTensorImpl<SparseIndexType>& sparse_tensor) {
-    static_assert(std::is_same<SparseIndexType, SparseCSRIndex>::value ||
-                      std::is_same<SparseIndexType, SparseCSCIndex>::value,
-                  "SparseIndexType must be either SparseCSRIndex or SparseCSCIndex");
-
-    const int elem_size = GetByteWidth(*sparse_tensor.type());
-    const int index_elem_size = sizeof(typename IndexValueType::c_type);
-
-    int32_t metadata_length;
-    int64_t body_length;
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    ASSERT_OK(
-        WriteSparseTensor(sparse_tensor, mmap_.get(), &metadata_length, &body_length));
-
-    const auto& sparse_index =
-        checked_cast<const SparseIndexType&>(*sparse_tensor.sparse_index());
-    const int64_t indptr_length =
-        BitUtil::RoundUpToMultipleOf8(index_elem_size * sparse_index.indptr()->size());
-    const int64_t indices_length =
-        BitUtil::RoundUpToMultipleOf8(index_elem_size * sparse_index.indices()->size());
-    const int64_t data_length =
-        BitUtil::RoundUpToMultipleOf8(elem_size * sparse_tensor.non_zero_length());
-    const int64_t expected_body_length = indptr_length + indices_length + data_length;
-    ASSERT_EQ(expected_body_length, body_length);
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    std::shared_ptr<SparseTensor> result;
-    ASSERT_OK_AND_ASSIGN(result, ReadSparseTensor(mmap_.get()));
-
-    constexpr auto expected_format_id =
-        std::is_same<SparseIndexType, SparseCSRIndex>::value ? SparseTensorFormat::CSR
-                                                             : SparseTensorFormat::CSC;
-    ASSERT_EQ(expected_format_id, result->format_id());
-
-    const auto& resulted_sparse_index =
-        checked_cast<const SparseIndexType&>(*result->sparse_index());
-    ASSERT_EQ(resulted_sparse_index.indptr()->data()->size(), indptr_length);
-    ASSERT_EQ(resulted_sparse_index.indices()->data()->size(), indices_length);
-    ASSERT_EQ(result->data()->size(), data_length);
-    ASSERT_TRUE(result->Equals(sparse_tensor));
-  }
-
-  void CheckSparseCSFTensorRoundTrip(const SparseCSFTensor& sparse_tensor) {
-    const int elem_size = GetByteWidth(*sparse_tensor.type());
-    const int index_elem_size = sizeof(typename IndexValueType::c_type);
-
-    int32_t metadata_length;
-    int64_t body_length;
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    ASSERT_OK(
-        WriteSparseTensor(sparse_tensor, mmap_.get(), &metadata_length, &body_length));
-
-    const auto& sparse_index =
-        checked_cast<const SparseCSFIndex&>(*sparse_tensor.sparse_index());
-
-    const int64_t ndim = sparse_index.axis_order().size();
-    int64_t indptr_length = 0;
-    int64_t indices_length = 0;
-
-    for (int64_t i = 0; i < ndim - 1; ++i) {
-      indptr_length += BitUtil::RoundUpToMultipleOf8(index_elem_size *
-                                                     sparse_index.indptr()[i]->size());
-    }
-    for (int64_t i = 0; i < ndim; ++i) {
-      indices_length += BitUtil::RoundUpToMultipleOf8(index_elem_size *
-                                                      sparse_index.indices()[i]->size());
-    }
-    const int64_t data_length =
-        BitUtil::RoundUpToMultipleOf8(elem_size * sparse_tensor.non_zero_length());
-    const int64_t expected_body_length = indptr_length + indices_length + data_length;
-    ASSERT_EQ(expected_body_length, body_length);
-
-    ASSERT_OK(mmap_->Seek(0));
-
-    std::shared_ptr<SparseTensor> result;
-    ASSERT_OK_AND_ASSIGN(result, ReadSparseTensor(mmap_.get()));
-    ASSERT_EQ(SparseTensorFormat::CSF, result->format_id());
-
-    const auto& resulted_sparse_index =
-        checked_cast<const SparseCSFIndex&>(*result->sparse_index());
-
-    int64_t out_indptr_length = 0;
-    int64_t out_indices_length = 0;
-    for (int i = 0; i < ndim - 1; ++i) {
-      out_indptr_length += BitUtil::RoundUpToMultipleOf8(
-          index_elem_size * resulted_sparse_index.indptr()[i]->size());
-    }
-    for (int i = 0; i < ndim; ++i) {
-      out_indices_length += BitUtil::RoundUpToMultipleOf8(
-          index_elem_size * resulted_sparse_index.indices()[i]->size());
-    }
-
-    ASSERT_EQ(out_indptr_length, indptr_length);
-    ASSERT_EQ(out_indices_length, indices_length);
-    ASSERT_EQ(result->data()->size(), data_length);
-    ASSERT_TRUE(resulted_sparse_index.Equals(sparse_index));
-    ASSERT_TRUE(result->Equals(sparse_tensor));
-  }
-
- protected:
-  std::shared_ptr<SparseCOOIndex> MakeSparseCOOIndex(
-      const std::vector<int64_t>& coords_shape,
-      const std::vector<int64_t>& coords_strides,
-      std::vector<typename IndexValueType::c_type>& coords_values) const {
-    auto coords_data = Buffer::Wrap(coords_values);
-    auto coords = std::make_shared<NumericTensor<IndexValueType>>(
-        coords_data, coords_shape, coords_strides);
-    return std::make_shared<SparseCOOIndex>(coords);
-  }
-
-  template <typename ValueType>
-  Result<std::shared_ptr<SparseCOOTensor>> MakeSparseCOOTensor(
-      const std::shared_ptr<SparseCOOIndex>& si, std::vector<ValueType>& sparse_values,
-      const std::vector<int64_t>& shape,
-      const std::vector<std::string>& dim_names = {}) const {
-    auto data = Buffer::Wrap(sparse_values);
-    return SparseCOOTensor::Make(si, CTypeTraits<ValueType>::type_singleton(), data,
-                                 shape, dim_names);
-  }
-};
-
-TYPED_TEST_SUITE_P(TestSparseTensorRoundTrip);
-
-TYPED_TEST_P(TestSparseTensorRoundTrip, WithSparseCOOIndexRowMajor) {
-  using IndexValueType = TypeParam;
-  using c_index_value_type = typename IndexValueType::c_type;
-
-  std::string path = "test-write-sparse-coo-tensor";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(this->mmap_,
-                       io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  // Dense representation:
-  // [
-  //   [
-  //     1 0 2 0
-  //     0 3 0 4
-  //     5 0 6 0
-  //   ],
-  //   [
-  //      0 11  0 12
-  //     13  0 14  0
-  //      0 15  0 16
-  //   ]
-  // ]
-  //
-  // Sparse representation:
-  // idx[0] = [0 0 0 0 0 0  1  1  1  1  1  1]
-  // idx[1] = [0 0 1 1 2 2  0  0  1  1  2  2]
-  // idx[2] = [0 2 1 3 0 2  1  3  0  2  1  3]
-  // data   = [1 2 3 4 5 6 11 12 13 14 15 16]
-
-  // canonical
-  std::vector<c_index_value_type> coords_values = {0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 3,
-                                                   0, 2, 0, 0, 2, 2, 1, 0, 1, 1, 0, 3,
-                                                   1, 1, 0, 1, 1, 2, 1, 2, 1, 1, 2, 3};
-  const int sizeof_index_value = sizeof(c_index_value_type);
-  std::shared_ptr<SparseCOOIndex> si;
-  ASSERT_OK_AND_ASSIGN(
-      si, SparseCOOIndex::Make(TypeTraits<IndexValueType>::type_singleton(), {12, 3},
-                               {sizeof_index_value * 3, sizeof_index_value},
-                               Buffer::Wrap(coords_values)));
-  ASSERT_TRUE(si->is_canonical());
-
-  std::vector<int64_t> shape = {2, 3, 4};
-  std::vector<std::string> dim_names = {"foo", "bar", "baz"};
-  std::vector<int64_t> values = {1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16};
-  std::shared_ptr<SparseCOOTensor> st;
-  ASSERT_OK_AND_ASSIGN(st, this->MakeSparseCOOTensor(si, values, shape, dim_names));
-
-  this->CheckSparseCOOTensorRoundTrip(*st);
-
-  // non-canonical
-  ASSERT_OK_AND_ASSIGN(
-      si, SparseCOOIndex::Make(TypeTraits<IndexValueType>::type_singleton(), {12, 3},
-                               {sizeof_index_value * 3, sizeof_index_value},
-                               Buffer::Wrap(coords_values), false));
-  ASSERT_FALSE(si->is_canonical());
-  ASSERT_OK_AND_ASSIGN(st, this->MakeSparseCOOTensor(si, values, shape, dim_names));
-
-  this->CheckSparseCOOTensorRoundTrip(*st);
-}
-
-TYPED_TEST_P(TestSparseTensorRoundTrip, WithSparseCOOIndexColumnMajor) {
-  using IndexValueType = TypeParam;
-  using c_index_value_type = typename IndexValueType::c_type;
-
-  std::string path = "test-write-sparse-coo-tensor";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(this->mmap_,
-                       io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  // Dense representation:
-  // [
-  //   [
-  //     1 0 2 0
-  //     0 3 0 4
-  //     5 0 6 0
-  //   ],
-  //   [
-  //      0 11  0 12
-  //     13  0 14  0
-  //      0 15  0 16
-  //   ]
-  // ]
-  //
-  // Sparse representation:
-  // idx[0] = [0 0 0 0 0 0  1  1  1  1  1  1]
-  // idx[1] = [0 0 1 1 2 2  0  0  1  1  2  2]
-  // idx[2] = [0 2 1 3 0 2  1  3  0  2  1  3]
-  // data   = [1 2 3 4 5 6 11 12 13 14 15 16]
-
-  // canonical
-  std::vector<c_index_value_type> coords_values = {0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,
-                                                   0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2,
-                                                   0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3};
-  const int sizeof_index_value = sizeof(c_index_value_type);
-  std::shared_ptr<SparseCOOIndex> si;
-  ASSERT_OK_AND_ASSIGN(
-      si, SparseCOOIndex::Make(TypeTraits<IndexValueType>::type_singleton(), {12, 3},
-                               {sizeof_index_value, sizeof_index_value * 12},
-                               Buffer::Wrap(coords_values)));
-  ASSERT_TRUE(si->is_canonical());
-
-  std::vector<int64_t> shape = {2, 3, 4};
-  std::vector<std::string> dim_names = {"foo", "bar", "baz"};
-  std::vector<int64_t> values = {1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16};
-
-  std::shared_ptr<SparseCOOTensor> st;
-  ASSERT_OK_AND_ASSIGN(st, this->MakeSparseCOOTensor(si, values, shape, dim_names));
-
-  this->CheckSparseCOOTensorRoundTrip(*st);
-
-  // non-canonical
-  ASSERT_OK_AND_ASSIGN(
-      si, SparseCOOIndex::Make(TypeTraits<IndexValueType>::type_singleton(), {12, 3},
-                               {sizeof_index_value, sizeof_index_value * 12},
-                               Buffer::Wrap(coords_values), false));
-  ASSERT_FALSE(si->is_canonical());
-  ASSERT_OK_AND_ASSIGN(st, this->MakeSparseCOOTensor(si, values, shape, dim_names));
-
-  this->CheckSparseCOOTensorRoundTrip(*st);
-}
-
-TYPED_TEST_P(TestSparseTensorRoundTrip, WithSparseCSRIndex) {
-  using IndexValueType = TypeParam;
-
-  std::string path = "test-write-sparse-csr-matrix";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(this->mmap_,
-                       io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  std::vector<int64_t> shape = {4, 6};
-  std::vector<std::string> dim_names = {"foo", "bar", "baz"};
-  std::vector<int64_t> values = {1, 0,  2, 0,  0,  3, 0,  4, 5, 0,  6, 0,
-                                 0, 11, 0, 12, 13, 0, 14, 0, 0, 15, 0, 16};
-
-  auto data = Buffer::Wrap(values);
-  NumericTensor<Int64Type> t(data, shape, {}, dim_names);
-  std::shared_ptr<SparseCSRMatrix> st;
-  ASSERT_OK_AND_ASSIGN(
-      st, SparseCSRMatrix::Make(t, TypeTraits<IndexValueType>::type_singleton()));
-
-  this->CheckSparseCSXMatrixRoundTrip(*st);
-}
-
-TYPED_TEST_P(TestSparseTensorRoundTrip, WithSparseCSCIndex) {
-  using IndexValueType = TypeParam;
-
-  std::string path = "test-write-sparse-csc-matrix";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(this->mmap_,
-                       io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  std::vector<int64_t> shape = {4, 6};
-  std::vector<std::string> dim_names = {"foo", "bar", "baz"};
-  std::vector<int64_t> values = {1, 0,  2, 0,  0,  3, 0,  4, 5, 0,  6, 0,
-                                 0, 11, 0, 12, 13, 0, 14, 0, 0, 15, 0, 16};
-
-  auto data = Buffer::Wrap(values);
-  NumericTensor<Int64Type> t(data, shape, {}, dim_names);
-  std::shared_ptr<SparseCSCMatrix> st;
-  ASSERT_OK_AND_ASSIGN(
-      st, SparseCSCMatrix::Make(t, TypeTraits<IndexValueType>::type_singleton()));
-
-  this->CheckSparseCSXMatrixRoundTrip(*st);
-}
-
-TYPED_TEST_P(TestSparseTensorRoundTrip, WithSparseCSFIndex) {
-  using IndexValueType = TypeParam;
-
-  std::string path = "test-write-sparse-csf-tensor";
-  constexpr int64_t kBufferSize = 1 << 20;
-  ASSERT_OK_AND_ASSIGN(this->mmap_,
-                       io::MemoryMapFixture::InitMemoryMap(kBufferSize, path));
-
-  std::vector<int64_t> shape = {4, 6};
-  std::vector<std::string> dim_names = {"foo", "bar", "baz"};
-  std::vector<int64_t> values = {1, 0,  2, 0,  0,  3, 0,  4, 5, 0,  6, 0,
-                                 0, 11, 0, 12, 13, 0, 14, 0, 0, 15, 0, 16};
-
-  auto data = Buffer::Wrap(values);
-  NumericTensor<Int64Type> t(data, shape, {}, dim_names);
-  std::shared_ptr<SparseCSFTensor> st;
-  ASSERT_OK_AND_ASSIGN(
-      st, SparseCSFTensor::Make(t, TypeTraits<IndexValueType>::type_singleton()));
-
-  this->CheckSparseCSFTensorRoundTrip(*st);
-}
-REGISTER_TYPED_TEST_SUITE_P(TestSparseTensorRoundTrip, WithSparseCOOIndexRowMajor,
-                            WithSparseCOOIndexColumnMajor, WithSparseCSRIndex,
-                            WithSparseCSCIndex, WithSparseCSFIndex);
-
-INSTANTIATE_TYPED_TEST_SUITE_P(TestInt8, TestSparseTensorRoundTrip, Int8Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestUInt8, TestSparseTensorRoundTrip, UInt8Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestInt16, TestSparseTensorRoundTrip, Int16Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestUInt16, TestSparseTensorRoundTrip, UInt16Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestInt32, TestSparseTensorRoundTrip, Int32Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestUInt32, TestSparseTensorRoundTrip, UInt32Type);
-INSTANTIATE_TYPED_TEST_SUITE_P(TestInt64, TestSparseTensorRoundTrip, Int64Type);
-
 TEST(TestRecordBatchStreamReader, MalformedInput) {
   const std::string empty_str = "";
   const std::string garbage_str = "12345678";
@@ -2145,6 +1807,487 @@ TEST(TestStreamDecoder, NextRequiredSize) {
   const uint8_t data[1] = {0};
   ASSERT_OK(decoder.Consume(data, 1));
   ASSERT_EQ(next_required_size - 1, decoder.next_required_size());
+}
+
+template <typename WriterHelperType>
+class TestDictionaryReplacement : public ::testing::Test {
+ public:
+  using WriterHelper = WriterHelperType;
+
+  void TestSameDictPointer() {
+    auto type = dictionary(int8(), utf8());
+    auto values = ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[0, 2, null, 1]"), values);
+    auto batch2 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, 0]"), values);
+    CheckRoundtrip({batch1, batch2});
+
+    EXPECT_EQ(read_stats_.num_messages, 4);  // including schema message
+    EXPECT_EQ(read_stats_.num_record_batches, 2);
+    EXPECT_EQ(read_stats_.num_dictionary_batches, 1);
+    EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+    EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+  }
+
+  void TestSameDictValues() {
+    auto type = dictionary(int8(), utf8());
+    // Create two separate dictionaries, but with the same contents
+    auto batch1 = MakeBatch(ArrayFromJSON(type, R"(["foo", "foo", "bar", null])"));
+    auto batch2 = MakeBatch(ArrayFromJSON(type, R"(["foo", "bar", "foo"])"));
+    CheckRoundtrip({batch1, batch2});
+
+    EXPECT_EQ(read_stats_.num_messages, 4);  // including schema message
+    EXPECT_EQ(read_stats_.num_record_batches, 2);
+    EXPECT_EQ(read_stats_.num_dictionary_batches, 1);
+    EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+    EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+  }
+
+  void TestDeltaDict() {
+    auto type = dictionary(int8(), utf8());
+    auto batch1 = MakeBatch(ArrayFromJSON(type, R"(["foo", "foo", "bar", null])"));
+    // Potential delta
+    auto batch2 = MakeBatch(ArrayFromJSON(type, R"(["foo", "bar", "quux", "foo"])"));
+    // Potential delta
+    auto batch3 =
+        MakeBatch(ArrayFromJSON(type, R"(["foo", "bar", "quux", "zzz", "foo"])"));
+    auto batch4 = MakeBatch(ArrayFromJSON(type, R"(["bar", null, "quux", "foo"])"));
+    RecordBatchVector batches{batch1, batch2, batch3, batch4};
+
+    // Emit replacements
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 9);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 4);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 4);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 3);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+
+    // Emit deltas
+    write_options_.emit_dictionary_deltas = true;
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 9);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 4);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 4);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 2);
+    }
+
+    // IPC file format: WriteTable should unify dicts
+    RecordBatchVector actual;
+    write_options_.unify_dictionaries = true;
+    ASSERT_OK(RoundTripTable(batches, &actual));
+    if (WriterHelper::kIsFileFormat) {
+      EXPECT_EQ(read_stats_.num_messages, 6);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 4);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 1);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+      CheckBatchesLogical(batches, actual);
+    } else {
+      EXPECT_EQ(read_stats_.num_messages, 9);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 4);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 4);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 2);
+      CheckBatches(batches, actual);
+    }
+  }
+
+  void TestSameDictValuesNested() {
+    auto batches = SameValuesNestedDictBatches();
+    CheckRoundtrip(batches);
+
+    EXPECT_EQ(read_stats_.num_messages, 5);  // including schema message
+    EXPECT_EQ(read_stats_.num_record_batches, 2);
+    EXPECT_EQ(read_stats_.num_dictionary_batches, 2);
+    EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+    EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+
+    write_options_.unify_dictionaries = true;
+    CheckRoundtrip(batches);
+    if (WriterHelper::kIsFileFormat) {
+      // This fails because unification of nested dictionaries is not supported.
+      // However, perhaps this should work because the dictionaries are simply equal.
+      CheckWritingTableFails(batches, StatusCode::NotImplemented);
+    } else {
+      CheckRoundtripTable(batches);
+    }
+  }
+
+  void TestDifferentDictValues() {
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(DifferentOrderDictBatches(), 1);
+      CheckWritingFails(DifferentValuesDictBatches(), 1);
+    } else {
+      CheckRoundtrip(DifferentOrderDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 5);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 2);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+
+      CheckRoundtrip(DifferentValuesDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 5);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 2);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+
+    // Same, but single-shot table write
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingTableFails(DifferentOrderDictBatches());
+      CheckWritingTableFails(DifferentValuesDictBatches());
+
+      write_options_.unify_dictionaries = true;
+      // Will unify dictionaries
+      CheckRoundtripTable(DifferentOrderDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 4);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 1);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+
+      CheckRoundtripTable(DifferentValuesDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 4);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 1);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 0);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    } else {
+      CheckRoundtripTable(DifferentOrderDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 5);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 2);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+
+      CheckRoundtripTable(DifferentValuesDictBatches());
+
+      EXPECT_EQ(read_stats_.num_messages, 5);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 2);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+  }
+
+  void TestDifferentDictValuesNested() {
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(DifferentValuesNestedDictBatches1(), 1);
+      CheckWritingFails(DifferentValuesNestedDictBatches2(), 1);
+      CheckWritingTableFails(DifferentValuesNestedDictBatches1());
+      CheckWritingTableFails(DifferentValuesNestedDictBatches2());
+
+      write_options_.unify_dictionaries = true;
+      CheckWritingFails(DifferentValuesNestedDictBatches1(), 1);
+      CheckWritingFails(DifferentValuesNestedDictBatches2(), 1);
+      CheckWritingTableFails(DifferentValuesNestedDictBatches1(),
+                             StatusCode::NotImplemented);
+      CheckWritingTableFails(DifferentValuesNestedDictBatches2(),
+                             StatusCode::NotImplemented);
+      return;
+    }
+    CheckRoundtrip(DifferentValuesNestedDictBatches1());
+
+    EXPECT_EQ(read_stats_.num_messages, 7);  // including schema message
+    EXPECT_EQ(read_stats_.num_record_batches, 2);
+    // Both inner and outer dict were replaced
+    EXPECT_EQ(read_stats_.num_dictionary_batches, 4);
+    EXPECT_EQ(read_stats_.num_replaced_dictionaries, 2);
+    EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+
+    CheckRoundtrip(DifferentValuesNestedDictBatches2());
+
+    EXPECT_EQ(read_stats_.num_messages, 6);  // including schema message
+    EXPECT_EQ(read_stats_.num_record_batches, 2);
+    // Only inner dict was replaced
+    EXPECT_EQ(read_stats_.num_dictionary_batches, 3);
+    EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+    EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+  }
+
+  void TestDeltaDictNestedOuter() {
+    // Outer dict changes, inner dict remains the same
+    auto value_type = list(dictionary(int8(), utf8()));
+    auto type = dictionary(int8(), value_type);
+    // Inner dict: ["a", "b"]
+    auto batch1_values = ArrayFromJSON(value_type, R"([["a"], ["b"]])");
+    // Potential delta
+    auto batch2_values = ArrayFromJSON(value_type, R"([["a"], ["b"], ["a", "a"]])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, 1]"), batch1_values);
+    auto batch2 =
+        MakeBatch(type, ArrayFromJSON(int8(), "[2, null, 0, 0]"), batch2_values);
+    RecordBatchVector batches{batch1, batch2};
+
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 6);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 3);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+
+    write_options_.emit_dictionary_deltas = true;
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      // Outer dict deltas are not emitted as the read path doesn't support them
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 6);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 2);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 3);
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 1);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+  }
+
+  void TestDeltaDictNestedInner() {
+    // Inner dict changes
+    auto value_type = list(dictionary(int8(), utf8()));
+    auto type = dictionary(int8(), value_type);
+    // Inner dict: ["a"]
+    auto batch1_values = ArrayFromJSON(value_type, R"([["a"]])");
+    // Inner dict: ["a", "b"] => potential delta
+    auto batch2_values = ArrayFromJSON(value_type, R"([["a"], ["b"], ["a", "a"]])");
+    // Inner dict: ["a", "b", "c"] => potential delta
+    auto batch3_values = ArrayFromJSON(value_type, R"([["a"], ["b"], ["c"]])");
+    // Inner dict: ["a", "b", "c"]
+    auto batch4_values = ArrayFromJSON(value_type, R"([["a"], ["b", "c"]])");
+    // Inner dict: ["a", "c", "b"] => replacement
+    auto batch5_values = ArrayFromJSON(value_type, R"([["a"], ["c"], ["b"]])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[0, null, 0]"), batch1_values);
+    auto batch2 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, 2]"), batch2_values);
+    auto batch3 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, 2]"), batch3_values);
+    auto batch4 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, null]"), batch4_values);
+    auto batch5 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 0, 2]"), batch5_values);
+    RecordBatchVector batches{batch1, batch2, batch3, batch4, batch5};
+
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 15);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 5);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 9);  // 4 inner + 5 outer
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 7);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 0);
+    }
+
+    write_options_.emit_dictionary_deltas = true;
+    if (WriterHelper::kIsFileFormat) {
+      CheckWritingFails(batches, 1);
+    } else {
+      CheckRoundtrip(batches);
+      EXPECT_EQ(read_stats_.num_messages, 15);  // including schema message
+      EXPECT_EQ(read_stats_.num_record_batches, 5);
+      EXPECT_EQ(read_stats_.num_dictionary_batches, 9);  // 4 inner + 5 outer
+      EXPECT_EQ(read_stats_.num_replaced_dictionaries, 5);
+      EXPECT_EQ(read_stats_.num_dictionary_deltas, 2);
+    }
+  }
+
+  Status RoundTrip(const RecordBatchVector& in_batches, RecordBatchVector* out_batches) {
+    WriterHelper writer_helper;
+    RETURN_NOT_OK(writer_helper.Init(in_batches[0]->schema(), write_options_));
+    for (const auto& batch : in_batches) {
+      RETURN_NOT_OK(writer_helper.WriteBatch(batch));
+    }
+    RETURN_NOT_OK(writer_helper.Finish(&write_stats_));
+    RETURN_NOT_OK(writer_helper.ReadBatches(read_options_, out_batches, &read_stats_));
+    for (const auto& batch : *out_batches) {
+      RETURN_NOT_OK(batch->ValidateFull());
+    }
+    return Status::OK();
+  }
+
+  Status RoundTripTable(const RecordBatchVector& in_batches,
+                        RecordBatchVector* out_batches) {
+    WriterHelper writer_helper;
+    RETURN_NOT_OK(writer_helper.Init(in_batches[0]->schema(), write_options_));
+    // WriteTable is different from a series of WriteBatch for RecordBatchFileWriter
+    RETURN_NOT_OK(writer_helper.WriteTable(in_batches));
+    RETURN_NOT_OK(writer_helper.Finish(&write_stats_));
+    RETURN_NOT_OK(writer_helper.ReadBatches(read_options_, out_batches, &read_stats_));
+    for (const auto& batch : *out_batches) {
+      RETURN_NOT_OK(batch->ValidateFull());
+    }
+    return Status::OK();
+  }
+
+  void CheckBatches(const RecordBatchVector& expected, const RecordBatchVector& actual) {
+    ASSERT_EQ(expected.size(), actual.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      AssertBatchesEqual(*expected[i], *actual[i]);
+    }
+  }
+
+  // Check that batches are logically equal, even if e.g. dictionaries
+  // are different.
+  void CheckBatchesLogical(const RecordBatchVector& expected,
+                           const RecordBatchVector& actual) {
+    ASSERT_OK_AND_ASSIGN(auto expected_table, Table::FromRecordBatches(expected));
+    ASSERT_OK_AND_ASSIGN(auto actual_table, Table::FromRecordBatches(actual));
+    ASSERT_OK_AND_ASSIGN(expected_table, expected_table->CombineChunks());
+    ASSERT_OK_AND_ASSIGN(actual_table, actual_table->CombineChunks());
+    AssertTablesEqual(*expected_table, *actual_table);
+  }
+
+  void CheckRoundtrip(const RecordBatchVector& in_batches) {
+    RecordBatchVector out_batches;
+    ASSERT_OK(RoundTrip(in_batches, &out_batches));
+    CheckStatsConsistent();
+    CheckBatches(in_batches, out_batches);
+  }
+
+  void CheckRoundtripTable(const RecordBatchVector& in_batches) {
+    RecordBatchVector out_batches;
+    ASSERT_OK(RoundTripTable(in_batches, &out_batches));
+    CheckStatsConsistent();
+    CheckBatchesLogical(in_batches, out_batches);
+  }
+
+  void CheckWritingFails(const RecordBatchVector& in_batches, size_t fails_at_batch_num) {
+    WriterHelper writer_helper;
+    ASSERT_OK(writer_helper.Init(in_batches[0]->schema(), write_options_));
+    for (size_t i = 0; i < fails_at_batch_num; ++i) {
+      ASSERT_OK(writer_helper.WriteBatch(in_batches[i]));
+    }
+    ASSERT_RAISES(Invalid, writer_helper.WriteBatch(in_batches[fails_at_batch_num]));
+  }
+
+  void CheckWritingTableFails(const RecordBatchVector& in_batches,
+                              StatusCode expected_error = StatusCode::Invalid) {
+    WriterHelper writer_helper;
+    ASSERT_OK(writer_helper.Init(in_batches[0]->schema(), write_options_));
+    auto st = writer_helper.WriteTable(in_batches);
+    ASSERT_FALSE(st.ok());
+    ASSERT_EQ(st.code(), expected_error);
+  }
+
+  void CheckStatsConsistent() {
+    ASSERT_EQ(read_stats_.num_messages, write_stats_.num_messages);
+    ASSERT_EQ(read_stats_.num_record_batches, write_stats_.num_record_batches);
+    ASSERT_EQ(read_stats_.num_dictionary_batches, write_stats_.num_dictionary_batches);
+    ASSERT_EQ(read_stats_.num_replaced_dictionaries,
+              write_stats_.num_replaced_dictionaries);
+    ASSERT_EQ(read_stats_.num_dictionary_deltas, write_stats_.num_dictionary_deltas);
+  }
+
+  RecordBatchVector DifferentOrderDictBatches() {
+    // Create two separate dictionaries with different order
+    auto type = dictionary(int8(), utf8());
+    auto batch1 = MakeBatch(ArrayFromJSON(type, R"(["foo", "foo", "bar", null])"));
+    auto batch2 = MakeBatch(ArrayFromJSON(type, R"(["bar", "bar", "foo"])"));
+    return {batch1, batch2};
+  }
+
+  RecordBatchVector DifferentValuesDictBatches() {
+    // Create two separate dictionaries with different values
+    auto type = dictionary(int8(), utf8());
+    auto batch1 = MakeBatch(ArrayFromJSON(type, R"(["foo", "foo", "bar", null])"));
+    auto batch2 = MakeBatch(ArrayFromJSON(type, R"(["bar", "quux", "quux"])"));
+    return {batch1, batch2};
+  }
+
+  RecordBatchVector SameValuesNestedDictBatches() {
+    auto value_type = list(dictionary(int8(), utf8()));
+    auto type = dictionary(int8(), value_type);
+    auto batch1_values = ArrayFromJSON(value_type, R"([[], ["a"], ["b"], ["a", "a"]])");
+    auto batch2_values = ArrayFromJSON(value_type, R"([[], ["a"], ["b"], ["a", "a"]])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 3, 0, 3]"), batch1_values);
+    auto batch2 = MakeBatch(type, ArrayFromJSON(int8(), "[2, null, 2]"), batch2_values);
+    return {batch1, batch2};
+  }
+
+  RecordBatchVector DifferentValuesNestedDictBatches1() {
+    // Inner dictionary values differ
+    auto value_type = list(dictionary(int8(), utf8()));
+    auto type = dictionary(int8(), value_type);
+    auto batch1_values = ArrayFromJSON(value_type, R"([[], ["a"], ["b"], ["a", "a"]])");
+    auto batch2_values = ArrayFromJSON(value_type, R"([[], ["a"], ["c"], ["a", "a"]])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 3, 0, 3]"), batch1_values);
+    auto batch2 = MakeBatch(type, ArrayFromJSON(int8(), "[2, null, 2]"), batch2_values);
+    return {batch1, batch2};
+  }
+
+  RecordBatchVector DifferentValuesNestedDictBatches2() {
+    // Outer dictionary values differ
+    auto value_type = list(dictionary(int8(), utf8()));
+    auto type = dictionary(int8(), value_type);
+    auto batch1_values = ArrayFromJSON(value_type, R"([[], ["a"], ["b"], ["a", "a"]])");
+    auto batch2_values = ArrayFromJSON(value_type, R"([["a"], ["b"], ["a", "a"]])");
+    auto batch1 = MakeBatch(type, ArrayFromJSON(int8(), "[1, 3, 0, 3]"), batch1_values);
+    auto batch2 = MakeBatch(type, ArrayFromJSON(int8(), "[2, null, 2]"), batch2_values);
+    return {batch1, batch2};
+  }
+
+  // Make one-column batch
+  std::shared_ptr<RecordBatch> MakeBatch(std::shared_ptr<Array> column) {
+    return RecordBatch::Make(schema({field("f", column->type())}), column->length(),
+                             {column});
+  }
+
+  // Make one-column batch with a dictionary array
+  std::shared_ptr<RecordBatch> MakeBatch(std::shared_ptr<DataType> type,
+                                         std::shared_ptr<Array> indices,
+                                         std::shared_ptr<Array> dictionary) {
+    auto array = *DictionaryArray::FromArrays(std::move(type), std::move(indices),
+                                              std::move(dictionary));
+    return MakeBatch(std::move(array));
+  }
+
+ protected:
+  IpcWriteOptions write_options_ = IpcWriteOptions::Defaults();
+  IpcReadOptions read_options_ = IpcReadOptions::Defaults();
+  WriteStats write_stats_;
+  ReadStats read_stats_;
+};
+
+using DictionaryReplacementTestTypes =
+    ::testing::Types<StreamWriterHelper, StreamDecoderBufferWriterHelper,
+                     FileWriterHelper>;
+
+TYPED_TEST_SUITE(TestDictionaryReplacement, DictionaryReplacementTestTypes);
+
+TYPED_TEST(TestDictionaryReplacement, SameDictPointer) { this->TestSameDictPointer(); }
+
+TYPED_TEST(TestDictionaryReplacement, SameDictValues) { this->TestSameDictValues(); }
+
+TYPED_TEST(TestDictionaryReplacement, DeltaDict) { this->TestDeltaDict(); }
+
+TYPED_TEST(TestDictionaryReplacement, SameDictValuesNested) {
+  this->TestSameDictValuesNested();
+}
+
+TYPED_TEST(TestDictionaryReplacement, DifferentDictValues) {
+  this->TestDifferentDictValues();
+}
+
+TYPED_TEST(TestDictionaryReplacement, DifferentDictValuesNested) {
+  this->TestDifferentDictValuesNested();
+}
+
+TYPED_TEST(TestDictionaryReplacement, DeltaDictNestedOuter) {
+  this->TestDeltaDictNestedOuter();
+}
+
+TYPED_TEST(TestDictionaryReplacement, DeltaDictNestedInner) {
+  this->TestDeltaDictNestedInner();
 }
 
 // ----------------------------------------------------------------------

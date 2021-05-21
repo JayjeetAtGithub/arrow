@@ -24,19 +24,57 @@
 #if defined(ARROW_R_WITH_ARROW)
 
 #include <arrow/buffer.h>  // for RBuffer definition below
-#include <arrow/c/bridge.h>
 #include <arrow/result.h>
-#include <arrow/type_fwd.h>
+#include <arrow/status.h>
 
 #include <limits>
 #include <memory>
 #include <utility>
-#include <vector>
+
+// forward declaration-only headers
+#include <arrow/c/abi.h>
+#include <arrow/compute/type_fwd.h>
+#include <arrow/csv/type_fwd.h>
+
+#if defined(ARROW_R_WITH_DATASET)
+#include <arrow/dataset/type_fwd.h>
+#endif
+
+#include <arrow/filesystem/type_fwd.h>
+#include <arrow/io/type_fwd.h>
+#include <arrow/ipc/type_fwd.h>
+#include <arrow/json/type_fwd.h>
+#include <arrow/type_fwd.h>
+#include <arrow/util/type_fwd.h>
+
+#if defined(ARROW_R_WITH_PARQUET)
+#include <parquet/type_fwd.h>
+#endif
+
+#if defined(ARROW_R_WITH_DATASET)
+namespace ds = ::arrow::dataset;
+#endif
+
+namespace compute = ::arrow::compute;
+namespace fs = ::arrow::fs;
 
 SEXP ChunkedArray__as_vector(const std::shared_ptr<arrow::ChunkedArray>& chunked_array);
 SEXP Array__as_vector(const std::shared_ptr<arrow::Array>& array);
-std::shared_ptr<arrow::Array> Array__from_vector(SEXP x, SEXP type);
 std::shared_ptr<arrow::RecordBatch> RecordBatch__from_arrays(SEXP, SEXP);
+arrow::MemoryPool* gc_memory_pool();
+
+#if (R_VERSION < R_Version(3, 5, 0))
+#define LOGICAL_RO(x) ((const int*)LOGICAL(x))
+#define INTEGER_RO(x) ((const int*)INTEGER(x))
+#define REAL_RO(x) ((const double*)REAL(x))
+#define COMPLEX_RO(x) ((const Rcomplex*)COMPLEX(x))
+#define STRING_PTR_RO(x) ((const SEXP*)STRING_PTR(x))
+#define RAW_RO(x) ((const Rbyte*)RAW(x))
+#define DATAPTR_RO(x) ((const void*)STRING_PTR(x))
+#define DATAPTR(x) (void*)STRING_PTR(x)
+#endif
+
+#define VECTOR_PTR_RO(x) ((const SEXP*)DATAPTR_RO(x))
 
 namespace arrow {
 
@@ -55,13 +93,15 @@ auto ValueOrStop(R&& result) -> decltype(std::forward<R>(result).ValueOrDie()) {
 namespace r {
 
 std::shared_ptr<arrow::DataType> InferArrowType(SEXP x);
+std::shared_ptr<arrow::Array> vec_to_arrow__reuse_memory(SEXP x);
+bool can_reuse_memory(SEXP x, const std::shared_ptr<arrow::DataType>& type);
 
 Status count_fields(SEXP lst, int* out);
 
-std::shared_ptr<arrow::Array> Array__from_vector(
-    SEXP x, const std::shared_ptr<arrow::DataType>& type, bool type_inferred);
-
 void inspect(SEXP obj);
+std::shared_ptr<arrow::Array> vec_to_arrow(SEXP x,
+                                           const std::shared_ptr<arrow::DataType>& type,
+                                           bool type_inferred);
 
 // the integer64 sentinel
 constexpr int64_t NA_INT64 = std::numeric_limits<int64_t>::min();
@@ -71,7 +111,8 @@ class RBuffer : public MutableBuffer {
  public:
   explicit RBuffer(RVector vec)
       : MutableBuffer(reinterpret_cast<uint8_t*>(DATAPTR(vec)),
-                      vec.size() * sizeof(typename RVector::value_type)),
+                      vec.size() * sizeof(typename RVector::value_type),
+                      arrow::CPUDevice::memory_manager(gc_memory_pool())),
         vec_(vec) {}
 
  private:
@@ -116,5 +157,83 @@ arrow::Status AddMetadataFromDots(SEXP lst, int num_fields,
 
 }  // namespace r
 }  // namespace arrow
+
+namespace cpp11 {
+
+template <typename T>
+struct r6_class_name {
+  static const char* get(const std::shared_ptr<T>& ptr) {
+    static const std::string name = arrow::util::nameof<T>(/*strip_namespace=*/true);
+    return name.c_str();
+  }
+};
+
+// Overrides of default R6 class names:
+#define R6_CLASS_NAME(CLASS, NAME)                                         \
+  template <>                                                              \
+  struct r6_class_name<CLASS> {                                            \
+    static const char* get(const std::shared_ptr<CLASS>&) { return NAME; } \
+  }
+
+R6_CLASS_NAME(arrow::csv::ReadOptions, "CsvReadOptions");
+R6_CLASS_NAME(arrow::csv::ParseOptions, "CsvParseOptions");
+R6_CLASS_NAME(arrow::csv::ConvertOptions, "CsvConvertOptions");
+R6_CLASS_NAME(arrow::csv::TableReader, "CsvTableReader");
+R6_CLASS_NAME(arrow::csv::WriteOptions, "CsvWriteOptions");
+
+#if defined(ARROW_R_WITH_PARQUET)
+R6_CLASS_NAME(parquet::ArrowReaderProperties, "ParquetArrowReaderProperties");
+R6_CLASS_NAME(parquet::ArrowWriterProperties, "ParquetArrowWriterProperties");
+R6_CLASS_NAME(parquet::WriterProperties, "ParquetWriterProperties");
+R6_CLASS_NAME(parquet::arrow::FileReader, "ParquetFileReader");
+R6_CLASS_NAME(parquet::WriterPropertiesBuilder, "ParquetWriterPropertiesBuilder");
+R6_CLASS_NAME(parquet::arrow::FileWriter, "ParquetFileWriter");
+#endif
+
+R6_CLASS_NAME(arrow::ipc::feather::Reader, "FeatherReader");
+
+R6_CLASS_NAME(arrow::json::ReadOptions, "JsonReadOptions");
+R6_CLASS_NAME(arrow::json::ParseOptions, "JsonParseOptions");
+R6_CLASS_NAME(arrow::json::TableReader, "JsonTableReader");
+
+#undef R6_CLASS_NAME
+
+// Declarations of discriminated base classes.
+// Definitions reside in corresponding .cpp files.
+template <>
+struct r6_class_name<fs::FileSystem> {
+  static const char* get(const std::shared_ptr<fs::FileSystem>&);
+};
+
+template <>
+struct r6_class_name<arrow::Array> {
+  static const char* get(const std::shared_ptr<arrow::Array>&);
+};
+
+template <>
+struct r6_class_name<arrow::Scalar> {
+  static const char* get(const std::shared_ptr<arrow::Scalar>&);
+};
+
+template <>
+struct r6_class_name<arrow::DataType> {
+  static const char* get(const std::shared_ptr<arrow::DataType>&);
+};
+
+#if defined(ARROW_R_WITH_DATASET)
+
+template <>
+struct r6_class_name<ds::Dataset> {
+  static const char* get(const std::shared_ptr<ds::Dataset>&);
+};
+
+template <>
+struct r6_class_name<ds::FileFormat> {
+  static const char* get(const std::shared_ptr<ds::FileFormat>&);
+};
+
+#endif
+
+}  // namespace cpp11
 
 #endif

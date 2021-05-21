@@ -20,13 +20,12 @@ import pickle
 import sys
 import weakref
 
-from distutils.version import LooseVersion
-
 import pytest
 import numpy as np
 import pyarrow as pa
 
 import pyarrow.tests.util as test_util
+from pyarrow.vendored.version import Version
 
 
 def test_schema_constructor_errors():
@@ -70,6 +69,7 @@ def test_type_to_pandas_dtype():
         (pa.string(), np.object_),
         (pa.list_(pa.int8()), np.object_),
         # (pa.list_(pa.int8(), 2), np.object_),  # TODO needs pandas conversion
+        (pa.map_(pa.int64(), pa.float64()), np.object_),
     ]
     for arrow_type, numpy_type in cases:
         assert arrow_type.to_pandas_dtype() == numpy_type
@@ -207,7 +207,7 @@ def test_from_numpy_dtype():
 
     # Things convertible to numpy dtypes work
     assert pa.from_numpy_dtype('U') == pa.string()
-    assert pa.from_numpy_dtype(np.unicode) == pa.string()
+    assert pa.from_numpy_dtype(np.str_) == pa.string()
     assert pa.from_numpy_dtype('int32') == pa.int32()
     assert pa.from_numpy_dtype(bool) == pa.bool_()
 
@@ -603,6 +603,7 @@ def test_type_schema_pickling():
         pa.timestamp('ms'),
         pa.timestamp('ns'),
         pa.decimal128(12, 2),
+        pa.decimal256(76, 38),
         pa.field('a', 'string', metadata={b'foo': b'bar'})
     ]
 
@@ -654,7 +655,7 @@ def test_schema_from_pandas():
             '2010-08-13T05:46:57.437699912'
         ], dtype='datetime64[ns]'),
     ]
-    if LooseVersion(pd.__version__) >= '1.0.0':
+    if Version(pd.__version__) >= Version('1.0.0'):
         inputs.append(pd.array([1, 2, None], dtype=pd.Int32Dtype()))
     for data in inputs:
         df = pd.DataFrame({'a': data})
@@ -707,3 +708,14 @@ def test_schema_merge():
 
     with pytest.raises(pa.ArrowInvalid):
         pa.unify_schemas([b, d])
+
+
+def test_undecodable_metadata():
+    # ARROW-10214: undecodable metadata shouldn't fail repr()
+    data1 = b'abcdef\xff\x00'
+    data2 = b'ghijkl\xff\x00'
+    schema = pa.schema(
+        [pa.field('ints', pa.int16(), metadata={'key': data1})],
+        metadata={'key': data2})
+    assert 'abcdef' in str(schema)
+    assert 'ghijkl' in str(schema)

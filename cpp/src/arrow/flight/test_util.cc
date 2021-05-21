@@ -86,7 +86,7 @@ Status ResolveCurrentExecutable(fs::path* out) {
 
 }  // namespace
 
-void TestServer::Start() {
+void TestServer::Start(const std::vector<std::string>& extra_args) {
   namespace fs = boost::filesystem;
 
   std::string str_port = std::to_string(port_);
@@ -103,8 +103,15 @@ void TestServer::Start() {
   }
 
   try {
-    server_process_ = std::make_shared<bp::child>(
-        bp::search_path(executable_name_, search_path), "-port", str_port);
+    if (unix_sock_.empty()) {
+      server_process_ =
+          std::make_shared<bp::child>(bp::search_path(executable_name_, search_path),
+                                      "-port", str_port, bp::args(extra_args));
+    } else {
+      server_process_ =
+          std::make_shared<bp::child>(bp::search_path(executable_name_, search_path),
+                                      "-server_unix", unix_sock_, bp::args(extra_args));
+    }
   } catch (...) {
     std::stringstream ss;
     ss << "Failed to launch test server '" << executable_name_ << "', looked in ";
@@ -136,6 +143,8 @@ int TestServer::Stop() {
 bool TestServer::IsRunning() { return server_process_->running(); }
 
 int TestServer::port() const { return port_; }
+
+const std::string& TestServer::unix_sock() const { return unix_sock_; }
 
 Status GetBatchForFlight(const Ticket& ticket, std::shared_ptr<RecordBatchReader>* out) {
   if (ticket.ticket == "ticket-ints-1") {

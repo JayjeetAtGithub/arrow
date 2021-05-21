@@ -22,58 +22,59 @@
 #include <memory>
 #include <vector>
 
+#include "arrow/compute/type_fwd.h"  // IWYU pragma: export
 #include "arrow/dataset/visibility.h"
 #include "arrow/filesystem/type_fwd.h"  // IWYU pragma: export
 #include "arrow/type_fwd.h"             // IWYU pragma: export
 
 namespace arrow {
-namespace compute {
-
-class ExecContext;
-
-}  // namespace compute
-
 namespace dataset {
 
 class Dataset;
+class DatasetFactory;
 using DatasetVector = std::vector<std::shared_ptr<Dataset>>;
 
 class UnionDataset;
-class DatasetFactory;
+class UnionDatasetFactory;
 
 class Fragment;
 using FragmentIterator = Iterator<std::shared_ptr<Fragment>>;
 using FragmentVector = std::vector<std::shared_ptr<Fragment>>;
 
+class FragmentScanOptions;
+
 class FileSource;
 class FileFormat;
 class FileFragment;
+class FileWriter;
+class FileWriteOptions;
 class FileSystemDataset;
+class FileSystemDatasetFactory;
+struct FileSystemDatasetWriteOptions;
 
 class InMemoryDataset;
 
 class CsvFileFormat;
+struct CsvFragmentScanOptions;
 
 class IpcFileFormat;
+class IpcFileWriter;
+class IpcFileWriteOptions;
+class IpcFragmentScanOptions;
 
 class ParquetFileFormat;
 class ParquetFileFragment;
-
-class Expression;
-using ExpressionVector = std::vector<std::shared_ptr<Expression>>;
-class ExpressionEvaluator;
-
-/// forward declared to facilitate scalar(true) as a default for Expression parameters
-ARROW_DS_EXPORT
-std::shared_ptr<Expression> scalar(bool);
+class ParquetFragmentScanOptions;
+class ParquetFileWriter;
+class ParquetFileWriteOptions;
 
 class Partitioning;
 class PartitioningFactory;
 class PartitioningOrFactory;
+class DirectoryPartitioning;
+class HivePartitioning;
 
-struct ScanContext;
-
-class ScanOptions;
+struct ScanOptions;
 
 class Scanner;
 
@@ -82,8 +83,6 @@ class ScannerBuilder;
 class ScanTask;
 using ScanTaskVector = std::vector<std::shared_ptr<ScanTask>>;
 using ScanTaskIterator = Iterator<std::shared_ptr<ScanTask>>;
-
-class RecordBatchProjector;
 
 }  // namespace dataset
 }  // namespace arrow

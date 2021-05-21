@@ -17,11 +17,11 @@
 
 #pragma once
 
-#include "arrow/builder.h"
 #include "arrow/compute/api_vector.h"
 #include "arrow/compute/cast.h"           // IWYU pragma: export
 #include "arrow/compute/cast_internal.h"  // IWYU pragma: export
 #include "arrow/compute/kernels/common.h"
+#include "arrow/compute/kernels/util_internal.h"
 
 namespace arrow {
 
@@ -37,10 +37,10 @@ struct CastFunctor {};
 template <typename O, typename I>
 struct CastFunctor<
     O, I, enable_if_t<std::is_same<O, I>::value && is_parameter_free_type<I>::value>> {
-  static void Exec(KernelContext*, const ExecBatch&, Datum*) {}
+  static Status Exec(KernelContext*, const ExecBatch&, Datum*) { return Status::OK(); }
 };
 
-void CastFromExtension(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status CastFromExtension(KernelContext* ctx, const ExecBatch& batch, Datum* out);
 
 // Utility for numeric casts
 void CastNumberToNumberUnsafe(Type::type in_type, Type::type out_type, const Datum& input,
@@ -49,21 +49,23 @@ void CastNumberToNumberUnsafe(Type::type in_type, Type::type out_type, const Dat
 // ----------------------------------------------------------------------
 // Dictionary to other things
 
-void UnpackDictionary(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status UnpackDictionary(KernelContext* ctx, const ExecBatch& batch, Datum* out);
 
-void OutputAllNull(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status OutputAllNull(KernelContext* ctx, const ExecBatch& batch, Datum* out);
 
-void CastFromNull(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status CastFromNull(KernelContext* ctx, const ExecBatch& batch, Datum* out);
 
-// Adds a cast function where the functor is defined and the input and output
-// types have a type_singleton
+// Adds a cast function where CastFunctor is specialized and the input and output
+// types are parameter free (have a type_singleton). Scalar inputs are handled by
+// wrapping with TrivialScalarUnaryAsArraysExec.
 template <typename InType, typename OutType>
 void AddSimpleCast(InputType in_ty, OutputType out_ty, CastFunction* func) {
-  DCHECK_OK(func->AddKernel(InType::type_id, {in_ty}, out_ty,
-                            CastFunctor<OutType, InType>::Exec));
+  DCHECK_OK(func->AddKernel(
+      InType::type_id, {in_ty}, out_ty,
+      TrivialScalarUnaryAsArraysExec(CastFunctor<OutType, InType>::Exec)));
 }
 
-void ZeroCopyCastExec(KernelContext* ctx, const ExecBatch& batch, Datum* out);
+Status ZeroCopyCastExec(KernelContext* ctx, const ExecBatch& batch, Datum* out);
 
 void AddZeroCopyCast(Type::type in_type_id, InputType in_type, OutputType out_type,
                      CastFunction* func);

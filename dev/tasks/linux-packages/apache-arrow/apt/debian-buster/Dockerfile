@@ -18,8 +18,6 @@
 ARG FROM=debian:buster
 FROM ${FROM}
 
-COPY qemu-* /usr/bin/
-
 RUN \
   echo "debconf debconf/frontend select Noninteractive" | \
     debconf-set-selections
@@ -35,32 +33,23 @@ RUN \
     /etc/apt/sources.list.d/backports.list
 
 ARG DEBUG
-ARG LLVM
 RUN \
   quiet=$([ "${DEBUG}" = "yes" ] || echo "-qq") && \
   apt update ${quiet} && \
   apt install -y -V ${quiet} \
-    apt-transport-https \
-    ca-certificates \
-    gnupg \
-    wget && \
-  wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && \
-  echo "deb https://apt.llvm.org/buster/ llvm-toolchain-buster-${LLVM} main" > \
-    /etc/apt/sources.list.d/llvm.list && \
-  apt update ${quiet} && \
-  apt install -y -V ${quiet} \
     build-essential \
+    ccache \
     cmake \
     debhelper \
     devscripts \
     git \
     gtk-doc-tools \
     libboost-filesystem-dev \
-    libboost-regex-dev \
     libboost-system-dev \
     libbrotli-dev \
     libbz2-dev \
     libc-ares-dev \
+    libcurl4-openssl-dev \
     libgirepository1.0-dev \
     libglib2.0-doc \
     libgmock-dev \
@@ -82,11 +71,9 @@ RUN \
     rapidjson-dev \
     tzdata \
     zlib1g-dev && \
-  if [ "$(dpkg --print-architecture)" != "arm64" ]; then \
-    apt install -y -V ${quiet} \
-      clang-${LLVM} \
-      llvm-${LLVM}-dev; \
-  fi && \
+  apt install -y -V -t buster-backports ${quiet} \
+    clang-11 \
+    llvm-11-dev && \
   if apt list | grep '^nvidia-cuda-toolkit/'; then \
     apt install -y -V ${quiet} nvidia-cuda-toolkit; \
   fi && \

@@ -18,20 +18,20 @@
 ARG FROM=centos:8
 FROM ${FROM}
 
-COPY qemu-* /usr/bin/
-
 ARG DEBUG
 
 RUN \
   quiet=$([ "${DEBUG}" = "yes" ] || echo "--quiet") && \
   dnf install -y ${quiet} epel-release && \
-  dnf install --enablerepo=PowerTools -y ${quiet} \
+  dnf install --enablerepo=powertools -y ${quiet} \
     bison \
     boost-devel \
     brotli-devel \
     bzip2-devel \
+    ccache \
     clang \
     cmake \
+    curl-devel \
     flex \
     gcc-c++ \
     gflags-devel \
@@ -54,7 +54,6 @@ RUN \
     python3-pip \
     re2-devel \
     # rapidjson-devel \
-    rpm-build \
     rpmdevtools \
     snappy-devel \
     tar \

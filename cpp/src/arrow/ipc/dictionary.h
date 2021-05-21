@@ -80,6 +80,10 @@ class ARROW_EXPORT DictionaryFieldMapper {
 
   int num_fields() const;
 
+  /// \brief Returns number of unique dictionaries, taking into
+  /// account that different fields can share the same dictionary.
+  int num_dicts() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -133,7 +137,10 @@ class ARROW_EXPORT DictionaryMemo {
 
   /// \brief Add a dictionary to the memo if it does not have one with the id,
   /// otherwise, replace the dictionary with the new one.
-  Status AddOrReplaceDictionary(int64_t id, const std::shared_ptr<ArrayData>& dictionary);
+  ///
+  /// Return true if the dictionary was added, false if replaced.
+  Result<bool> AddOrReplaceDictionary(int64_t id,
+                                      const std::shared_ptr<ArrayData>& dictionary);
 
  private:
   struct Impl;

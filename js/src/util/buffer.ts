@@ -27,7 +27,7 @@ const SharedArrayBuf = (typeof SharedArrayBuffer !== 'undefined' ? SharedArrayBu
 
 /** @ignore */
 function collapseContiguousByteRanges(chunks: Uint8Array[]) {
-    let result = chunks[0] ? [chunks[0]] : [];
+    const result = chunks[0] ? [chunks[0]] : [];
     let xOffset: number, yOffset: number, xLen: number, yLen: number;
     for (let x, y, i = 0, j = 0, n = chunks.length; ++i < n;) {
         x = result[j];
@@ -63,10 +63,11 @@ export function joinUint8Arrays(chunks: Uint8Array[], size?: number | null): [Ui
     // collapse chunks that share the same underlying ArrayBuffer and whose byte ranges overlap,
     // to avoid unnecessarily copying the bytes to do this buffer join. This is a common case during
     // streaming, where we may be reading partial byte ranges out of the same underlying ArrayBuffer
-    let result = collapseContiguousByteRanges(chunks);
-    let byteLength = result.reduce((x, b) => x + b.byteLength, 0);
+    const result = collapseContiguousByteRanges(chunks);
+    const byteLength = result.reduce((x, b) => x + b.byteLength, 0);
     let source: Uint8Array, sliced: Uint8Array, buffer: Uint8Array | void;
-    let offset = 0, index = -1, length = Math.min(size || Infinity, byteLength);
+    let offset = 0, index = -1;
+    const length = Math.min(size || Infinity, byteLength);
     for (let n = result.length; ++index < n;) {
         source = result[index];
         sliced = source.subarray(0, Math.min(source.length, length - offset));
@@ -141,12 +142,13 @@ export function* toArrayBufferViewIterator<T extends TypedArray>(ArrayCtor: Type
            : (source instanceof SharedArrayBuf) ? wrap(source)
     : !isIterable<ArrayBufferViewInput>(source) ? wrap(source) : source;
 
-    yield* pump((function* (it) {
+    yield* pump((function* (it: Iterator<ArrayBufferViewInput, any, number | undefined>): Generator<T, void, number | undefined> {
         let r: IteratorResult<any> = <any> null;
         do {
             r = it.next(yield toArrayBufferView(ArrayCtor, r));
         } while (!r.done);
     })(buffers[Symbol.iterator]()));
+    return new ArrayCtor();
 }
 
 /** @ignore */ export const toInt8ArrayIterator = (input: ArrayBufferViewIteratorInput) => toArrayBufferViewIterator(Int8Array, input);
@@ -163,7 +165,7 @@ export function* toArrayBufferViewIterator<T extends TypedArray>(ArrayCtor: Type
 type ArrayBufferViewAsyncIteratorInput = AsyncIterable<ArrayBufferViewInput> | Iterable<ArrayBufferViewInput> | PromiseLike<ArrayBufferViewInput> | ArrayBufferViewInput;
 
 /** @ignore */
-export async function* toArrayBufferViewAsyncIterator<T extends TypedArray>(ArrayCtor: TypedArrayConstructor<T>, source: ArrayBufferViewAsyncIteratorInput): AsyncIterableIterator<T> {
+export async function* toArrayBufferViewAsyncIterator<T extends TypedArray>(ArrayCtor: TypedArrayConstructor<T>, source: ArrayBufferViewAsyncIteratorInput): AsyncGenerator<T, T, number | undefined> {
 
     // if a Promise, unwrap the Promise and iterate the resolved value
     if (isPromise<ArrayBufferViewInput>(source)) {
@@ -175,7 +177,7 @@ export async function* toArrayBufferViewAsyncIterator<T extends TypedArray>(Arra
         yield* pump((function*(it: Iterator<any>) {
             let r: IteratorResult<any> = <any> null;
             do {
-                r = it.next(yield r && r.value);
+                r = it.next(yield r?.value);
             } while (!r.done);
         })(source[Symbol.iterator]()));
     };
@@ -189,12 +191,13 @@ export async function* toArrayBufferViewAsyncIterator<T extends TypedArray>(Arra
     : !isAsyncIterable<ArrayBufferViewInput>(source) ? wrap(source) // If not an AsyncIterable, treat as a sentinel and wrap in an AsyncIterableIterator
                                                      : source; // otherwise if AsyncIterable, use it
 
-    yield* pump((async function* (it) {
+    yield* pump((async function* (it: AsyncIterator<ArrayBufferViewInput, any, number | undefined>): AsyncGenerator<T, void, number | undefined> {
         let r: IteratorResult<any> = <any> null;
         do {
             r = await it.next(yield toArrayBufferView(ArrayCtor, r));
         } while (!r.done);
     })(buffers[Symbol.asyncIterator]()));
+    return new ArrayCtor();
 }
 
 /** @ignore */ export const toInt8ArrayAsyncIterator = (input: ArrayBufferViewAsyncIteratorInput) => toArrayBufferViewAsyncIterator(Int8Array, input);
@@ -222,7 +225,8 @@ export function rebaseValueOffsets(offset: number, length: number, valueOffsets:
 
 /** @ignore */
 export function compareArrayLike<T extends ArrayLike<any>>(a: T, b: T) {
-    let i = 0, n = a.length;
+    let i = 0;
+    const n = a.length;
     if (n !== b.length) { return false; }
     if (n > 0) {
         do { if (a[i] !== b[i]) { return false; } } while (++i < n);

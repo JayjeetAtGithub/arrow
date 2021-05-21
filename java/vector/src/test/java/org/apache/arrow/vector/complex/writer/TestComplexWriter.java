@@ -30,11 +30,13 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SchemaChangeCallBack;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.NonNullableStructVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.complex.UnionVector;
@@ -43,6 +45,7 @@ import org.apache.arrow.vector.complex.impl.SingleStructReaderImpl;
 import org.apache.arrow.vector.complex.impl.SingleStructWriter;
 import org.apache.arrow.vector.complex.impl.UnionListReader;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
+import org.apache.arrow.vector.complex.impl.UnionMapReader;
 import org.apache.arrow.vector.complex.impl.UnionReader;
 import org.apache.arrow.vector.complex.impl.UnionWriter;
 import org.apache.arrow.vector.complex.reader.BaseReader.StructReader;
@@ -53,6 +56,7 @@ import org.apache.arrow.vector.complex.reader.Float8Reader;
 import org.apache.arrow.vector.complex.reader.IntReader;
 import org.apache.arrow.vector.complex.writer.BaseWriter.ComplexWriter;
 import org.apache.arrow.vector.complex.writer.BaseWriter.ListWriter;
+import org.apache.arrow.vector.complex.writer.BaseWriter.MapWriter;
 import org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter;
 import org.apache.arrow.vector.holders.DecimalHolder;
 import org.apache.arrow.vector.holders.IntHolder;
@@ -310,21 +314,21 @@ public class TestComplexWriter {
       listVector.allocateNew();
       UnionListWriter listWriter = new UnionListWriter(listVector);
       DecimalHolder holder = new DecimalHolder();
-      holder.buffer = allocator.buffer(DecimalUtility.DECIMAL_BYTE_LENGTH);
-      ArrowType arrowType = new ArrowType.Decimal(10, 0);
+      holder.buffer = allocator.buffer(DecimalVector.TYPE_WIDTH);
+      ArrowType arrowType = new ArrowType.Decimal(10, 0, 128);
       for (int i = 0; i < COUNT; i++) {
         listWriter.startList();
         for (int j = 0; j < i % 7; j++) {
           if (j % 4 == 0) {
             listWriter.writeDecimal(new BigDecimal(j));
           } else if (j % 4 == 1) {
-            DecimalUtility.writeBigDecimalToArrowBuf(new BigDecimal(j), holder.buffer, 0);
+            DecimalUtility.writeBigDecimalToArrowBuf(new BigDecimal(j), holder.buffer, 0, DecimalVector.TYPE_WIDTH);
             holder.start = 0;
             holder.scale = 0;
             holder.precision = 10;
             listWriter.write(holder);
           } else if (j % 4 == 2) {
-            DecimalUtility.writeBigDecimalToArrowBuf(new BigDecimal(j), holder.buffer, 0);
+            DecimalUtility.writeBigDecimalToArrowBuf(new BigDecimal(j), holder.buffer, 0, DecimalVector.TYPE_WIDTH);
             listWriter.writeDecimal(0, holder.buffer, arrowType);
           } else {
             byte[] value = BigDecimal.valueOf(j).unscaledValue().toByteArray();
@@ -539,6 +543,59 @@ public class TestComplexWriter {
             Assert.assertEquals("record: " + i, k, innerListReader.reader().readInteger().intValue());
           } else {
             Assert.assertEquals("record: " + i, k, innerListReader.reader().readLong().longValue());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testListMapType() {
+    try (ListVector listVector = ListVector.empty("list", allocator)) {
+      listVector.allocateNew();
+      UnionListWriter listWriter = new UnionListWriter(listVector);
+      MapWriter innerMapWriter = listWriter.map(true);
+
+      for (int i = 0; i < COUNT; i++) {
+        listWriter.startList();
+        for (int j = 0; j < i % 7; j++) {
+          innerMapWriter.startMap();
+          for (int k = 0; k < i % 13; k++) {
+            innerMapWriter.startEntry();
+            innerMapWriter.key().integer().writeInt(k);
+            if (k % 2 == 0) {
+              innerMapWriter.value().bigInt().writeBigInt(k);
+            }
+            innerMapWriter.endEntry();
+          }
+          innerMapWriter.endMap();
+        }
+        listWriter.endList();
+      }
+      listWriter.setValueCount(COUNT);
+      checkListMap(listVector);
+
+      // Verify that the map vector has keysSorted = true
+      MapVector mapVector = (MapVector) listVector.getDataVector();
+      ArrowType arrowType = mapVector.getField().getFieldType().getType();
+      assertTrue(((ArrowType.Map) arrowType).getKeysSorted());
+    }
+  }
+
+  private void checkListMap(ListVector listVector) {
+    UnionListReader listReader = new UnionListReader(listVector);
+    for (int i = 0; i < COUNT; i++) {
+      listReader.setPosition(i);
+      for (int j = 0; j < i % 7; j++) {
+        listReader.next();
+        UnionMapReader mapReader = (UnionMapReader) listReader.reader();
+        for (int k = 0; k < i % 13; k++) {
+          mapReader.next();
+          Assert.assertEquals("record key: " + i, k, mapReader.key().readInteger().intValue());
+          if (k % 2 == 0) {
+            Assert.assertEquals("record value: " + i, k, mapReader.value().readLong().longValue());
+          } else {
+            Assert.assertNull("record value: " + i, mapReader.value().readLong());
           }
         }
       }
@@ -1021,6 +1078,7 @@ public class TestComplexWriter {
       Float4Writer float4Writer = singleStructWriter.float4("float4Field");
       Float8Writer float8Writer = singleStructWriter.float8("float8Field");
       ListWriter listWriter = singleStructWriter.list("listField");
+      MapWriter mapWriter = singleStructWriter.map("mapField", false);
 
       int intValue = 100;
       long bigIntValue = 10000;
@@ -1042,6 +1100,18 @@ public class TestComplexWriter {
         listWriter.integer().writeInt(intValue + i + 2);
         listWriter.integer().writeInt(intValue + i + 3);
         listWriter.endList();
+
+        mapWriter.setPosition(i);
+        mapWriter.startMap();
+        mapWriter.startEntry();
+        mapWriter.key().integer().writeInt(intValue + i);
+        mapWriter.value().integer().writeInt(intValue + i + 1);
+        mapWriter.endEntry();
+        mapWriter.startEntry();
+        mapWriter.key().integer().writeInt(intValue + i + 2);
+        mapWriter.value().integer().writeInt(intValue + i + 3);
+        mapWriter.endEntry();
+        mapWriter.endMap();
 
         singleStructWriter.end();
       }
@@ -1069,6 +1139,7 @@ public class TestComplexWriter {
       Float4Reader float4Reader = singleStructReader.reader("float4Field");
       Float8Reader float8Reader = singleStructReader.reader("float8Field");
       UnionListReader listReader = (UnionListReader) singleStructReader.reader("listField");
+      UnionMapReader mapReader = (UnionMapReader) singleStructReader.reader("mapField");
 
       for (int i = 0; i < initialCapacity; i++) {
         intReader.setPosition(i);
@@ -1076,6 +1147,7 @@ public class TestComplexWriter {
         float4Reader.setPosition(i);
         float8Reader.setPosition(i);
         listReader.setPosition(i);
+        mapReader.setPosition(i);
 
         assertEquals(intValue + i, intReader.readInteger().intValue());
         assertEquals(bigIntValue + (long) i, bigIntReader.readLong().longValue());
@@ -1086,9 +1158,178 @@ public class TestComplexWriter {
           listReader.next();
           assertEquals(intValue + i + j, listReader.reader().readInteger().intValue());
         }
+
+        for (int k = 0; k < 4; k += 2) {
+          mapReader.next();
+          assertEquals(intValue + k + i, mapReader.key().readInteger().intValue());
+          assertEquals(intValue + k + i + 1, mapReader.value().readInteger().intValue());
+        }
       }
     }
 
 
+  }
+
+  @Test
+  public void testListWriterWithNulls() {
+    try (ListVector listVector = ListVector.empty("list", allocator)) {
+      listVector.setInitialCapacity(COUNT);
+      listVector.allocateNew();
+      listVector.getValidityBuffer().setOne(0, (int) listVector.getValidityBuffer().capacity());
+
+      UnionListWriter listWriter = listVector.getWriter();
+
+      // expected listVector :  [[null], null, [2, 4], null, [null], null, [6, 12], ...]
+      for (int i = 0; i < COUNT; i++) {
+        listWriter.setPosition(i);
+        if (i % 2 == 0) {
+          listWriter.startList();
+          if (i % 4 == 0) {
+            listWriter.integer().writeNull();
+          } else {
+            listWriter.integer().writeInt(i);
+            listWriter.integer().writeInt(i * 2);
+          }
+          listWriter.endList();
+        } else {
+          listWriter.writeNull();
+        }
+      }
+      listVector.setValueCount(COUNT);
+
+      UnionListReader listReader = new UnionListReader(listVector);
+      for (int i = 0; i < COUNT; i++) {
+        listReader.setPosition(i);
+        if (i % 2 == 0) {
+          Assert.assertTrue(listReader.isSet());
+          listReader.next();
+          if (i % 4 == 0) {
+            Assert.assertNull(listReader.reader().readInteger());
+          } else {
+            Assert.assertEquals(i, listReader.reader().readInteger().intValue());
+            listReader.next();
+            Assert.assertEquals(i * 2, listReader.reader().readInteger().intValue());
+          }
+        } else {
+          Assert.assertFalse(listReader.isSet());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testListOfListWriterWithNulls() {
+    try (ListVector listVector = ListVector.empty("listoflist", allocator)) {
+      listVector.setInitialCapacity(COUNT);
+      listVector.allocateNew();
+      listVector.getValidityBuffer().setOne(0, (int) listVector.getValidityBuffer().capacity());
+
+      UnionListWriter listWriter = listVector.getWriter();
+
+      // create list : [ [null], null, [[null, 2, 4]], null, [null], null, [[null, 6, 12]], ... ]
+      for (int i = 0; i < COUNT; i++) {
+        listWriter.setPosition(i);
+        if (i % 2 == 0) {
+          listWriter.startList();
+          if (i % 4 == 0) {
+            listWriter.list().writeNull();
+          } else {
+            listWriter.list().startList();
+            listWriter.list().integer().writeNull();
+            listWriter.list().integer().writeInt(i);
+            listWriter.list().integer().writeInt(i * 2);
+            listWriter.list().endList();
+          }
+          listWriter.endList();
+        } else {
+          listWriter.writeNull();
+        }
+      }
+      listVector.setValueCount(COUNT);
+
+      UnionListReader listReader = new UnionListReader(listVector);
+      for (int i = 0; i < COUNT; i++) {
+        listReader.setPosition(i);
+        if (i % 2 == 0) {
+          Assert.assertTrue(listReader.isSet());
+          listReader.next();
+          if (i % 4 == 0) {
+            Assert.assertFalse(listReader.reader().isSet());
+          } else {
+            listReader.reader().next();
+            Assert.assertFalse(listReader.reader().reader().isSet());
+            listReader.reader().next();
+            Assert.assertEquals(i, listReader.reader().reader().readInteger().intValue());
+            listReader.reader().next();
+            Assert.assertEquals(i * 2, listReader.reader().reader().readInteger().intValue());
+          }
+        } else {
+          Assert.assertFalse(listReader.isSet());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testListOfListOfListWriterWithNulls() {
+    try (ListVector listVector = ListVector.empty("listoflistoflist", allocator)) {
+      listVector.setInitialCapacity(COUNT);
+      listVector.allocateNew();
+      listVector.getValidityBuffer().setOne(0, (int) listVector.getValidityBuffer().capacity());
+
+      UnionListWriter listWriter = listVector.getWriter();
+
+      // create list : [ null, [null], [[null]], [[[null, 1, 2]]], null, [null], ...
+      for (int i = 0; i < COUNT; i++) {
+        listWriter.setPosition(i);
+        if (i % 4 == 0) {
+          listWriter.writeNull();
+        } else {
+          listWriter.startList();
+          if (i % 4 == 1) {
+            listWriter.list().writeNull();
+          } else if (i % 4 == 2) {
+            listWriter.list().startList();
+            listWriter.list().list().writeNull();
+            listWriter.list().endList();
+          } else {
+            listWriter.list().startList();
+            listWriter.list().list().startList();
+            listWriter.list().list().integer().writeNull();
+            listWriter.list().list().integer().writeInt(i);
+            listWriter.list().list().integer().writeInt(i * 2);
+            listWriter.list().list().endList();
+            listWriter.list().endList();
+          }
+          listWriter.endList();
+        }
+      }
+      listVector.setValueCount(COUNT);
+
+      UnionListReader listReader = new UnionListReader(listVector);
+      for (int i = 0; i < COUNT; i++) {
+        listReader.setPosition(i);
+        if (i % 4 == 0) {
+          Assert.assertFalse(listReader.isSet());
+        } else {
+          Assert.assertTrue(listReader.isSet());
+          listReader.next();
+          if (i % 4 == 1) {
+            Assert.assertFalse(listReader.reader().isSet());
+          } else if (i % 4 == 2) {
+            listReader.reader().next();
+            Assert.assertFalse(listReader.reader().reader().isSet());
+          } else {
+            listReader.reader().next();
+            listReader.reader().reader().next();
+            Assert.assertFalse(listReader.reader().reader().reader().isSet());
+            listReader.reader().reader().next();
+            Assert.assertEquals(i, listReader.reader().reader().reader().readInteger().intValue());
+            listReader.reader().reader().next();
+            Assert.assertEquals(i * 2, listReader.reader().reader().reader().readInteger().intValue());
+          }
+        }
+      }
+    }
   }
 }

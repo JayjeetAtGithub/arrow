@@ -17,37 +17,38 @@
 # specific language governing permissions and limitations
 # under the License.
 
-%define _centos_ver %{?centos_ver:%{centos_ver}}%{!?centos_ver:8}
+%define _amzn %{?amzn:%{amzn}}%{!?amzn:0}
+%define is_amazon_linux (%{_amzn} != 0)
 
 %define boost_version %( \
-  if [ "%{_centos_ver}" = 7 ]; then \
+  if [ %{rhel} -eq 7 ]; then \
     echo 169; \
   fi)
 %define cmake_version %( \
-  if [ "%{_centos_ver}" -lt 8 ]; then \
+  if [ %{rhel} -lt 8 ]; then \
     echo 3; \
   fi)
 %define python_version %( \
-  if [ "%{_centos_ver}" = 6 ]; then \
-    echo 34; \
-  elif [ "%{_centos_ver}" = 7 ]; then \
+  if [ %{rhel} -eq 7 ]; then \
     echo 36; \
   else \
     echo 3; \
   fi)
 
-%define use_flight (%{_centos_ver} >= 8)
-%define use_gandiva (%{_centos_ver} >= 8 && %{_arch} != "aarch64")
-%define use_ninja (%{_centos_ver} >= 8)
-%define use_parquet (%{_centos_ver} >= 7)
+%define use_boost (!%{is_amazon_linux})
+%define use_flight (%{rhel} >= 8)
+%define use_gandiva (%{rhel} >= 8 && %{_arch} != "aarch64")
+%define use_gflags (!%{is_amazon_linux})
+%define use_mimalloc (%{rhel} >= 8)
+%define use_python (!%{is_amazon_linux})
+# TODO: Enable this. This works on local but is fragile on GitHub Actions and
+# Travis CI.
+# %define use_s3 (%{_centos_ver} >= 8)
+%define use_s3 0
 
-%define use_glib (%{_centos_ver} >= 7)
-%define use_meson (%{_centos_ver} >= 8)
-
-%define have_brotli (%{_centos_ver} >= 7)
-%define have_rapidjson (%{_centos_ver} == 7)
-%define have_re2 (%{_centos_ver} >= 8)
-%define have_utf8proc (%{_centos_ver} == 7)
+%define have_rapidjson (%{rhel} == 7)
+%define have_re2 (%{rhel} >= 8)
+%define have_utf8proc (%{rhel} == 7)
 
 Name:		@PACKAGE@
 Version:	@VERSION@
@@ -59,27 +60,31 @@ URL:		https://arrow.apache.org/
 Source0:	https://dist.apache.org/repos/dist/release/@PACKAGE@/@PACKAGE@-%{version}/apache-@PACKAGE@-%{version}.tar.gz
 
 BuildRequires:	bison
-%if %{_centos_ver} >= 7
+%if %{use_boost}
 BuildRequires:	boost%{boost_version}-devel
 %endif
-%if %{have_brotli}
 BuildRequires:	brotli-devel
-%endif
 BuildRequires:	bzip2-devel
 BuildRequires:	cmake%{cmake_version}
+%if %{use_s3}
+BuildRequires:	curl-devel
+%endif
+BuildRequires:	flex
 BuildRequires:	gcc-c++
-%if %{_centos_ver} >= 7
+%if %{use_gflags}
 BuildRequires:	gflags-devel
 %endif
 BuildRequires:	git
-%if %{_centos_ver} >= 7
 BuildRequires:	glog-devel
-%endif
 BuildRequires:	libzstd-devel
 BuildRequires:	lz4-devel
+BuildRequires:	ninja-build
+BuildRequires:	openssl-devel
 BuildRequires:	pkgconfig
+%if %{use_python}
 BuildRequires:	python%{python_version}-devel
 BuildRequires:	python%{python_version}-numpy
+%endif
 %if %{have_rapidjson}
 BuildRequires:	rapidjson-devel
 %endif
@@ -92,27 +97,13 @@ BuildRequires:	utf8proc-devel
 %endif
 BuildRequires:	zlib-devel
 
-%if %{use_flight}
-BuildRequires:	openssl-devel
-%endif
-
 %if %{use_gandiva}
 BuildRequires:	llvm-devel
 BuildRequires:	ncurses-devel
 %endif
 
-%if %{use_parquet}
-BuildRequires:	bison
-BuildRequires:	flex
-%endif
-
-%if %{use_glib}
-  %if !%{use_meson}
-BuildRequires:	autoconf-archive
-  %endif
 BuildRequires:	gobject-introspection-devel
 BuildRequires:	gtk-doc
-%endif
 
 %description
 Apache Arrow is a data processing library for analysis.
@@ -125,19 +116,29 @@ cpp_build_type=release
 mkdir cpp/build
 cd cpp/build
 %cmake3 .. \
+  -DARROW_CSV=ON \
+  -DARROW_DATASET=ON \
 %if %{use_flight}
   -DARROW_FLIGHT=ON \
 %endif
 %if %{use_gandiva}
   -DARROW_GANDIVA=ON \
 %endif
-  -DARROW_ORC=ON \
-%if %{use_parquet}
-  -DARROW_PARQUET=ON \
+  -DARROW_HDFS=ON \
+  -DARROW_JSON=ON \
+%if %{use_mimalloc}
+  -DARROW_MIMALLOC=ON \
 %endif
+  -DARROW_ORC=ON \
+  -DARROW_PACKAGE_KIND=rpm \
+  -DARROW_PARQUET=ON \
   -DARROW_PLASMA=ON \
+%if %{use_python}
   -DARROW_PYTHON=ON \
-  -DARROW_VERBOSE_THIRDPARTY_BUILD=ON \
+%endif
+%if %{use_s3}
+  -DARROW_S3=ON \
+%endif
   -DARROW_WITH_BROTLI=ON \
   -DARROW_WITH_BZ2=ON \
   -DARROW_WITH_LZ4=ON \
@@ -145,23 +146,19 @@ cd cpp/build
   -DARROW_WITH_ZLIB=ON \
   -DARROW_WITH_ZSTD=ON \
   -DCMAKE_BUILD_TYPE=$cpp_build_type \
+  -DARROW_USE_CCACHE=OFF \
   -DCMAKE_UNITY_BUILD=ON \
+  -DPARQUET_REQUIRE_ENCRYPTION=ON \
+%if %{use_python}
   -DPythonInterp_FIND_VERSION=ON \
   -DPythonInterp_FIND_VERSION_MAJOR=3 \
-%if %{use_ninja}
+%endif
   -GNinja
-%endif
 
-%if %{use_ninja}
-ninja
-%else
-make %{?_smp_mflags}
-%endif
+ninja %{?_smp_mflags}
 cd -
 
-%if %{use_glib}
 cd c_glib
-  %if %{use_meson}
 pip3 install meson
 meson setup build \
   --default-library=both \
@@ -170,66 +167,31 @@ meson setup build \
   -Darrow_cpp_build_dir=../cpp/build \
   -Darrow_cpp_build_type=$cpp_build_type \
   -Dgtk_doc=true
-LD_LIBRARY_PATH=$PWD/../cpp/build/$cpp_build_type ninja -C build
-  %else
-./autogen.sh
-%configure \
-  --with-arrow-cpp-build-dir=$PWD/../cpp/build \
-  --with-arrow-cpp-build-type=$cpp_build_type \
-  --enable-gtk-doc
-sed -i 's|^hardcode_libdir_flag_spec=.*|hardcode_libdir_flag_spec=""|g' libtool
-sed -i 's|^runpath_var=LD_RUN_PATH|runpath_var=DIE_RPATH_DIE|g' libtool
-ld_library_path=$PWD/arrow-glib/.libs/
-ld_library_path=$ld_library_path:$PWD/arrow-dataset-glib/.libs/
-ld_library_path=$ld_library_path:$PWD/parquet-glib/.libs/
-ld_library_path=$ld_library_path:$PWD/plasma-glib/.libs/
-ld_library_path=$ld_library_path:$PWD/../cpp/build/$cpp_build_type
-LD_LIBRARY_PATH=$ld_library_path make %{?_smp_mflags}
-  %endif
+LD_LIBRARY_PATH=$PWD/../cpp/build/$cpp_build_type \
+  ninja -C build %{?_smp_mflags}
 cd -
-%endif
 
 %install
 cpp_build_type=release
 
-%if %{use_glib}
 cd c_glib
-  %if %{use_meson}
 DESTDIR=$RPM_BUILD_ROOT ninja -C build install
 ninja -C build clean
-  %else
-make install DESTDIR=$RPM_BUILD_ROOT
-rm $RPM_BUILD_ROOT%{_libdir}/*.la
-make clean
-  %endif
 cd -
-%endif
 
 cd cpp/build
-%if %{use_ninja}
 DESTDIR=$RPM_BUILD_ROOT ninja install
 ninja clean
-%else
-make install DESTDIR=$RPM_BUILD_ROOT
-make clean
-%endif
 cd -
 
 %package libs
 Summary:	Runtime libraries for Apache Arrow C++
 License:	Apache-2.0
-%if %{_centos_ver} >= 7
-Requires:	boost%{boost_version}-system
-Requires:	boost%{boost_version}-filesystem
-Requires:	boost%{boost_version}-regex
-%endif
-%if %{have_brotli}
 Requires:	brotli
-%endif
-%if %{_centos_ver} >= 7
+%if %{use_gflags}
 Requires:	gflags
-Requires:	glog
 %endif
+Requires:	glog
 Requires:	libzstd
 Requires:	lz4
 %if %{have_re2}
@@ -254,6 +216,22 @@ This package contains the libraries for Apache Arrow C++.
 Summary:	Libraries and header files for Apache Arrow C++
 License:	Apache-2.0
 Requires:	%{name}-libs = %{version}-%{release}
+Requires:	brotli-devel
+Requires:	bzip2-devel
+Requires:	libzstd-devel
+Requires:	lz4-devel
+Requires:	openssl-devel
+%if %{have_rapidjson}
+Requires:	rapidjson-devel
+%endif
+%if %{have_re2}
+Requires:	re2-devel
+%endif
+Requires:	snappy-devel
+%if %{have_utf8proc}
+Requires:	utf8proc-devel
+%endif
+Requires:	zlib-devel
 
 %description devel
 Libraries and header files for Apache Arrow C++.
@@ -271,11 +249,12 @@ Libraries and header files for Apache Arrow C++.
 %{_libdir}/cmake/arrow/ArrowOptions.cmake
 %{_libdir}/cmake/arrow/ArrowTargets*.cmake
 %{_libdir}/cmake/arrow/FindArrow.cmake
-%if %{have_brotli}
 %{_libdir}/cmake/arrow/FindBrotli.cmake
-%endif
 %{_libdir}/cmake/arrow/FindLz4.cmake
 %{_libdir}/cmake/arrow/FindSnappy.cmake
+%if %{have_re2}
+%{_libdir}/cmake/arrow/Findre2Alt.cmake
+%endif
 %if %{have_utf8proc}
 %{_libdir}/cmake/arrow/Findutf8proc.cmake
 %endif
@@ -389,14 +368,12 @@ Libraries and header files for Gandiva.
 %{_libdir}/cmake/arrow/GandivaConfig*.cmake
 %{_libdir}/cmake/arrow/GandivaTargets*.cmake
 %{_libdir}/cmake/arrow/FindGandiva.cmake
-%if %{have_re2}
-%{_libdir}/cmake/arrow/FindRE2.cmake
-%endif
 %{_libdir}/libgandiva.a
 %{_libdir}/libgandiva.so
 %{_libdir}/pkgconfig/gandiva.pc
 %endif
 
+%if %{use_python}
 %package python-libs
 Summary:	Python integration library for Apache Arrow
 License:	Apache-2.0
@@ -439,7 +416,6 @@ Summary:	Python integration library for Apache Arrow Flight
 License:	Apache-2.0
 Requires:	%{name}-flight-libs = %{version}-%{release}
 Requires:	%{name}-python-libs = %{version}-%{release}
-Requires:	openssl
 
 %description python-flight-libs
 This package contains the Python integration library for Apache Arrow Flight.
@@ -470,6 +446,7 @@ Apache Arrow Flight.
 %{_libdir}/libarrow_python_flight.a
 %{_libdir}/libarrow_python_flight.so
 %{_libdir}/pkgconfig/arrow-python-flight.pc
+%endif
 %endif
 
 %package -n plasma-libs
@@ -517,12 +494,11 @@ Libraries and header files for Plasma in-memory object store.
 %{_libdir}/libplasma.so
 %{_libdir}/pkgconfig/plasma*.pc
 
-%if %{use_parquet}
 %package -n parquet-libs
 Summary:	Runtime libraries for Apache Parquet C++
 License:	Apache-2.0
-Requires:	boost%{boost_version}-program-options
 Requires:	%{name}-libs = %{version}-%{release}
+Requires:	openssl
 
 %description -n parquet-libs
 This package contains the libraries for Apache Parquet C++.
@@ -551,9 +527,7 @@ Libraries and header files for Apache Parquet C++.
 %{_libdir}/libparquet.a
 %{_libdir}/libparquet.so
 %{_libdir}/pkgconfig/parquet*.pc
-%endif
 
-%if %{use_glib}
 %package glib-libs
 Summary:	Runtime libraries for Apache Arrow GLib
 License:	Apache-2.0
@@ -648,7 +622,7 @@ Documentation for Apache Arrow dataset GLib.
 %doc README.md LICENSE.txt NOTICE.txt
 %{_datadir}/gtk-doc/html/arrow-dataset-glib/
 
-  %if %{use_gandiva}
+%if %{use_gandiva}
 %package -n gandiva-glib-libs
 Summary:	Runtime libraries for Gandiva GLib
 License:	Apache-2.0
@@ -693,7 +667,7 @@ Documentation for Gandiva GLib.
 %defattr(-,root,root,-)
 %doc README.md LICENSE.txt NOTICE.txt
 %{_datadir}/gtk-doc/html/gandiva-glib/
-  %endif
+%endif
 
 %package -n plasma-glib-libs
 Summary:	Runtime libraries for Plasma GLib
@@ -740,7 +714,6 @@ Documentation for Plasma GLib.
 %doc README.md LICENSE.txt NOTICE.txt
 %{_datadir}/gtk-doc/html/plasma-glib/
 
-  %if %{use_parquet}
 %package -n parquet-glib-libs
 Summary:	Runtime libraries for Apache Parquet GLib
 License:	Apache-2.0
@@ -785,10 +758,14 @@ Documentation for Apache Parquet GLib.
 %defattr(-,root,root,-)
 %doc README.md LICENSE.txt NOTICE.txt
 %{_datadir}/gtk-doc/html/parquet-glib/
-  %endif
-%endif
 
 %changelog
+* Mon Jan 18 2021 Krisztián Szűcs <szucs.krisztian@gmail.com> - 3.0.0-1
+- New upstream release.
+
+* Mon Oct 12 2020 Krisztián Szűcs <szucs.krisztian@gmail.com> - 2.0.0-1
+- New upstream release.
+
 * Mon Jul 20 2020 Krisztián Szűcs <szucs.krisztian@gmail.com> - 1.0.0-1
 - New upstream release.
 

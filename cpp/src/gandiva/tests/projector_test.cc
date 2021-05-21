@@ -15,13 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <cmath>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#include "gandiva/projector.h"
 
 #include <gtest/gtest.h>
 
-#include "arrow/memory_pool.h"
+#include <cmath>
 
-#include "gandiva/projector.h"
+#include "arrow/memory_pool.h"
+#include "gandiva/literal_holder.h"
+#include "gandiva/node.h"
 #include "gandiva/tests/test_util.h"
 #include "gandiva/tree_expr_builder.h"
 
@@ -354,6 +360,19 @@ TEST_F(TestProjector, TestExtendedMath) {
   auto field_log10 = arrow::field("log10", arrow::float64());
   auto field_logb = arrow::field("logb", arrow::float64());
   auto field_power = arrow::field("power", arrow::float64());
+  auto field_sin = arrow::field("sin", arrow::float64());
+  auto field_cos = arrow::field("cos", arrow::float64());
+  auto field_asin = arrow::field("asin", arrow::float64());
+  auto field_acos = arrow::field("acos", arrow::float64());
+  auto field_tan = arrow::field("tan", arrow::float64());
+  auto field_atan = arrow::field("atan", arrow::float64());
+  auto field_sinh = arrow::field("sinh", arrow::float64());
+  auto field_cosh = arrow::field("cosh", arrow::float64());
+  auto field_tanh = arrow::field("tanh", arrow::float64());
+  auto field_atan2 = arrow::field("atan2", arrow::float64());
+  auto field_cot = arrow::field("cot", arrow::float64());
+  auto field_radians = arrow::field("radians", arrow::float64());
+  auto field_degrees = arrow::field("degrees", arrow::float64());
 
   // Build expression
   auto cbrt_expr = TreeExprBuilder::MakeExpression("cbrt", {field0}, field_cbrt);
@@ -363,10 +382,27 @@ TEST_F(TestProjector, TestExtendedMath) {
   auto logb_expr = TreeExprBuilder::MakeExpression("log", {field0, field1}, field_logb);
   auto power_expr =
       TreeExprBuilder::MakeExpression("power", {field0, field1}, field_power);
+  auto sin_expr = TreeExprBuilder::MakeExpression("sin", {field0}, field_sin);
+  auto cos_expr = TreeExprBuilder::MakeExpression("cos", {field0}, field_cos);
+  auto asin_expr = TreeExprBuilder::MakeExpression("asin", {field0}, field_asin);
+  auto acos_expr = TreeExprBuilder::MakeExpression("acos", {field0}, field_acos);
+  auto tan_expr = TreeExprBuilder::MakeExpression("tan", {field0}, field_tan);
+  auto atan_expr = TreeExprBuilder::MakeExpression("atan", {field0}, field_atan);
+  auto sinh_expr = TreeExprBuilder::MakeExpression("sinh", {field0}, field_sinh);
+  auto cosh_expr = TreeExprBuilder::MakeExpression("cosh", {field0}, field_cosh);
+  auto tanh_expr = TreeExprBuilder::MakeExpression("tanh", {field0}, field_tanh);
+  auto atan2_expr =
+      TreeExprBuilder::MakeExpression("atan2", {field0, field1}, field_atan2);
+  auto cot_expr = TreeExprBuilder::MakeExpression("cot", {field0}, field_cot);
+  auto radians_expr = TreeExprBuilder::MakeExpression("radians", {field0}, field_radians);
+  auto degrees_expr = TreeExprBuilder::MakeExpression("degrees", {field0}, field_degrees);
 
   std::shared_ptr<Projector> projector;
   auto status = Projector::Make(
-      schema, {cbrt_expr, exp_expr, log_expr, log10_expr, logb_expr, power_expr},
+      schema,
+      {cbrt_expr, exp_expr, log_expr, log10_expr, logb_expr, power_expr, sin_expr,
+       cos_expr, asin_expr, acos_expr, tan_expr, atan_expr, sinh_expr, cosh_expr,
+       tanh_expr, atan2_expr, cot_expr, radians_expr, degrees_expr},
       TestConfiguration(), &projector);
   EXPECT_TRUE(status.ok());
 
@@ -386,6 +422,19 @@ TEST_F(TestProjector, TestExtendedMath) {
   std::vector<double> log10_vals;
   std::vector<double> logb_vals;
   std::vector<double> power_vals;
+  std::vector<double> sin_vals;
+  std::vector<double> cos_vals;
+  std::vector<double> asin_vals;
+  std::vector<double> acos_vals;
+  std::vector<double> tan_vals;
+  std::vector<double> atan_vals;
+  std::vector<double> sinh_vals;
+  std::vector<double> cosh_vals;
+  std::vector<double> tanh_vals;
+  std::vector<double> atan2_vals;
+  std::vector<double> cot_vals;
+  std::vector<double> radians_vals;
+  std::vector<double> degrees_vals;
   for (int i = 0; i < num_records; i++) {
     cbrt_vals.push_back(static_cast<double>(cbrtl(input0[i])));
     exp_vals.push_back(static_cast<double>(expl(input0[i])));
@@ -393,6 +442,19 @@ TEST_F(TestProjector, TestExtendedMath) {
     log10_vals.push_back(static_cast<double>(log10l(input0[i])));
     logb_vals.push_back(static_cast<double>(logl(input1[i]) / logl(input0[i])));
     power_vals.push_back(static_cast<double>(powl(input0[i], input1[i])));
+    sin_vals.push_back(static_cast<double>(sin(input0[i])));
+    cos_vals.push_back(static_cast<double>(cos(input0[i])));
+    asin_vals.push_back(static_cast<double>(asin(input0[i])));
+    acos_vals.push_back(static_cast<double>(acos(input0[i])));
+    tan_vals.push_back(static_cast<double>(tan(input0[i])));
+    atan_vals.push_back(static_cast<double>(atan(input0[i])));
+    sinh_vals.push_back(static_cast<double>(sinh(input0[i])));
+    cosh_vals.push_back(static_cast<double>(cosh(input0[i])));
+    tanh_vals.push_back(static_cast<double>(tanh(input0[i])));
+    atan2_vals.push_back(static_cast<double>(atan2(input0[i], input1[i])));
+    cot_vals.push_back(static_cast<double>(tan(M_PI / 2 - input0[i])));
+    radians_vals.push_back(static_cast<double>(input0[i] * M_PI / 180.0));
+    degrees_vals.push_back(static_cast<double>(input0[i] * 180.0 / M_PI));
   }
   auto expected_cbrt = MakeArrowArray<arrow::DoubleType, double>(cbrt_vals, validity);
   auto expected_exp = MakeArrowArray<arrow::DoubleType, double>(exp_vals, validity);
@@ -400,7 +462,21 @@ TEST_F(TestProjector, TestExtendedMath) {
   auto expected_log10 = MakeArrowArray<arrow::DoubleType, double>(log10_vals, validity);
   auto expected_logb = MakeArrowArray<arrow::DoubleType, double>(logb_vals, validity);
   auto expected_power = MakeArrowArray<arrow::DoubleType, double>(power_vals, validity);
-
+  auto expected_sin = MakeArrowArray<arrow::DoubleType, double>(sin_vals, validity);
+  auto expected_cos = MakeArrowArray<arrow::DoubleType, double>(cos_vals, validity);
+  auto expected_asin = MakeArrowArray<arrow::DoubleType, double>(asin_vals, validity);
+  auto expected_acos = MakeArrowArray<arrow::DoubleType, double>(acos_vals, validity);
+  auto expected_tan = MakeArrowArray<arrow::DoubleType, double>(tan_vals, validity);
+  auto expected_atan = MakeArrowArray<arrow::DoubleType, double>(atan_vals, validity);
+  auto expected_sinh = MakeArrowArray<arrow::DoubleType, double>(sinh_vals, validity);
+  auto expected_cosh = MakeArrowArray<arrow::DoubleType, double>(cosh_vals, validity);
+  auto expected_tanh = MakeArrowArray<arrow::DoubleType, double>(tanh_vals, validity);
+  auto expected_atan2 = MakeArrowArray<arrow::DoubleType, double>(atan2_vals, validity);
+  auto expected_cot = MakeArrowArray<arrow::DoubleType, double>(cot_vals, validity);
+  auto expected_radians =
+      MakeArrowArray<arrow::DoubleType, double>(radians_vals, validity);
+  auto expected_degrees =
+      MakeArrowArray<arrow::DoubleType, double>(degrees_vals, validity);
   // prepare input record batch
   auto in_batch = arrow::RecordBatch::Make(schema, num_records, {array0, array1});
 
@@ -417,6 +493,19 @@ TEST_F(TestProjector, TestExtendedMath) {
   EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_log10, outputs.at(3), epsilon);
   EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_logb, outputs.at(4), epsilon);
   EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_power, outputs.at(5), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_sin, outputs.at(6), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_cos, outputs.at(7), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_asin, outputs.at(8), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_acos, outputs.at(9), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_tan, outputs.at(10), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_atan, outputs.at(11), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_sinh, outputs.at(12), 1E-08);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_cosh, outputs.at(13), 1E-08);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_tanh, outputs.at(14), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_atan2, outputs.at(15), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_cot, outputs.at(16), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_radians, outputs.at(17), epsilon);
+  EXPECT_ARROW_ARRAY_APPROX_EQUALS(expected_degrees, outputs.at(18), epsilon);
 }
 
 TEST_F(TestProjector, TestFloatLessThan) {
@@ -764,6 +853,161 @@ TEST_F(TestProjector, TestOffset) {
 
   // Validate results
   EXPECT_ARROW_ARRAY_EQUALS(exp_sum, outputs.at(0));
+}
+
+// Test to ensure behaviour of cast functions when the validity is false for an input. The
+// function should not run for that input.
+TEST_F(TestProjector, TestCastFunction) {
+  auto field0 = field("f0", arrow::utf8());
+  auto schema = arrow::schema({field0});
+
+  // output fields
+  auto res_float4 = field("res_float4", arrow::float32());
+  auto res_float8 = field("res_float8", arrow::float64());
+  auto res_int4 = field("castINT", arrow::int32());
+  auto res_int8 = field("castBIGINT", arrow::int64());
+
+  // Build expression
+  auto cast_expr_float4 =
+      TreeExprBuilder::MakeExpression("castFLOAT4", {field0}, res_float4);
+  auto cast_expr_float8 =
+      TreeExprBuilder::MakeExpression("castFLOAT8", {field0}, res_float8);
+  auto cast_expr_int4 = TreeExprBuilder::MakeExpression("castINT", {field0}, res_int4);
+  auto cast_expr_int8 = TreeExprBuilder::MakeExpression("castBIGINT", {field0}, res_int8);
+
+  std::shared_ptr<Projector> projector;
+
+  //  {cast_expr_float4, cast_expr_float8, cast_expr_int4, cast_expr_int8}
+  auto status = Projector::Make(
+      schema, {cast_expr_float4, cast_expr_float8, cast_expr_int4, cast_expr_int8},
+      TestConfiguration(), &projector);
+  EXPECT_TRUE(status.ok());
+
+  // Create a row-batch with some sample data
+  int num_records = 4;
+
+  // Last validity is false and the cast functions throw error when input is empty. Should
+  // not be evaluated due to addition of NativeFunction::kCanReturnErrors
+  auto array0 = MakeArrowArrayUtf8({"1", "2", "3", ""}, {true, true, true, false});
+  auto in_batch = arrow::RecordBatch::Make(schema, num_records, {array0});
+
+  auto out_float4 = MakeArrowArrayFloat32({1, 2, 3, 0}, {true, true, true, false});
+  auto out_float8 = MakeArrowArrayFloat64({1, 2, 3, 0}, {true, true, true, false});
+  auto out_int4 = MakeArrowArrayInt32({1, 2, 3, 0}, {true, true, true, false});
+  auto out_int8 = MakeArrowArrayInt64({1, 2, 3, 0}, {true, true, true, false});
+
+  arrow::ArrayVector outputs;
+
+  // Evaluate expression
+  status = projector->Evaluate(*in_batch, pool_, &outputs);
+  EXPECT_TRUE(status.ok());
+
+  EXPECT_ARROW_ARRAY_EQUALS(out_float4, outputs.at(0));
+  EXPECT_ARROW_ARRAY_EQUALS(out_float8, outputs.at(1));
+  EXPECT_ARROW_ARRAY_EQUALS(out_int4, outputs.at(2));
+  EXPECT_ARROW_ARRAY_EQUALS(out_int8, outputs.at(3));
+}
+
+TEST_F(TestProjector, TestToDate) {
+  // schema for input fields
+  auto field0 = field("f0", arrow::utf8());
+  auto field_node = std::make_shared<FieldNode>(field0);
+  auto schema = arrow::schema({field0});
+
+  // output fields
+  auto field_result = field("res", arrow::date64());
+
+  auto pattern_node = std::make_shared<LiteralNode>(
+      arrow::utf8(), LiteralHolder(std::string("YYYY-MM-DD")), false);
+
+  // Build expression
+  auto fn_node = TreeExprBuilder::MakeFunction("to_date", {field_node, pattern_node},
+                                               arrow::date64());
+  auto expr = TreeExprBuilder::MakeExpression(fn_node, field_result);
+
+  // Build a projector for the expressions.
+  std::shared_ptr<Projector> projector;
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
+  EXPECT_TRUE(status.ok());
+
+  // Create a row-batch with some sample data
+  int num_records = 3;
+  auto array0 =
+      MakeArrowArrayUtf8({"1986-12-01", "2012-12-01", "invalid"}, {true, true, false});
+  // expected output
+  auto exp = MakeArrowArrayDate64({533779200000, 1354320000000, 0}, {true, true, false});
+
+  // prepare input record batch
+  auto in_batch = arrow::RecordBatch::Make(schema, num_records, {array0});
+
+  // Evaluate expression
+  arrow::ArrayVector outputs;
+  status = projector->Evaluate(*in_batch, pool_, &outputs);
+  EXPECT_TRUE(status.ok());
+
+  // Validate results
+  EXPECT_ARROW_ARRAY_EQUALS(exp, outputs.at(0));
+}
+
+// ARROW-11617
+TEST_F(TestProjector, TestIfElseOpt) {
+  // schema for input
+  auto field0 = field("f0", int32());
+  auto field1 = field("f1", int32());
+  auto field2 = field("f2", int32());
+  auto schema = arrow::schema({field0, field1, field2});
+
+  auto f0 = std::make_shared<FieldNode>(field0);
+  auto f1 = std::make_shared<FieldNode>(field1);
+  auto f2 = std::make_shared<FieldNode>(field2);
+
+  // output fields
+  auto field_result = field("out", int32());
+
+  // Expr - (f0, f1 - null; f2 non null)
+  //
+  // if (is not null(f0))
+  // then f0
+  // else add((
+  //    if (is not null (f1))
+  //    then f1
+  //    else f2
+  //  ), f1)
+
+  auto cond_node_inner = TreeExprBuilder::MakeFunction("isnotnull", {f1}, boolean());
+  auto if_node_inner = TreeExprBuilder::MakeIf(cond_node_inner, f1, f2, int32());
+
+  auto cond_node_outer = TreeExprBuilder::MakeFunction("isnotnull", {f0}, boolean());
+  auto else_node_outer =
+      TreeExprBuilder::MakeFunction("add", {if_node_inner, f1}, int32());
+
+  auto if_node_outer =
+      TreeExprBuilder::MakeIf(cond_node_outer, f1, else_node_outer, int32());
+  auto expr = TreeExprBuilder::MakeExpression(if_node_outer, field_result);
+
+  // Build a projector for the expressions.
+  std::shared_ptr<Projector> projector;
+  auto status = Projector::Make(schema, {expr}, TestConfiguration(), &projector);
+  EXPECT_TRUE(status.ok());
+
+  // Create a row-batch with some sample data
+  int num_records = 1;
+  auto array0 = MakeArrowArrayInt32({0}, {false});
+  auto array1 = MakeArrowArrayInt32({0}, {false});
+  auto array2 = MakeArrowArrayInt32({99}, {true});
+  // expected output
+  auto exp = MakeArrowArrayInt32({0}, {false});
+
+  // prepare input record batch
+  auto in_batch = arrow::RecordBatch::Make(schema, num_records, {array0, array1, array2});
+
+  // Evaluate expression
+  arrow::ArrayVector outputs;
+  status = projector->Evaluate(*in_batch, pool_, &outputs);
+  EXPECT_TRUE(status.ok());
+
+  // Validate results
+  EXPECT_ARROW_ARRAY_EQUALS(exp, outputs.at(0));
 }
 
 }  // namespace gandiva
